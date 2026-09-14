@@ -11,6 +11,7 @@ const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "
 const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), "tosub2-sms-provider-"));
 const smsActions = [];
 let smsChecks = 0;
+let autoRotateNumberCalls = 0;
 let customInboxChecks = 0;
 const smsServer = http.createServer((req, res) => {
   const url = new URL(req.url || "/", "http://127.0.0.1");
@@ -29,7 +30,13 @@ const smsServer = http.createServer((req, res) => {
   const action = url.searchParams.get("action");
   smsActions.push({ action, status: url.searchParams.get("status"), maxPrice: url.searchParams.get("maxPrice") });
   let body = "BAD_ACTION";
-  if (action === "getNumber") body = "ACCESS_NUMBER:mock-activation:60123456789";
+  if (action === "getNumber") {
+    if (url.searchParams.get("api_key") === "auto-rotate-key" && autoRotateNumberCalls++ === 0) {
+      body = "NO_NUMBERS";
+    } else {
+      body = `ACCESS_NUMBER:mock-activation-${autoRotateNumberCalls}:60123456789`;
+    }
+  }
   if (action === "getStatus") body = ++smsChecks < 2 ? "STATUS_WAIT_CODE" : "STATUS_OK:654321";
   if (action === "getPrices") body = JSON.stringify({
     1001: { dr: { cost: 0.42, count: 12 } },
@@ -128,7 +135,13 @@ try {
     headers,
     body: JSON.stringify({
       providerId: "smsbower",
-      config: { apiKey: "test-api-key", service: "dr", country: "1001", maxPrice: "0.42" },
+      config: {
+        apiKey: "test-api-key",
+        service: "dr",
+        country: "1001",
+        maxPrice: "0.42",
+        maxRotationAttempts: "1",
+      },
     }),
   });
   assert.equal(rejectedNumberResponse.status, 200, await rejectedNumberResponse.text());
@@ -147,6 +160,34 @@ try {
     smsActions.filter((item) => item.action === "setStatus" && item.status === "8").length,
     releasedOrderCount + 1,
   );
+
+  const autoRotateCreatedResponse = await fetch(`${baseUrl}/api/jobs`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ email: "auto-rotate@example.com" }),
+  });
+  assert.equal(autoRotateCreatedResponse.status, 201);
+  const autoRotateCreated = await autoRotateCreatedResponse.json();
+  await waitForJob(headers, autoRotateCreated.job.id, (job) => job.status === "phone");
+  const autoRotateNumberResponse = await fetch(`${baseUrl}/api/jobs/${autoRotateCreated.job.id}/sms-number`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      providerId: "smsbower",
+      config: {
+        apiKey: "auto-rotate-key",
+        service: "dr",
+        country: "1001",
+        maxPrice: "0.42",
+        maxRotationAttempts: "3",
+        rotationIntervalSeconds: "0.02",
+      },
+    }),
+  });
+  assert.equal(autoRotateNumberResponse.status, 200, await autoRotateNumberResponse.text());
+  const autoRotated = await waitForJob(headers, autoRotateCreated.job.id, (job) => job.status === "completed");
+  assert.equal(autoRotated.smsStatus, "completed");
+  assert.equal(autoRotateNumberCalls, 2);
 
   const customCreatedResponse = await fetch(`${baseUrl}/api/jobs`, {
     method: "POST",

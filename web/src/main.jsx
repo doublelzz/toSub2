@@ -439,6 +439,16 @@ function App() {
         return;
       }
     }
+    const maxRotationAttempts = Number(resolved.config.maxRotationAttempts);
+    const rotationIntervalSeconds = Number(resolved.config.rotationIntervalSeconds);
+    if (!Number.isSafeInteger(maxRotationAttempts) || maxRotationAttempts < 1 || maxRotationAttempts > 20) {
+      setSmsSettingsError("最大取号次数必须是 1 到 20 之间的整数");
+      return;
+    }
+    if (!Number.isFinite(rotationIntervalSeconds) || rotationIntervalSeconds < 0 || rotationIntervalSeconds > 600) {
+      setSmsSettingsError("自动换号间隔必须是 0 到 600 秒");
+      return;
+    }
     setSmsSettings(withSmsProviderDefaults(smsProviderDefinitions, smsSettingsDraft));
     setSmsSettingsOpen(false);
     setSmsSettingsError("");
@@ -1109,6 +1119,9 @@ function App() {
                           {field.type === "password" ? <KeyRound size={15} /> : <Settings2 size={15} />}
                           <input
                             type={field.type || "text"}
+                            min={field.min}
+                            max={field.max}
+                            step={field.step}
                             value={draftSmsProvider.config[field.key] || ""}
                             onChange={(event) => updateSmsProviderConfig(draftSmsProvider.id, { [field.key]: event.target.value })}
                             placeholder={field.placeholder}
@@ -1905,9 +1918,12 @@ function getInputConfig(status, currentPhone) {
 
 function smsStatusText(job) {
   const providerName = job.smsProviderName || "接码平台";
+  const rotationProgress = job.smsAutoRetrying && job.smsNumberMaxAttempts
+    ? `（${Math.max(1, Math.min(job.smsNumberAttempt || 1, job.smsNumberMaxAttempts))}/${job.smsNumberMaxAttempts}）`
+    : "";
   if (job.smsError) return `${providerName}：${job.smsError}`;
   return {
-    requesting: `${providerName}：正在获取手机号`,
+    requesting: `${providerName}：正在获取手机号${rotationProgress}`,
     number_acquired: `${providerName}：已获取手机号，正在发送验证码`,
     waiting_sms: `${providerName}：验证码已发送，正在等待短信`,
     submitting: `${providerName}：已收到验证码，正在自动提交`,

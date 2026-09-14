@@ -38,6 +38,10 @@ const SUB2API_MONITOR_INTERVAL_MS = readDurationEnv("SUB2API_MONITOR_INTERVAL_MS
 const SUB2API_AUTO_REPAIR_COOLDOWN_MS = readDurationEnv("SUB2API_AUTO_REPAIR_COOLDOWN_MS", 5 * 60_000, 0);
 const MAIL_POLL_INTERVAL_MS = 2_500;
 const MAIL_POLL_TIMEOUT_MS = 10 * 60_000;
+const DEFAULT_SMS_NUMBER_MAX_ATTEMPTS = 3;
+const MAX_SMS_NUMBER_MAX_ATTEMPTS = 20;
+const DEFAULT_SMS_NUMBER_RETRY_INTERVAL_MS = 5_000;
+const MAX_SMS_NUMBER_RETRY_INTERVAL_MS = 10 * 60_000;
 const MAX_MAIL_REQUEST_BODY_BYTES = 64 * 1024;
 const MAX_MAIL_REQUEST_HEADERS = 64;
 const FORBIDDEN_MAIL_REQUEST_HEADERS = new Set([
@@ -1595,6 +1599,7 @@ function consumeOutput(job, rawText) {
   if (phoneNumberPromptIndex > phoneOtpPromptIndex) {
     stopMailPolling(job);
     setStage(job, "phone", "请输入需要绑定的手机号");
+    if (job.smsRetryPending) scheduleSmsNumberRetry(job, job.smsError || "当前手机号不可用", { alreadyPending: true });
   } else if (phoneOtpPromptIndex > phoneNumberPromptIndex) {
     if (job.smsStatus !== "error") job.phoneError = null;
     setStage(
@@ -1611,9 +1616,10 @@ function consumeOutput(job, rawText) {
     job.currentPhone = latest[1];
     job.phoneError = friendlyPhoneError(latest[2]);
     if (job.smsOrderId && job.smsNumber === job.currentPhone) {
-      releaseSmsNumber(job, "error", "该平台手机号无法接收验证码，请重新取号或手动输入其他手机号");
+      releaseSmsOrder(job, "error", "该平台手机号无法接收验证码，请重新取号或手动输入其他手机号");
     }
     setStage(job, "phone", `手机号 ${job.currentPhone} 无法接收验证码，请更换手机号`);
+    scheduleSmsNumberRetry(job, job.phoneError || "当前手机号无法接收验证码");
   }
 
   const validationFailures = [...scan.matchAll(/\[warn\] Phone OTP validation failed:\s*([^\r\n]+)/g)];
@@ -1633,8 +1639,10 @@ function consumeOutput(job, rawText) {
     if (shouldChangePhoneAfterOtpFailure(validationMessage)) {
       job.smsError = job.phoneError;
       appendJobLog(job, "[sms] 当前手机号已被服务端拒绝，停止提交旧验证码并自动返回换号步骤。\n");
+      const automaticRotation = Boolean(job.smsProviderConfig && job.smsOrderId);
       void submitJobInput(job, { action: "change_phone", value: "" }, {
         preservePhoneError: true,
+        automaticRotation,
       }).catch((error) => {
         failJob(job, `无法自动返回换号步骤：${error.message}`);
       });
@@ -1908,7 +1916,9 @@ function acquireCustomSmsEntry(entries) {
 
 async function acquireSmsNumber(job, providerId, config) {
   requireStage(job, "phone");
-  if (job.smsStatus === "requesting") throw httpError(409, "正在获取手机号，请不要重复提交");
+  if (job.smsStatus === "requesting" || job.smsNumberAcquisitionPromise) {
+    throw httpError(409, "正在获取手机号，请不要重复提交");
+  }
 
   let smsClient;
   try {
@@ -1921,40 +1931,229 @@ async function acquireSmsNumber(job, providerId, config) {
     throw httpError(400, safeSmsProviderError(error, config?.apiKey));
   }
 
+  const retryConfig = normalizeSmsNumberRetryConfig(config);
   releaseSmsNumber(job, "idle");
+  job.smsProviderConfig = { ...config };
   job.smsClient = smsClient;
   job.smsProviderId = smsClient.id;
   job.smsProviderName = smsClient.name;
   job.smsServiceLabel = smsClient.serviceLabel;
+  job.smsNumberMaxAttempts = retryConfig.maxAttempts;
+  job.smsNumberRetryIntervalMs = retryConfig.retryIntervalMs;
+  job.smsNumberAttempt = 0;
+  job.smsRetryPending = false;
+  startSmsNumberAcquisition(job, { resetAttempts: false });
+}
+
+function normalizeSmsNumberRetryConfig(config = {}) {
+  const rawAttempts = config.maxRotationAttempts ?? config.maxAttempts;
+  const rawIntervalSeconds = config.rotationIntervalSeconds;
+  const rawIntervalMs = config.numberRetryIntervalMs ?? config.retryIntervalMs;
+  const attempts = rawAttempts === undefined || String(rawAttempts).trim() === ""
+    ? DEFAULT_SMS_NUMBER_MAX_ATTEMPTS
+    : Number(rawAttempts);
+  const intervalMs = rawIntervalSeconds !== undefined && String(rawIntervalSeconds).trim() !== ""
+    ? Number(rawIntervalSeconds) * 1_000
+    : rawIntervalMs === undefined || String(rawIntervalMs).trim() === ""
+      ? DEFAULT_SMS_NUMBER_RETRY_INTERVAL_MS
+      : Number(rawIntervalMs);
+  if (!Number.isSafeInteger(attempts) || attempts < 1 || attempts > MAX_SMS_NUMBER_MAX_ATTEMPTS) {
+    throw httpError(400, `自动取号最大次数必须是 1 到 ${MAX_SMS_NUMBER_MAX_ATTEMPTS} 之间的整数`);
+  }
+  if (!Number.isFinite(intervalMs) || intervalMs < 0 || intervalMs > MAX_SMS_NUMBER_RETRY_INTERVAL_MS) {
+    throw httpError(400, `自动换号间隔必须是 0 到 ${MAX_SMS_NUMBER_RETRY_INTERVAL_MS / 1_000} 秒`);
+  }
+  return {
+    maxAttempts: attempts,
+    retryIntervalMs: Math.round(intervalMs),
+  };
+}
+
+function startSmsNumberAcquisition(job, { resetAttempts = true } = {}) {
+  if (!job.smsProviderConfig || !job.smsProviderId) return;
+  if (resetAttempts) job.smsNumberAttempt = 0;
+  const token = crypto.randomUUID();
+  job.smsNumberAcquisitionToken = token;
   job.smsStatus = "requesting";
   job.smsError = null;
+  job.smsRetryPending = false;
+  touch(job);
+  void saveJobMetadata(job).catch(() => {});
+
+  const operation = runSmsNumberAcquisition(job, token);
+  job.smsNumberAcquisitionPromise = operation;
+  void operation.catch((error) => {
+    if (job.smsNumberAcquisitionToken !== token || isTerminalStatus(job.status)) return;
+    job.smsStatus = "error";
+    job.smsError = safeSmsProviderError(error, job.smsClient?.apiKey);
+    touch(job);
+    void saveJobMetadata(job).catch(() => {});
+  });
+}
+
+async function runSmsNumberAcquisition(job, token) {
+  try {
+    while (job.smsNumberAcquisitionToken === token && job.status === "phone" && job.child) {
+      const outcome = await withEmailJobLock(job.email, () => acquireSmsNumberAttempt(job, token));
+      if (outcome !== "retry") return;
+      if (job.smsNumberAttempt >= job.smsNumberMaxAttempts) return;
+      await delay(job.smsNumberRetryIntervalMs);
+    }
+  } finally {
+    if (job.smsNumberAcquisitionToken === token) {
+      job.smsNumberAcquisitionPromise = null;
+      touch(job);
+      void saveJobMetadata(job).catch(() => {});
+    }
+  }
+}
+
+async function acquireSmsNumberAttempt(job, token) {
+  if (job.smsNumberAcquisitionToken !== token || job.status !== "phone" || !job.child) return "stopped";
+  const smsClient = job.smsClient;
+  if (!smsClient) return "stopped";
+  job.smsNumberAttempt += 1;
+  const attempt = job.smsNumberAttempt;
+  job.smsStatus = "requesting";
+  job.smsError = attempt > 1
+    ? `正在自动获取第 ${attempt}/${job.smsNumberMaxAttempts} 个手机号`
+    : null;
   touch(job);
 
-  let order;
+  let order = null;
   try {
     order = await smsClient.getNumber();
-    if (job.status !== "phone" || !job.child) {
+    if (job.smsNumberAcquisitionToken !== token || job.status !== "phone" || !job.child) {
       void smsClient.release(order.requestId).catch(() => {});
-      throw httpError(409, "任务已经不在手机号输入步骤，平台号码已释放");
+      return "stopped";
     }
     job.smsOrderId = order.requestId;
     job.smsNumber = order.number;
     job.smsStatus = "number_acquired";
     job.smsError = null;
     await saveJobMetadata(job);
-    appendJobLog(job, `[sms] 已从 ${smsClient.name} 获取手机号并提交，等待短信发送结果。\n`);
+    appendJobLog(job, `[sms] 已从 ${smsClient.name} 获取第 ${attempt}/${job.smsNumberMaxAttempts} 个手机号并提交，等待短信发送结果。\n`);
     await submitJobInput(job, { action: "phone", value: order.number }, { source: "sms-provider" });
+    return "success";
   } catch (error) {
-    if (order?.requestId && job.smsOrderId === order.requestId) releaseSmsNumber(job, "error");
-    if (job.status === "phone") {
-      job.smsStatus = "error";
-      job.smsError = safeSmsProviderError(error, smsClient.apiKey);
-      if (!order) job.smsClient = null;
-      touch(job);
+    if (order?.requestId && job.smsOrderId === order.requestId) {
+      releaseSmsOrder(job, "requesting", safeSmsProviderError(error, smsClient.apiKey));
     }
-    if (error?.status) throw error;
-    throw httpError(502, safeSmsProviderError(error, smsClient.apiKey));
+    if (error?.status === 409 && (job.status !== "phone" || !job.child)) return "stopped";
+    const message = safeSmsProviderError(error, smsClient.apiKey);
+    if (job.smsNumberAttempt >= job.smsNumberMaxAttempts) {
+      job.smsStatus = "error";
+      job.smsError = `${message}（已达到自动取号上限 ${job.smsNumberMaxAttempts} 次）`;
+      appendJobLog(job, `[sms] 自动取号失败，已达到 ${job.smsNumberMaxAttempts} 次上限：${message}\n`);
+    } else {
+      job.smsStatus = "requesting";
+      job.smsError = `${message}，${formatSeconds(job.smsNumberRetryIntervalMs)} 秒后自动换号（${job.smsNumberAttempt + 1}/${job.smsNumberMaxAttempts}）`;
+      appendJobLog(job, `[sms] 第 ${attempt}/${job.smsNumberMaxAttempts} 次取号失败：${message}，将自动重试。\n`);
+    }
+    touch(job);
+    await saveJobMetadata(job);
+    return job.smsNumberAttempt >= job.smsNumberMaxAttempts ? "done" : "retry";
   }
+}
+
+function formatSeconds(milliseconds) {
+  const seconds = Number(milliseconds || 0) / 1_000;
+  return Number.isInteger(seconds) ? String(seconds) : seconds.toFixed(1);
+}
+
+function requestAutomaticSmsRotation(job, reason) {
+  if (
+    job.status !== "phone_otp"
+    || !job.child
+    || !job.smsProviderConfig
+    || !job.smsProviderId
+    || !job.smsOrderId
+    || job.smsRetryPending
+    || job.smsNumberAcquisitionPromise
+  ) return;
+  const message = String(reason || "当前手机号不可用");
+  if (job.smsNumberAttempt >= job.smsNumberMaxAttempts) {
+    releaseSmsNumber(
+      job,
+      "error",
+      `${message}，已达到自动取号上限 ${job.smsNumberMaxAttempts} 次`,
+      { automaticRotation: true },
+    );
+    job.phoneError = message;
+    touch(job);
+    void saveJobMetadata(job).catch(() => {});
+    return;
+  }
+  job.smsError = `${message}，正在返回换号步骤`;
+  job.phoneError = message;
+  appendJobLog(job, `[sms] ${message}，正在自动返回手机号步骤并换号。\n`);
+  void submitJobInput(job, { action: "change_phone", value: "" }, {
+    preservePhoneError: true,
+    automaticRotation: true,
+  }).catch((error) => {
+    failJob(job, `无法自动返回换号步骤：${error.message}`);
+  });
+}
+
+function scheduleSmsNumberRetry(job, reason = "手机号不可用", options = {}) {
+  const alreadyPending = options.alreadyPending === true;
+  if (alreadyPending && job.smsNumberAttempt >= job.smsNumberMaxAttempts) {
+    job.smsRetryPending = false;
+    touch(job);
+    void saveJobMetadata(job).catch(() => {});
+    return;
+  }
+  if (
+    job.status !== "phone"
+    || !job.child
+    || !job.smsProviderConfig
+    || !job.smsProviderId
+    || job.smsNumberAcquisitionPromise
+    || (!alreadyPending && job.smsRetryPending)
+    || job.smsNumberAttempt >= job.smsNumberMaxAttempts
+  ) return;
+  job.smsRetryPending = true;
+  job.smsStatus = "requesting";
+  job.smsError = `${reason}，${formatSeconds(job.smsNumberRetryIntervalMs)} 秒后自动换号（${job.smsNumberAttempt + 1}/${job.smsNumberMaxAttempts}）`;
+  touch(job);
+  void saveJobMetadata(job).catch(() => {});
+  void (async () => {
+    await delay(job.smsNumberRetryIntervalMs);
+    await withEmailJobLock(job.email, async () => {
+      if (
+        job.status !== "phone"
+        || !job.child
+        || !job.smsRetryPending
+        || job.smsNumberAcquisitionPromise
+        || job.smsNumberAttempt >= job.smsNumberMaxAttempts
+      ) return;
+      let smsClient;
+      try {
+        smsClient = createSmsProvider(job.smsProviderId, job.smsProviderConfig, {
+          lubanApiBase: process.env.LUBAN_SMS_API_BASE,
+          smsBowerApiBase: process.env.SMSBOWER_API_BASE,
+          acquireCustomSmsEntry,
+        });
+      } catch (error) {
+        job.smsRetryPending = false;
+        job.smsStatus = "error";
+        job.smsError = safeSmsProviderError(error, job.smsProviderConfig?.apiKey);
+        touch(job);
+        void saveJobMetadata(job).catch(() => {});
+        return;
+      }
+      job.smsClient = smsClient;
+      job.smsProviderName = smsClient.name;
+      job.smsServiceLabel = smsClient.serviceLabel;
+      startSmsNumberAcquisition(job, { resetAttempts: false });
+    });
+  })().catch((error) => {
+    job.smsRetryPending = false;
+    job.smsStatus = "error";
+    job.smsError = safeSmsProviderError(error, job.smsProviderConfig?.apiKey);
+    touch(job);
+    void saveJobMetadata(job).catch(() => {});
+  });
 }
 
 async function beginSmsPolling(job) {
@@ -1996,6 +2195,7 @@ async function beginSmsPolling(job) {
             job.smsError = "接码平台仍返回已提交过的验证码，已停止重复提交";
             appendJobLog(job, `[sms] ${smsClient.name} 返回了已提交过的验证码，已停止本次自动轮询。\n`);
             touch(job);
+            requestAutomaticSmsRotation(job, job.smsError);
             return;
           }
           job.smsLastSubmittedCode = result.code;
@@ -2011,12 +2211,14 @@ async function beginSmsPolling(job) {
         if (job.smsPollToken !== pollToken) return;
         if (error?.terminal) {
           job.smsStatus = "error";
-          job.smsError = `${safeSmsProviderError(error)}，可以手动输入验证码或更换手机号`;
+          const providerError = safeSmsProviderError(error, smsClient.apiKey);
+          job.smsError = `${providerError}，可以手动输入验证码或更换手机号`;
           touch(job);
+          requestAutomaticSmsRotation(job, providerError);
           return;
         }
         job.smsStatus = "waiting_sms";
-        job.smsError = `${safeSmsProviderError(error)}，正在自动重试`;
+        job.smsError = `${safeSmsProviderError(error, smsClient.apiKey)}，正在自动重试`;
         touch(job);
       }
       await delay(SMS_POLL_INTERVAL_MS);
@@ -2026,6 +2228,7 @@ async function beginSmsPolling(job) {
       job.smsStatus = "error";
       job.smsError = "等待平台短信超时，可以手动输入验证码或更换手机号";
       touch(job);
+      requestAutomaticSmsRotation(job, "等待短信超时");
     }
   } finally {
     if (job.smsPollToken === pollToken) {
@@ -2039,28 +2242,36 @@ function stopSmsPolling(job) {
   job.smsPollToken = null;
 }
 
-function releaseSmsNumber(job, nextStatus = "idle", errorMessage = null) {
-  const requestId = job.smsOrderId;
-  const smsClient = job.smsClient;
-  const providerName = job.smsProviderName || smsClient?.name || "接码平台";
-  stopSmsPolling(job);
-  job.smsOrderId = null;
-  job.smsNumber = null;
+function releaseSmsNumber(job, nextStatus = "idle", errorMessage = null, options = {}) {
+  const preserveProvider = options.automaticRotation === true;
+  job.smsNumberAcquisitionToken = null;
+  job.smsRetryPending = false;
+  releaseSmsOrder(job, nextStatus, errorMessage);
   job.smsClient = null;
-  job.smsLastSubmittedCode = null;
-  job.smsStatus = nextStatus;
-  job.smsError = errorMessage;
-  if (nextStatus === "idle") {
+  if (nextStatus === "idle" && !preserveProvider) {
     job.smsProviderId = null;
     job.smsProviderName = null;
     job.smsServiceLabel = null;
+    job.smsProviderConfig = null;
   }
+  if (job.outputPath) void saveJobMetadata(job).catch(() => {});
+}
+
+function releaseSmsOrder(job, nextStatus = "idle", errorMessage = null) {
+  const requestId = job.smsOrderId;
+  const smsClient = job.smsClient;
+  stopSmsPolling(job);
+  job.smsOrderId = null;
+  job.smsNumber = null;
+  job.smsLastSubmittedCode = null;
+  job.smsStatus = nextStatus;
+  job.smsError = errorMessage;
   if (requestId && smsClient) {
     void smsClient.release(requestId).catch(() => {
+      const providerName = job.smsProviderName || smsClient.name || "接码平台";
       appendJobLog(job, `[sms] ${providerName} 号码释放请求失败，请在平台控制台检查订单。\n`);
     });
   }
-  if (job.outputPath) void saveJobMetadata(job).catch(() => {});
 }
 
 function completeSmsNumber(job) {
@@ -2096,6 +2307,13 @@ function newSmsState() {
     smsError: null,
     smsPollToken: null,
     smsLastSubmittedCode: null,
+    smsProviderConfig: null,
+    smsNumberAttempt: 0,
+    smsNumberMaxAttempts: DEFAULT_SMS_NUMBER_MAX_ATTEMPTS,
+    smsNumberRetryIntervalMs: DEFAULT_SMS_NUMBER_RETRY_INTERVAL_MS,
+    smsNumberAcquisitionToken: null,
+    smsNumberAcquisitionPromise: null,
+    smsRetryPending: false,
   };
 }
 
@@ -2103,6 +2321,9 @@ function restoredSmsState(metadata = {}) {
   const orderId = metadata.sms_order_id || metadata.luban_request_id;
   const number = metadata.sms_number || metadata.luban_number;
   if (!orderId || !number) return newSmsState();
+  const savedAttempt = Number(metadata.sms_number_attempt);
+  const savedMaxAttempts = Number(metadata.sms_number_max_attempts);
+  const savedRetryIntervalMs = Number(metadata.sms_number_retry_interval_ms);
   return {
     smsProviderId: metadata.sms_provider_id || "luban",
     smsProviderName: metadata.sms_provider_name || (metadata.sms_provider_id === "smsbower" ? "SMSBower" : "LubanSMS"),
@@ -2114,6 +2335,21 @@ function restoredSmsState(metadata = {}) {
     smsError: "服务重启后已停止自动收短信，可手动输入验证码或换号",
     smsPollToken: null,
     smsLastSubmittedCode: null,
+    smsProviderConfig: null,
+    smsNumberAttempt: Number.isSafeInteger(savedAttempt) && savedAttempt >= 0 ? savedAttempt : 0,
+    smsNumberMaxAttempts: Number.isSafeInteger(savedMaxAttempts)
+      && savedMaxAttempts >= 1
+      && savedMaxAttempts <= MAX_SMS_NUMBER_MAX_ATTEMPTS
+      ? savedMaxAttempts
+      : DEFAULT_SMS_NUMBER_MAX_ATTEMPTS,
+    smsNumberRetryIntervalMs: Number.isFinite(savedRetryIntervalMs)
+      && savedRetryIntervalMs >= 0
+      && savedRetryIntervalMs <= MAX_SMS_NUMBER_RETRY_INTERVAL_MS
+      ? savedRetryIntervalMs
+      : DEFAULT_SMS_NUMBER_RETRY_INTERVAL_MS,
+    smsNumberAcquisitionToken: null,
+    smsNumberAcquisitionPromise: null,
+    smsRetryPending: false,
   };
 }
 
@@ -2207,9 +2443,11 @@ async function submitJobInput(job, body, options = {}) {
       job,
       options.preservePhoneError ? "error" : "idle",
       options.preservePhoneError ? preservedPhoneError : null,
+      { automaticRotation: options.automaticRotation },
     );
     job.currentPhone = null;
     job.phoneError = preservedPhoneError;
+    if (options.automaticRotation) job.smsRetryPending = true;
     inputValue = "p";
     setStage(
       job,
@@ -2990,6 +3228,10 @@ function publicJob(job) {
     smsServiceLabel: job.smsServiceLabel,
     smsStatus: job.smsStatus,
     smsError: job.smsError,
+    smsNumberAttempt: Number(job.smsNumberAttempt || 0),
+    smsNumberMaxAttempts: Number(job.smsNumberMaxAttempts || DEFAULT_SMS_NUMBER_MAX_ATTEMPTS),
+    smsNumberRetryIntervalMs: Number(job.smsNumberRetryIntervalMs ?? DEFAULT_SMS_NUMBER_RETRY_INTERVAL_MS),
+    smsAutoRetrying: Boolean(job.smsRetryPending || job.smsNumberAcquisitionPromise),
     securityCheckRequired: Boolean(job.securityCheckRequired),
     canRetry: ["failed", "canceled", "reauth_required", "resume_available"].includes(job.status),
     canResume: job.status === "resume_available",
@@ -4352,6 +4594,9 @@ async function saveJobMetadata(job) {
         sms_order_id: job.smsOrderId || null,
         sms_number: job.smsNumber || null,
         sms_status: job.smsStatus || null,
+        sms_number_attempt: Number(job.smsNumberAttempt || 0),
+        sms_number_max_attempts: Number(job.smsNumberMaxAttempts || DEFAULT_SMS_NUMBER_MAX_ATTEMPTS),
+        sms_number_retry_interval_ms: Number(job.smsNumberRetryIntervalMs ?? DEFAULT_SMS_NUMBER_RETRY_INTERVAL_MS),
         last_auth_automated: Boolean(job.lastAuthAutomated),
         last_auth_automation_reason: job.lastAuthAutomationReason || null,
         last_auth_automated_at: job.lastAuthAutomatedAt || null,

@@ -10,6 +10,8 @@ export const SMS_PROVIDER_DEFINITIONS = [
     fields: [
       { key: "apiKey", label: "API Key", type: "password", placeholder: "输入 LubanSMS API Key" },
       { key: "serviceId", label: "供应商编号", type: "text", placeholder: "例如 121949", summary: true },
+      { key: "maxRotationAttempts", label: "最大取号次数（含首次）", type: "number", defaultValue: "3", min: 1, max: 20, step: 1, required: false },
+      { key: "rotationIntervalSeconds", label: "自动换号间隔（秒）", type: "number", defaultValue: "5", min: 0, max: 600, step: 1, required: false },
     ],
   },
   {
@@ -23,6 +25,8 @@ export const SMS_PROVIDER_DEFINITIONS = [
       { key: "country", label: "国家与价格", type: "price-select", defaultValue: "1001", summaryKey: "countryLabel" },
       { key: "maxPrice", label: "最高价格", type: "hidden", required: false },
       { key: "countryLabel", label: "国家名称", type: "hidden", required: false },
+      { key: "maxRotationAttempts", label: "最大取号次数（含首次）", type: "number", defaultValue: "3", min: 1, max: 20, step: 1, required: false },
+      { key: "rotationIntervalSeconds", label: "自动换号间隔（秒）", type: "number", defaultValue: "5", min: 0, max: 600, step: 1, required: false },
     ],
   },
   {
@@ -36,6 +40,8 @@ export const SMS_PROVIDER_DEFINITIONS = [
         type: "textarea",
         placeholder: "+861871291167----https://example.com/messages/1871291167",
       },
+      { key: "maxRotationAttempts", label: "最大取号次数（含首次）", type: "number", defaultValue: "3", min: 1, max: 20, step: 1, required: false },
+      { key: "rotationIntervalSeconds", label: "自动换号间隔（秒）", type: "number", defaultValue: "5", min: 0, max: 600, step: 1, required: false },
     ],
   },
 ];
