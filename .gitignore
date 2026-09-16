@@ -1,4 +1,5 @@
 node_modules/
+.idea/
 __pycache__/
 *.py[cod]
 web/dist/
@@ -7,6 +8,7 @@ tmp/
 .env.*
 !.env.example
 *.log
+docs/console.png
 .DS_Store
 chatgpt-protocol-session.json
 sub2api-import*.json
