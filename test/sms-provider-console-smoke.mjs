@@ -28,7 +28,12 @@ const smsServer = http.createServer((req, res) => {
     return;
   }
   const action = url.searchParams.get("action");
-  smsActions.push({ action, status: url.searchParams.get("status"), maxPrice: url.searchParams.get("maxPrice") });
+  smsActions.push({
+    action,
+    status: url.searchParams.get("status"),
+    maxPrice: url.searchParams.get("maxPrice"),
+    providerIds: url.searchParams.get("providerIds"),
+  });
   let body = "BAD_ACTION";
   if (action === "getNumber") {
     if (url.searchParams.get("api_key") === "auto-rotate-key" && autoRotateNumberCalls++ === 0) {
@@ -38,13 +43,13 @@ const smsServer = http.createServer((req, res) => {
     }
   }
   if (action === "getStatus") body = ++smsChecks < 2 ? "STATUS_WAIT_CODE" : "STATUS_OK:654321";
-  if (action === "getPrices") body = JSON.stringify({
-    1001: { dr: { cost: 0.42, count: 12 } },
-    7: { dr: { cost: 0.18, count: 8 } },
+  if (action === "getTopCountriesByService") body = JSON.stringify({
+    japan: { 3301: { price: 0.42, count: 12 } },
+    malaysia: { 3401: { price: 0.18, count: 8 } },
   });
   if (action === "getCountries") body = JSON.stringify({ countries: [
-    { id: 1001, eng: "Japan", chn: "日本" },
-    { id: 7, eng: "Malaysia", chn: "马来西亚" },
+    { id: 350, activate_org_code: "1001", slug: "japan", eng: "Japan", chn: "日本" },
+    { id: 71, activate_org_code: "7", slug: "malaysia", eng: "Malaysia", chn: "马来西亚" },
   ] });
   if (action === "setStatus") {
     body = { "1": "ACCESS_READY", "6": "ACCESS_ACTIVATION", "8": "ACCESS_CANCEL" }[url.searchParams.get("status")] || "BAD_STATUS";
@@ -106,7 +111,7 @@ try {
     headers,
     body: JSON.stringify({
       providerId: "smsbower",
-      config: { apiKey: "test-api-key", service: "dr", country: "1001", maxPrice: "0.42" },
+      config: { apiKey: "test-api-key", service: "dr", country: "1001", maxPrice: "0.42", providerIds: "3301" },
     }),
   });
   assert.equal(numberResponse.status, 200, await numberResponse.text());
@@ -118,6 +123,7 @@ try {
   assert.ok(smsActions.some((item) => item.action === "setStatus" && item.status === "1"));
   assert.ok(smsActions.some((item) => item.action === "setStatus" && item.status === "6"));
   assert.ok(smsActions.some((item) => item.action === "getNumber" && item.maxPrice === "0.42"));
+  assert.ok(smsActions.some((item) => item.action === "getNumber" && item.providerIds === "3301"));
 
   const completedOrderCount = smsActions.filter((item) => item.action === "setStatus" && item.status === "6").length;
   const releasedOrderCount = smsActions.filter((item) => item.action === "setStatus" && item.status === "8").length;
@@ -140,6 +146,7 @@ try {
         service: "dr",
         country: "1001",
         maxPrice: "0.42",
+        providerIds: "3301",
         maxRotationAttempts: "1",
       },
     }),
@@ -179,6 +186,7 @@ try {
         service: "dr",
         country: "1001",
         maxPrice: "0.42",
+        providerIds: "3301",
         maxRotationAttempts: "3",
         rotationIntervalSeconds: "0.02",
       },

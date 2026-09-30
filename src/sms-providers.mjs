@@ -17,13 +17,14 @@ export const SMS_PROVIDER_DEFINITIONS = [
   {
     id: "smsbower",
     name: "SMSBower",
-    description: "查询 OpenAI 实时价格和库存后选择国家",
+    description: "查询 OpenAI Gold 实时价格和库存后选择国家",
     optionsEndpoint: "/api/sms-providers/smsbower/options",
     fields: [
       { key: "apiKey", label: "API Key", type: "password", placeholder: "输入 SMSBower API Key" },
       { key: "service", label: "服务代码", type: "hidden", defaultValue: "dr" },
       { key: "country", label: "国家与价格", type: "price-select", defaultValue: "1001", summaryKey: "countryLabel" },
       { key: "maxPrice", label: "最高价格", type: "hidden", required: false },
+      { key: "providerIds", label: "Gold 供应商", type: "hidden", required: false },
       { key: "countryLabel", label: "国家名称", type: "hidden", required: false },
       { key: "maxRotationAttempts", label: "最大取号次数（含首次）", type: "number", defaultValue: "3", min: 1, max: 20, step: 1, required: false },
       { key: "rotationIntervalSeconds", label: "自动换号间隔（秒）", type: "number", defaultValue: "5", min: 0, max: 600, step: 1, required: false },
@@ -78,10 +79,14 @@ export function createSmsProvider(providerIdValue, configValue = {}, options = {
     const service = String(config.service || "dr").trim().toLowerCase();
     const country = String(config.country || "").trim();
     const maxPrice = String(config.maxPrice || "").trim();
+    const providerIds = String(config.providerIds || "").trim();
     if (!/^[a-z0-9_]{1,32}$/.test(service)) throw new Error("请输入有效的 SMSBower 服务代码");
     if (!/^\d{1,5}$/.test(country)) throw new Error("请输入有效的 SMSBower 国家 ID");
     if (maxPrice && (!/^\d+(?:\.\d{1,6})?$/.test(maxPrice) || Number(maxPrice) <= 0)) {
       throw new Error("请重新查询 SMSBower 国家价格");
+    }
+    if (providerIds && !/^\d{1,12}(?:,\d{1,12}){0,99}$/.test(providerIds)) {
+      throw new Error("请重新查询 SMSBower Gold 价格");
     }
     const client = createSmsBowerClient({ apiKey, apiBase: options.smsBowerApiBase, fetchImpl: options.fetchImpl });
     return {
@@ -89,7 +94,10 @@ export function createSmsProvider(providerIdValue, configValue = {}, options = {
       name: "SMSBower",
       apiKey,
       serviceLabel: config.countryLabel || `${service} / ${country}`,
-      getNumber: () => client.getNumber(service, country, maxPrice),
+      getNumber: async () => {
+        if (!maxPrice || !providerIds) throw new Error("请先查询并选择 SMSBower Gold 价格");
+        return client.getNumber(service, country, maxPrice, providerIds);
+      },
       listNumberOptions: () => client.getPriceOptions(service),
       getSms: (requestId) => client.getSms(requestId),
       markReady: (requestId) => client.markReady(requestId),

@@ -18,17 +18,24 @@ const fetchImpl = async (url) => {
   let body;
   if (action === "getNumber") body = "ACCESS_NUMBER:activation-1:60123456789";
   else if (action === "getStatus") body = ++smsChecks === 1 ? "STATUS_WAIT_CODE" : "STATUS_OK:OpenAI code 654321";
-  else if (action === "getPrices") body = JSON.stringify({
-    12: { dr: { cost: 0.004, count: 366063 } },
-    1001: { dr: { cost: 0.42, count: 12 } },
-    7: { dr: { cost: 0.18, count: 8 } },
-    0: { dr: { cost: 0.08, count: 0 } },
+  else if (action === "getTopCountriesByService") body = JSON.stringify({
+    "united-states-virtual": {
+      2430: { price: 0.004, count: 200000 },
+      2440: { price: 0.004, count: 166063 },
+    },
+    japan: {
+      3301: { price: 0.42, count: 7 },
+      3302: { price: 0.42, count: 5 },
+      3303: { price: 0.5, count: 3 },
+    },
+    malaysia: { 3401: { price: 0.18, count: 8 } },
+    unavailable: { 3501: { price: 0.08, count: 0 } },
   });
   else if (action === "getCountries") body = JSON.stringify({ data: [
-    { id: 12, rus: "США (виртуальные)", eng: "United States (virtual)", chn: "美国（虚拟号码）" },
+    { id: 352, activate_org_code: "12", slug: "united-states-virtual", rus: "США (виртуальные)", eng: "United States (virtual)", chn: "美国（虚拟号码）" },
     { id: 1001, rus: "Япония", eng: "Japan", chn: "日本" },
     { id: 7, rus: "Малайзия", eng: "Malaysia", chn: "马来西亚" },
-    { id: 0, rus: "Unavailable", eng: "Unavailable", chn: "无库存" },
+    { id: 0, slug: "unavailable", rus: "Unavailable", eng: "Unavailable", chn: "无库存" },
   ] });
   else if (action === "setStatus") {
     body = {
@@ -41,7 +48,7 @@ const fetchImpl = async (url) => {
 };
 
 const client = createSmsBowerClient({ apiKey: "test-api-key", fetchImpl });
-const order = await client.getNumber("dr", "1001", "0.42");
+const order = await client.getNumber("dr", "1001", "0.42", "3301,3302");
 assert.deepEqual(order, { requestId: "activation-1", number: "+60123456789" });
 assert.equal((await client.getSms(order.requestId)).status, "waiting");
 assert.deepEqual(await client.getSms(order.requestId), { status: "received", code: "654321" });
@@ -52,11 +59,15 @@ assert.equal(requests[0].searchParams.get("api_key"), "test-api-key");
 assert.equal(requests[0].searchParams.get("service"), "dr");
 assert.equal(requests[0].searchParams.get("country"), "1001");
 assert.equal(requests[0].searchParams.get("maxPrice"), "0.42");
+assert.equal(requests[0].searchParams.get("providerIds"), "3301,3302");
 assert.deepEqual(await client.getPriceOptions("dr"), [
-  { country: "12", title: "美国（虚拟号码）", iso: "", prefix: "", price: 0.004, count: 366063 },
-  { country: "7", title: "马来西亚", iso: "", prefix: "", price: 0.18, count: 8 },
-  { country: "1001", title: "日本", iso: "", prefix: "", price: 0.42, count: 12 },
+  { country: "12", title: "美国（虚拟号码）", iso: "", prefix: "", price: 0.004, count: 366063, providerIds: "2430,2440" },
+  { country: "7", title: "马来西亚", iso: "", prefix: "", price: 0.18, count: 8, providerIds: "3401" },
+  { country: "1001", title: "日本", iso: "", prefix: "", price: 0.42, count: 12, providerIds: "3301,3302" },
+  { country: "1001", title: "日本", iso: "", prefix: "", price: 0.5, count: 3, providerIds: "3303" },
 ]);
+assert.ok(requests.some((request) => request.searchParams.get("action") === "getTopCountriesByService"));
+assert.ok(!requests.some((request) => request.searchParams.get("action") === "getPrices"));
 
 const badClient = createSmsBowerClient({
   apiKey: "test-api-key",
@@ -78,6 +89,7 @@ const provider = createSmsProvider("smsbower", {
   service: "dr",
   country: "1001",
   maxPrice: "0.42",
+  providerIds: "3301,3302",
   countryLabel: "日本",
 }, { fetchImpl });
 assert.equal(provider.name, "SMSBower");
@@ -85,6 +97,19 @@ assert.equal(provider.serviceLabel, "日本");
 assert.deepEqual(await provider.getNumber(), { requestId: "activation-1", number: "+60123456789" });
 assert.equal((await provider.listNumberOptions())[0].country, "12");
 assert.throws(() => createSmsProvider("smsbower", { apiKey: "short", service: "dr", country: "1001" }), /API Key/);
+assert.throws(
+  () => createSmsProvider("smsbower", { apiKey: "test-api-key", service: "dr", country: "1001", providerIds: "3301,bad" }),
+  /Gold 价格/,
+);
+await assert.rejects(
+  () => createSmsProvider("smsbower", {
+    apiKey: "test-api-key",
+    service: "dr",
+    country: "1001",
+    maxPrice: "0.42",
+  }, { fetchImpl }).getNumber(),
+  /先查询并选择 SMSBower Gold 价格/,
+);
 assert.deepEqual(parseCustomSmsEntries([
   "+8613711111111----https://sms.example/first",
   "+8613822222222----https://sms.example/second",

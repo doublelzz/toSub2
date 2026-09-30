@@ -201,6 +201,10 @@ function App() {
     () => resolveSmsProvider(smsProviderDefinitions, smsSettingsDraft),
     [smsProviderDefinitions, smsSettingsDraft],
   );
+  const selectedSmsNumberOption = useMemo(
+    () => findSmsNumberOption(smsNumberOptions, draftSmsProvider.config),
+    [smsNumberOptions, draftSmsProvider.config],
+  );
   const selectedJobs = useMemo(
     () => jobSelectionIndex.filter((job) => selectedJobIds.has(job.id)),
     [jobSelectionIndex, selectedJobIds],
@@ -389,12 +393,13 @@ function App() {
       const options = Array.isArray(data.options) ? data.options : [];
       setSmsNumberOptions(options);
       const current = resolved.config.maxPrice
-        ? options.find((option) => option.country === resolved.config.country) || options[0]
+        ? findSmsNumberOption(options, resolved.config) || options[0]
         : options[0];
       if (!current) throw new Error("当前没有可购买的国家号码");
       updateSmsProviderConfig(resolved.id, {
         country: current.country,
         maxPrice: String(current.price),
+        providerIds: current.providerIds || "",
         countryLabel: formatSmsCountryName(current),
       });
     } catch (requestError) {
@@ -1071,13 +1076,16 @@ function App() {
                           <div className="price-select-box">
                             <Settings2 size={15} />
                             <select
-                              value={draftSmsProvider.config.country || ""}
+                              value={selectedSmsNumberOption
+                                ? smsPriceOptionKey(selectedSmsNumberOption)
+                                : draftSmsProvider.config.country || ""}
                               onChange={(event) => {
-                                const selected = smsNumberOptions.find((option) => option.country === event.target.value);
+                                const selected = smsNumberOptions.find((option) => smsPriceOptionKey(option) === event.target.value);
                                 if (!selected) return;
                                 updateSmsProviderConfig(draftSmsProvider.id, {
                                   country: selected.country,
                                   maxPrice: String(selected.price),
+                                  providerIds: selected.providerIds || "",
                                   countryLabel: formatSmsCountryName(selected),
                                 });
                               }}
@@ -1090,7 +1098,7 @@ function App() {
                                 </option>
                               )}
                               {smsNumberOptions.map((option) => (
-                                <option key={option.country} value={option.country}>{formatSmsPriceOption(option)}</option>
+                                <option key={smsPriceOptionKey(option)} value={smsPriceOptionKey(option)}>{formatSmsPriceOption(option)}</option>
                               ))}
                             </select>
                           </div>
@@ -2293,6 +2301,23 @@ function formatSmsCountryName(option) {
 function formatSmsPriceOption(option) {
   const name = formatSmsCountryName(option);
   return `${name} | 价格 ${option.price} | 库存 ${option.count}`;
+}
+
+function smsPriceOptionKey(option) {
+  return `${option.country}|${option.price}|${option.providerIds || ""}`;
+}
+
+function findSmsNumberOption(options, config = {}) {
+  const country = String(config.country || "");
+  const price = Number(config.maxPrice);
+  const providerIds = String(config.providerIds || "");
+  return options.find((option) => (
+    option.country === country
+    && Number(option.price) === price
+    && (!providerIds || option.providerIds === providerIds)
+  )) || options.find((option) => option.country === country && Number(option.price) === price)
+    || options.find((option) => option.country === country)
+    || null;
 }
 
 function writeLocalJson(key, value) {

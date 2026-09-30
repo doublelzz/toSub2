@@ -54,9 +54,10 @@ export function createSmsBowerClient(options = {}) {
   }
 
   return {
-    async getNumber(service, country, maxPrice = "") {
+    async getNumber(service, country, maxPrice = "", providerIds = "") {
       const params = { service, country };
       if (maxPrice !== "") params.maxPrice = maxPrice;
+      if (providerIds !== "") params.providerIds = providerIds;
       const text = await request("getNumber", params);
       const match = /^ACCESS_NUMBER:([^:]+):(\+?\d+)$/.exec(text);
       if (!match) throw responseError(text, "获取手机号失败");
@@ -68,13 +69,12 @@ export function createSmsBowerClient(options = {}) {
 
     async getPriceOptions(service) {
       const [pricesText, countriesText] = await Promise.all([
-        request("getPrices", { service }),
+        request("getTopCountriesByService", { service }),
         request("getCountries"),
       ]);
-      return normalizePriceOptions(
+      return normalizeGoldPriceOptions(
         parseJsonResponse(pricesText, "价格接口返回格式不正确"),
         parseJsonResponse(countriesText, "国家接口返回格式不正确"),
-        service,
       );
     },
 
@@ -132,40 +132,68 @@ function parseJsonResponse(value, fallback) {
   }
 }
 
-function normalizePriceOptions(prices, countries, service) {
+function normalizeGoldPriceOptions(pricesValue, countries) {
+  const prices = unwrapDataObject(pricesValue);
   if (!prices || typeof prices !== "object" || Array.isArray(prices)) {
     throw new SmsBowerError("价格接口返回格式不正确", { terminal: true });
   }
   const countryList = collectCountryRecords(countries);
   const countryIndex = new Map();
   countryList.forEach((country) => {
-    const keys = [country.activate_org_code, country.id, country.slug, country.title, country.eng, country.chn, country.iso, country.__alias];
+    const keys = [
+      country.activate_org_code,
+      country.id,
+      country.slug,
+      country.title,
+      country.eng,
+      country.chn,
+      country.iso,
+      country.__alias,
+      ...Object.values(country.alternative_params || {}),
+      ...String(country.alternative_title_locale || "").split("|"),
+    ];
     keys.filter((key) => key !== undefined && key !== null && key !== "").forEach((key) => {
-      countryIndex.set(String(key).toLowerCase(), country);
+      countryIndex.set(normalizeCountryAlias(key), country);
     });
+    const countryCode = String(country.activate_org_code ?? country.id ?? "");
+    if (countryCode === "12") countryIndex.set("usa", country);
+    if (countryCode === "187") countryIndex.set("usaphysical", country);
+    if (countryCode === "16") countryIndex.set("england", country);
   });
 
   const options = new Map();
-  Object.entries(prices).forEach(([countryKey, services]) => {
-    const details = services?.[service] || services;
-    const cost = Number(details?.cost);
-    const count = Number(details?.count);
-    if (!Number.isFinite(cost) || cost < 0 || !Number.isFinite(count) || count <= 0) return;
-    const countryInfo = countryIndex.get(String(countryKey).toLowerCase()) || {};
-    const country = String(countryInfo.activate_org_code ?? countryKey);
+  Object.entries(prices).forEach(([countryKey, partners]) => {
+    if (!partners || typeof partners !== "object" || Array.isArray(partners)) return;
+    const countryInfo = countryIndex.get(normalizeCountryAlias(countryKey)) || {};
+    const country = String(countryInfo.activate_org_code ?? countryInfo.id ?? countryKey);
     if (!/^\d{1,5}$/.test(country)) return;
-    const option = {
-      country,
-      title: safeMessage(countryInfo.chn || countryInfo.title || countryInfo.eng || fallbackCountryName(country)),
-      iso: /^[A-Z]{2}$/.test(String(countryInfo.iso || "").toUpperCase())
-        ? String(countryInfo.iso).toUpperCase()
-        : "",
-      prefix: String(countryInfo.prefix || "").replace(/\D/g, "").slice(0, 4),
-      price: cost,
-      count: Math.floor(count),
-    };
-    const existing = options.get(country);
-    if (!existing || option.price < existing.price) options.set(country, option);
+    Object.entries(partners).forEach(([providerKey, details]) => {
+      const providerId = String(details?.provider_id ?? providerKey);
+      const price = Number(details?.price ?? details?.cost);
+      const count = Number(details?.count);
+      if (!/^\d{1,12}$/.test(providerId)) return;
+      if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(count) || count <= 0) return;
+
+      const optionKey = `${country}|${price}`;
+      const existing = options.get(optionKey);
+      if (existing) {
+        if (existing.providerIds.split(",").includes(providerId)) return;
+        existing.count += Math.floor(count);
+        existing.providerIds += `,${providerId}`;
+        return;
+      }
+      options.set(optionKey, {
+        country,
+        title: safeMessage(countryInfo.chn || countryInfo.title || countryInfo.eng || fallbackCountryName(country)),
+        iso: /^[A-Z]{2}$/.test(String(countryInfo.iso || "").toUpperCase())
+          ? String(countryInfo.iso).toUpperCase()
+          : "",
+        prefix: String(countryInfo.prefix || "").replace(/\D/g, "").slice(0, 4),
+        price,
+        count: Math.floor(count),
+        providerIds: providerId,
+      });
+    });
   });
 
   const result = [...options.values()].sort((left, right) => (
@@ -173,8 +201,20 @@ function normalizePriceOptions(prices, countries, service) {
     || right.count - left.count
     || left.title.localeCompare(right.title)
   ));
-  if (!result.length) throw new SmsBowerError("OpenAI 当前没有可购买的国家号码", { terminal: true });
+  if (!result.length) throw new SmsBowerError("OpenAI 当前没有可购买的 Gold 号码", { terminal: true });
   return result;
+}
+
+function unwrapDataObject(value) {
+  if (
+    value
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && value.data
+    && typeof value.data === "object"
+    && !Array.isArray(value.data)
+  ) return value.data;
+  return value;
 }
 
 function collectCountryRecords(value) {
@@ -194,6 +234,10 @@ function collectCountryRecords(value) {
   };
   visit(value);
   return records;
+}
+
+function normalizeCountryAlias(value) {
+  return String(value || "").toLowerCase().replace(/[^a-z0-9\p{L}]+/gu, "");
 }
 
 function fallbackCountryName(country) {
