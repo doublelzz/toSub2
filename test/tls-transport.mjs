@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   browserIdentityForTlsProfile,
+  DEFAULT_TLS_PROFILE,
   DirectTlsProfileProbe,
   proxySupportsSessionRotation,
   rotateProxySession,
@@ -29,11 +30,17 @@ const server = http.createServer(async (req, res) => {
 
 await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
 const address = server.address();
-const transport = new TlsFingerprintTransport({ enabled: true, profile: "chrome146" });
+const transport = new TlsFingerprintTransport({ enabled: true });
 
 try {
   const getResponse = await transport.request("GET", `http://127.0.0.1:${address.port}/get`);
   assert.equal(getResponse.status, 200);
+  assert.equal(transport.profile, "chrome150", "the default must be supported without falling back");
+  const defaultIdentity = await transport.request("GET", `http://127.0.0.1:${address.port}/identity`);
+  const defaultHeaders = (await defaultIdentity.json()).headers;
+  assert.match(defaultHeaders["user-agent"], /Chrome\/150\.0\.0\.0/);
+  assert.match(defaultHeaders["sec-ch-ua"], /"Chromium";v="150"/);
+  assert.equal(defaultHeaders["sec-ch-ua-platform"], '"macOS"');
   assert.deepEqual(JSON.parse(await getResponse.text()), { method: "GET", body: "" });
   assert.deepEqual(await getResponse.json(), { method: "GET", body: "" });
   assert.equal(getResponse.headers.rawSetCookie.length, 2);
@@ -201,7 +208,7 @@ try {
       solveOperations += 1;
       assert.equal(message.url, "https://chatgpt.com/");
       assert.match(Buffer.from(message.challengeBody, "base64").toString("utf8"), /_cf_chl_opt/);
-      assert.match(message.userAgent, /Chrome\/146/);
+      assert.match(message.userAgent, /Chrome\/150/);
       assert.equal(message.browserIdentity.platform, "MacIntel");
       assert.equal(message.browserIdentity.locale, "zh-CN");
       assert.equal(message.browserIdentity.languages[0], "zh-CN");
@@ -329,15 +336,15 @@ class FakeRequests:
     @classmethod
     def Session(cls, impersonate, proxy):
         cls.attempts.append(impersonate)
-        if impersonate == "chrome146":
-            raise RuntimeError("Impersonating chrome146 is not supported")
+        if impersonate == "chrome150":
+            raise RuntimeError("Impersonating chrome150 is not supported")
         return FakeSession()
 
 module.requests = FakeRequests
 worker = module.Worker()
-worker.configure(None, "chrome146")
-assert worker.impersonate == "chrome145", worker.impersonate
-assert FakeRequests.attempts[:2] == ["chrome146", "chrome145"], FakeRequests.attempts
+worker.configure(None, None)
+assert worker.impersonate == "chrome146", worker.impersonate
+assert FakeRequests.attempts[:2] == ["chrome150", "chrome146"], FakeRequests.attempts
 `;
   const result = spawnSync(python.command, [...python.args, "-c", script, workerPath], {
     encoding: "utf8",
@@ -346,16 +353,16 @@ assert FakeRequests.attempts[:2] == ["chrome146", "chrome145"], FakeRequests.att
   });
   assert.equal(result.status, 0, `configure-stage TLS fallback failed:\n${result.stderr || result.stdout}`);
 
-  const transport = new TlsFingerprintTransport({ enabled: true, profile: "chrome146" });
+  const transport = new TlsFingerprintTransport({ enabled: true });
   transport.send = async (message) => {
     assert.equal(message.operation, "configure");
-    assert.equal(message.impersonate, "chrome146");
+    assert.equal(message.impersonate, "chrome150");
     assert.equal(message.verifyTls, true);
-    return { configured: true, profile: "chrome145" };
+    return { configured: true, profile: "chrome146" };
   };
   await transport.configure(null);
-  assert.equal(transport.profile, "chrome145");
-  assert.equal(transport.configuredProfile, "chrome145");
+  assert.equal(transport.profile, "chrome146");
+  assert.equal(transport.configuredProfile, "chrome146");
 }
 
 function testCloudflareWorkerSessionReuse() {
@@ -555,8 +562,10 @@ bounded = module.Worker().probe_profiles(
 )
 assert bounded == {"profile": "chrome142", "attempts": 4}, bounded
 assert FakeRequests.attempts == ["chrome146", "chrome142", "chrome141", "chrome140"]
+from typing import Literal
+module.BrowserTypeLiteral = Literal["chrome150", "chrome146", "chrome142", "chrome131_android", "chrome"]
 profiles = worker._supported_chrome_profiles()
-assert profiles[0] == "chrome146", profiles
+assert profiles[0] == "chrome150", profiles
 assert "chrome142" in profiles
 assert "chrome131_android" not in profiles
 assert "chrome" not in profiles
@@ -637,6 +646,10 @@ async function testSharedDirectProfileProbe() {
 }
 
 function testBrowserIdentity() {
+  assert.equal(DEFAULT_TLS_PROFILE, "chrome150");
+  const defaults = browserIdentityForTlsProfile();
+  assert.equal(defaults.browserMajorVersion, 150);
+  assert.match(defaults.userAgent, /Chrome\/150\.0\.0\.0/);
   const modern = browserIdentityForTlsProfile("chrome145");
   assert.match(modern.userAgent, /Macintosh; Intel Mac OS X 10_15_7/);
   assert.match(modern.userAgent, /Chrome\/145\.0\.0\.0/);
@@ -675,8 +688,8 @@ function findTestPython() {
   const candidates = configured
     ? [{ command: configured, args: [] }]
     : process.platform === "win32"
-      ? [{ command: "python", args: [] }, { command: "py", args: ["-3"] }]
-      : [{ command: "python3", args: [] }, { command: "python", args: [] }];
+      ? [{ command: fileURLToPath(new URL("../.venv/Scripts/python.exe", import.meta.url)), args: [] }, { command: "python", args: [] }, { command: "py", args: ["-3"] }]
+      : [{ command: fileURLToPath(new URL("../.venv/bin/python", import.meta.url)), args: [] }, { command: "python3", args: [] }, { command: "python", args: [] }];
   return candidates.find((candidate) => spawnSync(candidate.command, [...candidate.args, "-c", "import curl_cffi"], {
     stdio: "ignore",
     windowsHide: true,

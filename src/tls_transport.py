@@ -11,6 +11,8 @@ import sys
 from typing import get_args
 from urllib.parse import urljoin, urlparse
 
+DEFAULT_TLS_PROFILE = "chrome150"
+
 try:
     from curl_cffi import requests
     from curl_cffi.requests.impersonate import BrowserTypeLiteral
@@ -43,10 +45,10 @@ class Worker:
     def __init__(self):
         self.session = None
         self.proxy = None
-        self.impersonate = "chrome146"
+        self.impersonate = DEFAULT_TLS_PROFILE
         self.verify_tls = True
         self.sentinel_client = None
-        self.fallback_profiles = ("chrome146", "chrome145", "chrome142", "chrome136")
+        self.fallback_profiles = (DEFAULT_TLS_PROFILE, "chrome146", "chrome145", "chrome142", "chrome136")
 
     def configure(self, proxy, impersonate, allow_fallback=True, verify_tls=True):
         if IMPORT_ERROR:
@@ -60,7 +62,7 @@ class Worker:
             self.session = None
         self.proxy = proxy or None
         self.verify_tls = bool(verify_tls)
-        requested_profile = impersonate or "chrome146"
+        requested_profile = impersonate or DEFAULT_TLS_PROFILE
         profiles = [requested_profile]
         if allow_fallback:
             profiles.extend(

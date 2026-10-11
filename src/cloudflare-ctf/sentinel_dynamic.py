@@ -24,10 +24,10 @@ from curl_cffi import requests
 BASE_DIR = Path(__file__).resolve().parent
 RUNTIME = BASE_DIR / "sentinel_runtime.cjs"
 PROXY = "http://127.0.0.1:8080"
-TLS_PROFILE = "chrome145"
+TLS_PROFILE = "chrome150"
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
 )
 SENTINEL_LOADER = "https://sentinel.openai.com/backend-api/sentinel/sdk.js"
 

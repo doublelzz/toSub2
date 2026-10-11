@@ -10,18 +10,18 @@ import { fileURLToPath } from "node:url";
 import react from "@vitejs/plugin-react";
 import { createServer as createViteServer } from "vite";
 import { createCredentialStore } from "./credential-store.mjs";
+import { createMfaWorkspace } from "./mfa-workspace.mjs";
 import {
   fetchMailboxOtpCandidates,
   filterMailboxOtpCandidatesByRequestTime,
   validateMailApiUrl,
 } from "./mail-otp.mjs";
 import { createSmsProvider, publicSmsProviderDefinitions } from "./sms-providers.mjs";
-import { DirectTlsProfileProbe, proxySupportsSessionRotation } from "./tls-transport.mjs";
+import { DEFAULT_TLS_PROFILE, DirectTlsProfileProbe, proxySupportsSessionRotation } from "./tls-transport.mjs";
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 4399;
 const MAX_ACTIVE_JOBS = 20;
-const DEFAULT_TLS_PROFILE = "chrome146";
 const MAX_BATCH_JOBS = 500;
 const MAX_PROXY_RISK_RETRIES = 10;
 const MAX_PROXY_CONNECTION_FAILURES = 20;
@@ -72,6 +72,7 @@ const consoleToken = crypto.randomBytes(24).toString("base64url");
 const jobs = new Map();
 const customSmsPoolPositions = new Map();
 const emailJobLocks = new Map();
+let mfaWorkspace = null;
 let outputSyncPromise = null;
 let lastOutputSyncAt = 0;
 let shuttingDown = false;
@@ -122,6 +123,22 @@ if (!Number.isInteger(requestedPort) || requestedPort < 1 || requestedPort > 655
 await fs.mkdir(OUTPUT_ROOT, { recursive: true });
 await loadSub2ApiMonitorConfiguration();
 await syncCompletedOutputs(true);
+const mfaCredentialStore = createCredentialStore({
+  windowsRoot: path.join(OUTPUT_ROOT, "mfa", "credentials"),
+  macRoot: path.join(OUTPUT_ROOT, "mfa", "credentials"),
+});
+const mfaCredentialPrefix = `mfa:${crypto.createHash("sha256").update(OUTPUT_ROOT).digest("hex")}:`;
+mfaWorkspace = await createMfaWorkspace({
+  root: OUTPUT_ROOT,
+  protocolScript: PROTOCOL_SCRIPT,
+  credentialStore: {
+    save: (email, credentials) => mfaCredentialStore.save(`${mfaCredentialPrefix}${email}`, credentials),
+    load: (email) => mfaCredentialStore.load(`${mfaCredentialPrefix}${email}`),
+  },
+  isAccountBusy: (email) => emailJobLocks.has(email.toLowerCase())
+    || [...jobs.values()].some((job) => job.email.toLowerCase() === email.toLowerCase() && isActive(job.status)),
+  onSuccess: syncMfaCredentials,
+});
 scheduleQueuedJobs();
 scheduleSub2ApiMonitor();
 
@@ -218,6 +235,7 @@ async function handleApi(req, res, requestUrl) {
         sub2apiMonitor: true,
         tlsFingerprint: true,
         totpSetup: true,
+        mfaChange: true,
         passwordAdd: true,
         forceRelogin: true,
       },
@@ -227,6 +245,11 @@ async function handleApi(req, res, requestUrl) {
 
   if (req.headers["x-console-token"] !== consoleToken) {
     sendJson(res, 403, { error: "Invalid console token" });
+    return;
+  }
+
+  if (requestUrl.pathname.startsWith("/api/mfa/")) {
+    await handleMfaApi(req, res, requestUrl);
     return;
   }
 
@@ -647,7 +670,72 @@ function normalizeEmailFilter(value) {
   return [...unique];
 }
 
+async function handleMfaApi(req, res, requestUrl) {
+  res.setHeader("cache-control", "no-store");
+  const action = requestUrl.pathname.slice("/api/mfa/".length);
+  if (req.method === "GET" && action === "accounts") {
+    sendJson(res, 200, mfaWorkspace.list());
+    return;
+  }
+  if (req.method === "GET" && action === "history") {
+    sendJson(res, 200, mfaWorkspace.history());
+    return;
+  }
+  if (req.method !== "POST") throw httpError(404, "MFA 接口不存在");
+  if (shuttingDown) throw httpError(503, "服务正在关闭，请稍后重试");
+  const body = await readJson(req);
+  if (!body || typeof body !== "object" || Array.isArray(body)) throw httpError(400, "请求内容必须是 JSON 对象");
+  if (action === "preview") sendJson(res, 200, mfaWorkspace.preview(body.text));
+  else if (action === "import") sendJson(res, 200, await mfaWorkspace.importAccounts(body.text));
+  else if (action === "start" || action === "logout-all") {
+    sendJson(res, 200, await mfaWorkspace[action === "start" ? "start" : "logoutAll"]({
+      ...body,
+      ...(Object.hasOwn(body, "proxyUrl") ? { proxyUrl: normalizeProxyUrl(body.proxyUrl) || "" } : {}),
+    }));
+  } else if (action === "cancel") sendJson(res, 200, await mfaWorkspace.cancel(body.ids));
+  else if (action === "export") {
+    const result = await mfaWorkspace.exportAccounts(body);
+    const payload = Buffer.isBuffer(result.body) ? result.body : Buffer.from(result.body, "utf8");
+    res.writeHead(200, {
+      "content-type": result.contentType,
+      "content-disposition": `attachment; filename="${result.filename}"`,
+      "content-length": payload.length,
+      "cache-control": "no-store",
+      "x-content-type-options": "nosniff",
+    });
+    res.end(payload);
+  } else throw httpError(404, "MFA 接口不存在");
+}
+
+function assertMfaIdle(email) {
+  if (mfaWorkspace?.isBusy(email)) throw httpError(409, "该账号正在进行 MFA 修改，请等待当前操作结束");
+}
+
+async function syncMfaCredentials(email, credentials) {
+  await withEmailJobLock(email, async () => {
+    const matching = [...jobs.values()].filter((job) => job.email.toLowerCase() === email.toLowerCase());
+    if (!matching.length) return;
+    const stored = await loadStoredLoginCredentials(email);
+    const next = { ...stored, password: credentials.password, totpSecret: credentials.totpSecret };
+    if (!(await saveStoredLoginCredentials(email, next))) throw httpError(500, "MFA 已修改，账号凭据同步未完成，请重试保存");
+    for (const job of matching) {
+      job.password = next.password;
+      job.totpSecret = next.totpSecret;
+      job.hasPasswordCredential = Boolean(next.password);
+      job.hasTotpCredential = true;
+      job.totpKnownEnabled = true;
+      job.loginMode = next.password ? "password" : job.loginMode;
+      job.totpSetupError = null;
+      recordJobOperation(job, "change_mfa");
+      appendJobLog(job, "[mfa] MFA 修改成功，登录凭据已同步，可以导出最新账号信息。\n");
+      touch(job);
+      await saveJobMetadata(job);
+    }
+  });
+}
+
 async function startJob(email, credentials = {}, proxyUrl = null) {
+  assertMfaIdle(email);
   const { loginMode, mailApiUrl, mailRequestBody, password, totpSecret } = normalizeLoginCredentials(credentials);
   await saveStoredLoginCredentials(email, { password, totpSecret, proxyUrl });
   const id = crypto.randomUUID();
@@ -963,6 +1051,7 @@ function handleChildCloseFailure(job, mode, runId, error) {
 }
 
 async function retryJob(job, options = {}) {
+  assertMfaIdle(job.email);
   if (!["failed", "canceled", "reauth_required", "resume_available"].includes(job.status)) {
     throw httpError(409, "当前任务不需要重新授权");
   }
@@ -1013,6 +1102,7 @@ async function retryJob(job, options = {}) {
 }
 
 async function regenerateJob(job, options = {}) {
+  assertMfaIdle(job.email);
   if (job.status !== "completed" || !job.resultSaved) {
     throw httpError(409, "只能为已经完成的任务重新生成授权");
   }
@@ -1040,6 +1130,7 @@ async function regenerateJob(job, options = {}) {
 }
 
 async function forceReloginJob(job, options = {}, context = {}) {
+  assertMfaIdle(job.email);
   if (!canForceRelogin(job)) {
     throw httpError(409, "当前任务正在进行中，不能重新登录");
   }
@@ -1119,6 +1210,7 @@ async function reloadMissingJobCredentials(job) {
 }
 
 async function startTotpSetup(job, options = {}) {
+  assertMfaIdle(job.email);
   if (!canSetupTotp(job)) {
     throw httpError(409, "只能为已完成授权，或已保存邮箱登录检查点且尚未设置 2FA 的账号设置 2FA");
   }
@@ -1165,6 +1257,7 @@ async function startTotpSetup(job, options = {}) {
 }
 
 async function startPasswordAdd(job, options = {}) {
+  assertMfaIdle(job.email);
   if (!canAddPassword(job)) {
     throw httpError(409, "只能为已完成授权，或已保存邮箱登录检查点且尚未保存密码的账号添加密码");
   }
@@ -3468,6 +3561,7 @@ function resolveSelectedJobs(ids) {
 }
 
 async function deleteJobsByEmail(email) {
+  assertMfaIdle(email);
   const matching = [...jobs.values()].filter((job) => job.email.toLowerCase() === email);
   const directories = new Set();
   matching.forEach((job) => {
@@ -4479,6 +4573,7 @@ function escapeRegExp(value) {
 }
 
 async function updateJobCredentials(job, credentials, options = {}) {
+  assertMfaIdle(job.email);
   if (credentials.preserveExistingCredentials) await reloadMissingJobCredentials(job);
   const normalized = credentials.preserveExistingCredentials
     ? normalizeLoginCredentials({
@@ -4521,6 +4616,7 @@ async function updateJobCredentials(job, credentials, options = {}) {
 }
 
 async function updateJobProxy(job, proxyUrl) {
+  assertMfaIdle(job.email);
   if (job.proxyUrl === proxyUrl) return;
   job.proxyUrl = proxyUrl;
   await saveStoredLoginCredentials(job.email, job);
@@ -4865,6 +4961,7 @@ async function shutdown() {
     }
     for (const controller of sub2ApiRequestControllers) controller.abort();
     await Promise.allSettled([
+      mfaWorkspace?.shutdown(),
       sub2ApiMonitorPromise,
       ...sub2ApiRequestPromises,
       ...sub2ApiAutoRepairPromises,

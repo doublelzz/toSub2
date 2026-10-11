@@ -56,7 +56,7 @@ def _log(message: str) -> None:
 
 def _browser_major(user_agent: str) -> str:
     match = re.search(r"(?:Chrome|Chromium)/(\d+)", user_agent or "")
-    return match.group(1) if match else "146"
+    return match.group(1) if match else "150"
 
 
 def navigation_headers(user_agent: str, browser_identity: dict[str, Any] | None = None) -> dict[str, str]:

@@ -11,6 +11,7 @@ from curl_cffi import requests
 from sentinel_dynamic import (
     PROXY,
     TLS_PROFILE,
+    USER_AGENT,
     fetch_assets,
     run_call,
     start_runtime,
@@ -32,10 +33,7 @@ class SentinelClient:
         device_id: str | None = None,
     ) -> None:
         self.page_url = page_url
-        self.user_agent = user_agent or (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
-        )
+        self.user_agent = user_agent or USER_AGENT
         self.browser_identity = browser_identity or {}
         self.client = client or requests.Session(
             impersonate=TLS_PROFILE,

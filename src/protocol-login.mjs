@@ -6,6 +6,7 @@ import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import {
   browserIdentityForTlsProfile,
+  DEFAULT_TLS_PROFILE,
   shouldUseTlsTransport,
   TlsFingerprintTransport,
 } from "./tls-transport.mjs";
@@ -17,6 +18,7 @@ const DEFAULT_CODEX_REDIRECT_URI = "http://localhost:1455/auth/callback";
 const DEFAULT_OUT = "tmp/chatgpt-protocol-session.json";
 const DEFAULT_SUB2API_OUT = "tmp/sub2api-import-oauth.json";
 const DEFAULT_TOTP_RESULT = "tmp/chatgpt-totp-setup.json";
+const DEFAULT_TOTP_ROTATION_RESULT = "tmp/chatgpt-totp-rotation.json";
 const DEFAULT_PASSWORD_ADD_RESULT = "tmp/chatgpt-password-add-result.json";
 const DEFAULT_TIMEOUT_MS = 30_000;
 const PROFILE_MIN_AGE = 20;
@@ -56,7 +58,7 @@ function userAgentForTransport(transport) {
 }
 
 function browserIdentityForTransport(transport) {
-  return browserIdentityForTlsProfile(transport?.identityProfile || transport?.profile || "chrome146");
+  return browserIdentityForTlsProfile(transport?.identityProfile || transport?.profile || DEFAULT_TLS_PROFILE);
 }
 
 function browserHeadersForTransport(transport) {
@@ -282,6 +284,12 @@ async function run() {
     printHelp();
     return;
   }
+  if (args.rotateTotp && (args.setupTotp || args.addPassword || args.refreshSub2api)) {
+    throw new Error("MFA_OPTIONS_INVALID: MFA rotation cannot be combined with another account operation");
+  }
+  if (args.logoutAll && (args.rotateTotp || args.setupTotp || args.addPassword || args.refreshSub2api)) {
+    throw new Error("MFA_OPTIONS_INVALID: Logout cannot be combined with another account operation");
+  }
 
   const chatgptBase = trimSlash(args.chatgptBase || process.env.CHATGPT_BASE || DEFAULT_CHATGPT_BASE);
   const authBase = trimSlash(args.authBase || process.env.AUTH_BASE || DEFAULT_AUTH_BASE);
@@ -297,8 +305,8 @@ async function run() {
     profile:
       args.tlsProfile
       || process.env.TOSUB2_TLS_PROFILE
-      || "chrome146",
-    verbose: Boolean(args.verbose),
+      || DEFAULT_TLS_PROFILE,
+    verbose: Boolean(args.verbose && !args.rotateTotp && !args.logoutAll),
     maxProxySessionAttempts: process.env.CHATGPT_PROXY_MAX_ATTEMPTS || 10,
     sameProxyRiskRetryDelayMs: process.env.CHATGPT_SAME_PROXY_RISK_RETRY_DELAY_MS,
   });
@@ -320,6 +328,27 @@ async function run() {
       return;
     }
     await transport.prepareProxy(proxyTemplate, `${chatgptBase}/`);
+    if (args.logoutAll) {
+      if (!args.logoutResult || !args.logoutAttempt) throw new Error("MFA_OPTIONS_INVALID: Logout requires a result path and attempt ID");
+      await logoutAllChatgptDevices({
+        email: String(args.email || "").trim().toLowerCase(), chatgptBase, authBase, transport,
+        resultPath: path.resolve(args.logoutResult), attemptId: args.logoutAttempt,
+        password: process.env.CHATGPT_LOGIN_PASSWORD || "", totpSecret: process.env.CHATGPT_TOTP_SECRET || "",
+      });
+      return;
+    }
+    if (args.rotateTotp) {
+      await rotateChatgptTotp({
+        email: String(args.email || "").trim().toLowerCase(),
+        chatgptBase,
+        authBase,
+        transport,
+        resultPath: path.resolve(args.totpResult || DEFAULT_TOTP_ROTATION_RESULT),
+        password: process.env.CHATGPT_LOGIN_PASSWORD || "",
+        totpSecret: process.env.CHATGPT_TOTP_SECRET || "",
+      });
+      return;
+    }
     if (args.addPassword) {
       const resultPath = path.resolve(args.passwordAddResult || DEFAULT_PASSWORD_ADD_RESULT);
       const newPassword = validateNewAccountPassword(process.env.CHATGPT_NEW_PASSWORD || "");
@@ -822,6 +851,272 @@ function isNewPasswordPage(value) {
   }
 }
 
+async function rotateChatgptTotp({ email, chatgptBase, authBase, transport, resultPath, password, totpSecret }) {
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    throw new Error("MFA_EMAIL_REQUIRED: A valid account email is required");
+  }
+  let state = {
+    version: 1, mode: "rotate", email, chatgpt_base: chatgptBase, auth_base: authBase,
+    stage: "pending", activation_succeeded: false, old_factor_disabled: false,
+    created_at: new Date().toISOString(),
+  };
+  try {
+    const saved = JSON.parse(await fs.readFile(resultPath, "utf8"));
+    if (saved?.version !== 1 || saved.mode !== "rotate" || saved.email !== email
+        || saved.chatgpt_base !== chatgptBase || saved.auth_base !== authBase
+        || typeof saved.stage !== "string"
+        || (saved.secret && !normalizeEnrolledTotpSecret(saved.secret))) {
+      throw new Error("MFA_CHECKPOINT_INVALID: The saved operation does not match this account or service");
+    }
+    state = saved;
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw new Error("MFA_CHECKPOINT_INVALID: The saved operation is invalid; it has been preserved");
+    }
+  }
+  if (state.activation_succeeded) {
+    if (!state.secret || !state.activated_at || !state.factor_id) {
+      throw new Error("MFA_CHECKPOINT_INVALID: The completed result is incomplete");
+    }
+    console.log("[ok] MFA rotation was already confirmed; keeping the existing result.");
+    return;
+  }
+  let client = new ProtocolClient({ transport, jar: CookieJar.fromJSON(state.cookies) });
+  let accessToken = "";
+  const save = async (stage, fields = {}) => {
+    state = { ...state, ...fields, stage, cookies: client.jar.toJSON(), updated_at: new Date().toISOString() };
+    await writePrivateJson(resultPath, state);
+  };
+  const readSession = async () => {
+    let result;
+    try {
+      result = await client.request("GET", `${chatgptBase}/api/auth/session`, { referer: `${chatgptBase}/` });
+    } catch {
+      throw new Error("MFA_SESSION_UNAVAILABLE: Could not verify the account session");
+    }
+    if (result.res.status !== 200) throw new Error("MFA_SESSION_INVALID: The account session expired");
+    let data;
+    try { data = JSON.parse(result.text); } catch { data = null; }
+    if (String(data?.user?.email || "").trim().toLowerCase() !== email) {
+      throw new Error("MFA_SESSION_INVALID: Could not verify the session belongs to the requested account");
+    }
+    accessToken = typeof data.accessToken === "string" ? data.accessToken : "";
+    if (!accessToken) throw new Error("MFA_SESSION_INVALID: The verified session has no access token");
+  };
+  const request = async (endpoint, payload = null) => {
+    const target = `/backend-api/accounts/${endpoint}`;
+    let result;
+    try {
+      result = await client.request(payload === null ? "GET" : "POST", `${chatgptBase}${target}`, {
+        headers: chatgptMfaHeaders({ chatgptBase, accessToken, deviceId: state.device_id }, target),
+        origin: chatgptBase, referer: `${chatgptBase}/`,
+        ...(payload === null ? {} : { json: payload }),
+      });
+    } catch {
+      throw new Error("MFA_NETWORK_ERROR: The request did not complete; retry to reconcile the saved operation");
+    }
+    if (result.res.status !== 200) {
+      if (endpoint === "mfa/user/activate_enrollment"
+          && /invalid_session|session_expired|enrollment_expired/i.test(result.text)) {
+        throw new Error("MFA_ENROLLMENT_EXPIRED: The inactive enrollment expired; retry to request a new key");
+      }
+      throw new Error(`MFA_HTTP_ERROR: The account service returned HTTP ${result.res.status}`);
+    }
+    let data;
+    try { data = JSON.parse(result.text); } catch { data = null; }
+    if (!data || typeof data !== "object" || Array.isArray(data)) {
+      throw new Error("MFA_RESPONSE_INVALID: The account service returned an invalid response");
+    }
+    return data;
+  };
+  const readInfo = async () => {
+    const info = await request("mfa_info");
+    if (!Array.isArray(info?.factors?.totp)
+        || info.factors.totp.some((factor) => !factor || typeof factor.id !== "string" || !factor.id)) {
+      throw new Error("MFA_INFO_INVALID: Could not verify the current TOTP factors");
+    }
+    return info;
+  };
+  const confirmsNewFactor = (info) => Boolean(
+    state.factor_id && (info.mfa_enabled === true || info.mfa_enabled_v2 === true)
+    && info.factors.totp.some((factor) => factor.id === state.factor_id),
+  );
+  const complete = async () => {
+    await save("confirmed", { activation_succeeded: true, activated_at: new Date().toISOString(), error_code: "" });
+    console.log("[ok] MFA rotation confirmed; the new key is saved in the private result file.");
+  };
+  try {
+    await save(state.stage);
+    if (state.cookies?.length) {
+      try { await readSession(); }
+      catch (error) {
+        if (!String(error.message).startsWith("MFA_SESSION_INVALID:")) throw error;
+        client = new ProtocolClient({ transport });
+      }
+    }
+    if (!accessToken) {
+      if (!password) throw new Error("MFA_PASSWORD_REQUIRED: A login password is required");
+      console.log("[mfa-rotation] Sign in and verify the existing account.");
+      const web = await loginChatgptWeb(client, {
+        chatgptBase, authBase, email, password,
+        totpSecret: state.old_factor_disabled && state.secret ? state.secret : totpSecret,
+        nonInteractive: true, existingOnly: true,
+      });
+      await readSession();
+      await save(state.stage === "pending" ? "authenticated" : state.stage, { device_id: web.deviceId });
+    }
+    if (!state.device_id) await save(state.stage, { device_id: crypto.randomUUID() });
+    let info = await readInfo();
+    if (confirmsNewFactor(info)) {
+      await complete();
+      return;
+    }
+    const ids = info.factors.totp.map((factor) => factor.id);
+    if (state.factor_id && ids.includes(state.factor_id)) {
+      throw new Error("MFA_CONFIRMATION_PENDING: The new factor exists but its enabled status is unconfirmed");
+    }
+    if (state.old_factor_disabled && ids.length) {
+      throw new Error("MFA_FACTOR_CONFLICT: The remote factors changed; the saved operation has been preserved");
+    }
+    if (!state.old_factor_disabled) {
+      if (ids.length > 1 || (state.old_factor_id && ids.some((id) => id !== state.old_factor_id))) {
+        throw new Error("MFA_FACTOR_CONFLICT: Expected at most the original TOTP factor");
+      }
+      if (ids.length) {
+        await save("disable_requested", { old_factor_id: ids[0] });
+        let disableError = null;
+        try { await request("mfa/user/disable_in_house", { factor_id: state.old_factor_id }); }
+        catch (error) { disableError = error; }
+        info = await readInfo();
+        if (info.factors.totp.length) {
+          throw disableError || new Error("MFA_DISABLE_UNCONFIRMED: The original factor is still enabled");
+        }
+      }
+      await save("disabled", { old_factor_disabled: true });
+    }
+    if (!state.secret || state.enrollment_expired) {
+      await save("enroll_requested");
+      const enrollment = await request("mfa/enroll", { factor_type: "totp", source: "settings" });
+      const secret = normalizeEnrolledTotpSecret(enrollment.secret);
+      const factorId = typeof enrollment.factor?.id === "string" ? enrollment.factor.id : "";
+      const sessionId = typeof enrollment.session_id === "string" ? enrollment.session_id : "";
+      if (!secret || !factorId || !sessionId) {
+        throw new Error("MFA_ENROLL_INVALID: The enrollment response is incomplete; retry to recover");
+      }
+      // Persist the one-time key and enrollment before any activation request.
+      await save("enrolled", {
+        secret, factor_id: factorId, session_id: sessionId, enrollment_expired: false,
+        activation_accepted: false, otpauth_uri: buildTotpUri(email, secret),
+      });
+    }
+    if (!state.factor_id || !state.session_id) {
+      throw new Error("MFA_CHECKPOINT_INVALID: The pending enrollment is incomplete");
+    }
+    const remainingMs = 30_000 - Date.now() % 30_000;
+    if (remainingMs < 5_000) {
+      console.log("[mfa-rotation] Waiting for the next 2FA time window before activation.");
+      await new Promise((resolve) => setTimeout(resolve, remainingMs + 50));
+    }
+    await save("activating");
+    let activationError = null;
+    try {
+      const activation = await request("mfa/user/activate_enrollment", {
+        code: generateTotp(state.secret), factor_type: "totp", session_id: state.session_id, source: "settings",
+      });
+      if (activation.success === true) await save("activating", { activation_accepted: true });
+      else activationError = new Error("MFA_ACTIVATION_UNCONFIRMED: Activation was not confirmed by the account service");
+    } catch (error) { activationError = error; }
+    info = await readInfo();
+    if (confirmsNewFactor(info)) {
+      await complete();
+      return;
+    }
+    if (String(activationError?.message).startsWith("MFA_ENROLLMENT_EXPIRED:") && !info.factors.totp.length) {
+      await save("enrolled", { enrollment_expired: true });
+    }
+    throw activationError || new Error("MFA_CONFIRMATION_PENDING: The new factor has not been confirmed; retry to reconcile it");
+  } catch (error) {
+    const { message, ...diagnostics } = mfaOperationError(error);
+    await save(state.stage, diagnostics).catch(() => {});
+    throw new Error(message);
+  }
+}
+
+function mfaOperationError(error, fallback = "MFA_ROTATION_FAILED") {
+  const detail = String(error?.message || "");
+  const httpStatus = /(?:HTTP|with status)\s+(\d{3})/i.exec(detail)?.[1] || "";
+  const loginPage = /^UNEXPECTED_LOGIN_PAGE:/.test(detail);
+  const securityCheck = /^PROXY_RISK_CONTROL:/.test(detail);
+  const message = /^MFA_[A-Z_]+:/.test(detail) ? detail
+    : loginPage ? "MFA_LOGIN_PAGE_CHANGED: The login service returned an unsupported page"
+    : securityCheck ? "MFA_LOGIN_SECURITY_CHECK: The login service requires an additional security check"
+    : httpStatus ? `MFA_LOGIN_HTTP_ERROR: The login service returned HTTP ${httpStatus}`
+    : `${fallback}: The operation stopped; retry to check the saved result`;
+  let endpoint = "";
+  const targetUrl = /https?:\/\/[^\s]+/.exec(detail)?.[0];
+  if (targetUrl) {
+    try { endpoint = new URL(targetUrl).pathname; } catch {}
+  } else if (loginPage) {
+    endpoint = /received (\/[a-zA-Z0-9/_-]+)/.exec(detail)?.[1] || "";
+  }
+  return { message, error_code: message.split(":", 1)[0], error_http_status: httpStatus, error_endpoint: endpoint };
+}
+
+async function logoutAllChatgptDevices({ email, chatgptBase, authBase, transport, resultPath, attemptId, password, totpSecret }) {
+  const state = { version: 1, mode: "logout_all", email, attempt_id: attemptId, stage: "pending", logout_succeeded: false };
+  const save = async (fields = {}) => {
+    Object.assign(state, fields, { updated_at: new Date().toISOString() });
+    await writePrivateJson(resultPath, state);
+  };
+  try {
+    await save();
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error("MFA_EMAIL_REQUIRED: A valid account email is required");
+    if (!password) throw new Error("MFA_PASSWORD_REQUIRED: A login password is required");
+    const client = new ProtocolClient({ transport });
+    const web = await loginChatgptWeb(client, { chatgptBase, authBase, email, password, totpSecret, nonInteractive: true, existingOnly: true });
+    const session = await client.request("GET", `${chatgptBase}/api/auth/session`, { referer: `${chatgptBase}/` });
+    if (session.res.status !== 200) throw new Error("MFA_SESSION_INVALID: The account session expired");
+    let data;
+    try { data = JSON.parse(session.text); } catch {}
+    if (String(data?.user?.email || "").trim().toLowerCase() !== email || !data?.accessToken) {
+      throw new Error("MFA_SESSION_INVALID: Could not verify the session belongs to the requested account");
+    }
+    let accountId = data.account?.id;
+    if (!accountId) {
+      try { accountId = decodeJwtPayload(data.accessToken)["https://api.openai.com/auth"]?.chatgpt_account_id; } catch {}
+    }
+    if (typeof accountId !== "string" || !/^[a-zA-Z0-9_-]{1,128}$/.test(accountId)) {
+      throw new Error("MFA_LOGOUT_ACCOUNT_REQUIRED: The verified session has no account ID");
+    }
+    const target = "/backend-api/accounts/logout_all";
+    await save({ stage: "logout_requested" });
+    let result;
+    try {
+      // The captured request is a bodyless POST. Use this account's fresh
+      // session and account ID; no credentials are copied from the HAR.
+      result = await client.request("POST", `${chatgptBase}${target}`, {
+        headers: { ...chatgptMfaHeaders({ chatgptBase, accessToken: data.accessToken, deviceId: web.deviceId }, target),
+          "oai-did": web.deviceId, "ChatGPT-Account-Id": accountId },
+        origin: chatgptBase, referer: `${chatgptBase}/`,
+      });
+    } catch {
+      throw new Error("MFA_LOGOUT_NETWORK_ERROR: Logout was not confirmed; retry to check the account");
+    }
+    if (result.res.status !== 200) throw new Error(`MFA_LOGOUT_HTTP_ERROR: Logout returned HTTP ${result.res.status}`);
+    let response;
+    try { response = JSON.parse(result.text); } catch {
+      throw new Error("MFA_LOGOUT_RESPONSE_INVALID: Logout returned an invalid response");
+    }
+    if (response !== null && response?.success !== true) throw new Error("MFA_LOGOUT_UNCONFIRMED: Logout was not confirmed");
+    await save({ stage: "logout_confirmed", logout_succeeded: true, logout_at: new Date().toISOString(), error_code: "" });
+    console.log("[ok] Logout of all devices was accepted by the account service.");
+  } catch (error) {
+    const { message, ...diagnostics } = mfaOperationError(error, "MFA_LOGOUT_FAILED");
+    await save(diagnostics).catch(() => {});
+    throw new Error(message);
+  }
+}
+
 async function setupChatgptTotp(client, { chatgptBase, email, rl, deviceId, resultPath }) {
   console.log("[2/3] Check current 2FA status");
   const enablePage = await client.follow(`${chatgptBase}/?action=enable&factor=totp`, {
@@ -986,7 +1281,7 @@ async function askSetupTotpOtp(rl) {
   }
 }
 
-async function loginChatgptWeb(client, { chatgptBase, authBase, email, rl, password, totpSecret }) {
+async function loginChatgptWeb(client, { chatgptBase, authBase, email, rl, password, totpSecret, existingOnly = false, nonInteractive = false }) {
   await client.follow(`${chatgptBase}/`, { referer: `${chatgptBase}/` });
   await client.getJson("GET", `${chatgptBase}/api/auth/providers`, {
     referer: `${chatgptBase}/`,
@@ -1008,7 +1303,7 @@ async function loginChatgptWeb(client, { chatgptBase, authBase, email, rl, passw
       prompt: "login",
       "ext-oai-did": deviceId,
       auth_session_logging_id: authSessionLoggingId,
-      screen_hint: "login_or_signup",
+      screen_hint: existingOnly ? "login" : "login_or_signup",
       login_hint: email,
     }).toString();
 
@@ -1025,8 +1320,8 @@ async function loginChatgptWeb(client, { chatgptBase, authBase, email, rl, passw
 
   const authRequestStartedAt = new Date().toISOString();
   const authPage = await client.follow(signin.url, { referer: `${chatgptBase}/` });
-  console.log(`[info] Auth page: ${safeUrl(authPage.finalUrl)}`);
-  if (authPage.last?.text) {
+  if (!nonInteractive) console.log(`[info] Auth page: ${safeUrl(authPage.finalUrl)}`);
+  if (authPage.last?.text && !nonInteractive) {
     console.log(`[info] Page text: ${summarizeHtml(authPage.last.text)}`);
   }
 
@@ -1040,9 +1335,11 @@ async function loginChatgptWeb(client, { chatgptBase, authBase, email, rl, passw
       rl,
       deviceId,
       password,
+      nonInteractive,
       referer: authPage.finalUrl,
     });
   } else if (isEmailVerificationPage(authPage.finalUrl)) {
+    if (nonInteractive) throw new Error("MFA_EMAIL_VERIFICATION_REQUIRED: Complete the account email verification before retrying");
     loginMethod = "email_otp";
     console.log(`[email-otp-requested-at] ${authRequestStartedAt}`);
     console.log("[3/5] Email OTP page reached. Enter code, or type r to resend.");
@@ -1071,8 +1368,12 @@ async function loginChatgptWeb(client, { chatgptBase, authBase, email, rl, passw
     deviceId,
     payload: authenticated,
     totpSecret,
+    nonInteractive,
     referer: authPage.finalUrl,
   });
+  if (existingOnly && isAccountProfileRequired(authenticated)) {
+    throw new Error("MFA_EXISTING_ACCOUNT_REQUIRED: The login flow requested account creation");
+  }
   authenticated = await completeAccountProfileIfNeeded(client, {
     authBase,
     deviceId,
@@ -1108,9 +1409,10 @@ async function selectChatgptLoginWorkspaceIfNeeded(client, { authBase, payload }
   return data;
 }
 
-async function verifyPassword(client, { authBase, rl, deviceId, password, referer }) {
+async function verifyPassword(client, { authBase, rl, deviceId, password, referer, nonInteractive = false }) {
   let nextPassword = password;
   for (;;) {
+    if (nonInteractive && !nextPassword) throw new Error("MFA_PASSWORD_REQUIRED: A login password is required");
     const value = nextPassword || (await ask(rl, "Password (q=quit): "));
     nextPassword = "";
     if (!value || value.toLowerCase() === "q") throw new Error("Stopped before password validation");
@@ -1127,12 +1429,13 @@ async function verifyPassword(client, { authBase, rl, deviceId, password, refere
       return data;
     } catch (error) {
       if (!isRejectedPasswordError(error)) throw error;
+      if (nonInteractive) throw new Error("MFA_PASSWORD_REJECTED: The login password was rejected");
       console.log("[warn] Password was rejected. Enter it again, or q to quit.");
     }
   }
 }
 
-async function completeTotpMfaIfNeeded(client, { authBase, rl, deviceId, payload, totpSecret, referer }) {
+async function completeTotpMfaIfNeeded(client, { authBase, rl, deviceId, payload, totpSecret, referer, nonInteractive = false }) {
   if (!isMfaChallengePayload(payload)) return payload;
   const factor = pickTotpFactor(payload);
   if (!factor?.id) throw new Error("2FA is required, but the response does not contain a TOTP factor ID");
@@ -1151,6 +1454,7 @@ async function completeTotpMfaIfNeeded(client, { authBase, rl, deviceId, payload
     generatedFromSecret = true;
     console.log("[mfa] Generated a 6-digit code from the configured 2FA key.");
   } else {
+    if (nonInteractive) throw new Error("MFA_SECRET_REQUIRED: The account requires its current 2FA key");
     code = await askTotpOtp(rl);
   }
   const challengeUrl = getContinueUrl(payload) || `${authBase}/mfa-challenge/${factor.id}`;
@@ -1170,6 +1474,7 @@ async function completeTotpMfaIfNeeded(client, { authBase, rl, deviceId, payload
       return data;
     } catch (error) {
       if (!isRejectedTotpError(error)) throw error;
+      if (nonInteractive) throw new Error("MFA_CODE_REJECTED: The current 2FA code was rejected");
       console.log(
         generatedFromSecret
           ? "[warn] The code generated from the configured 2FA key was rejected; enter a current code manually."
@@ -2220,6 +2525,12 @@ function parseArgs(argv) {
     else if (item === "--debug-auth") args.debugAuth = true;
     else if (item === "--web-only") args.webOnly = true;
     else if (item === "--setup-totp") args.setupTotp = true;
+    else if (item === "--rotate-totp") args.rotateTotp = true;
+    else if (item === "--logout-all") args.logoutAll = true;
+    else if (item.startsWith("--logout-result=")) args.logoutResult = item.slice("--logout-result=".length);
+    else if (item === "--logout-result") args.logoutResult = argv[++i];
+    else if (item.startsWith("--logout-attempt=")) args.logoutAttempt = item.slice("--logout-attempt=".length);
+    else if (item === "--logout-attempt") args.logoutAttempt = argv[++i];
     else if (item === "--add-password") args.addPassword = true;
     else if (item.startsWith("--password-add-result=")) args.passwordAddResult = item.slice("--password-add-result=".length);
     else if (item === "--password-add-result") args.passwordAddResult = argv[++i];
@@ -2362,7 +2673,12 @@ Options:
   --phone <phone>                 Phone number in E.164 format. If omitted, prompt when needed.
   --web-only                      Only complete ChatGPT web login, skip Codex OAuth.
   --setup-totp                    Sign in and set up TOTP 2FA; skip Codex OAuth.
+  --rotate-totp                   Replace existing TOTP or set it up, with resumable private state.
+  --logout-all                    Sign in with current credentials and log out all devices.
+  --logout-result <file>          Private logout result; required with --logout-all.
+  --logout-attempt <id>           Unique operation ID; required with --logout-all.
   --totp-result <file>            Private 2FA setup result. Default: ${DEFAULT_TOTP_RESULT}
+                                 With --rotate-totp, default: ${DEFAULT_TOTP_ROTATION_RESULT}
   --add-password                  Sign in and add a password to a passwordless account.
   --password-add-result <file>    Private add-password result. Default: ${DEFAULT_PASSWORD_ADD_RESULT}
   --out <file>                    Output JSON path. Default: ${DEFAULT_OUT}
@@ -2377,7 +2693,7 @@ Options:
   --priority <number>             sub2api priority. Default: 1
   --rate-multiplier <number>      sub2api rate_multiplier. Default: 1
   --proxy <url>                   Account proxy; supports http, socks5 and socks5h.
-  --tls-profile <name>            curl_cffi browser profile. Default: chrome146; use auto to enable probing
+  --tls-profile <name>            curl_cffi browser profile. Default: ${DEFAULT_TLS_PROFILE}; use auto to enable probing
   --native-http                   Disable the Python TLS fingerprint transport.
   --chatgpt-base <url>            Default: ${DEFAULT_CHATGPT_BASE}
   --auth-base <url>               Default: ${DEFAULT_AUTH_BASE}

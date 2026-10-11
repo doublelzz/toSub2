@@ -32,6 +32,7 @@ import {
   X,
 } from "lucide-react";
 import "./styles.css";
+import MfaWorkspace from "./MfaWorkspace.jsx";
 
 const POLL_INTERVAL_MS = 900;
 const LUBAN_API_KEY_STORAGE_KEY = "chatgpt-onboarding.luban-api-key";
@@ -55,6 +56,7 @@ const REGION_NAMES = typeof Intl.DisplayNames === "function"
   : null;
 
 function App() {
+  const [activeWorkspace, setActiveWorkspace] = useState("authorization");
   const [token, setToken] = useState("");
   const [features, setFeatures] = useState({});
   const [jobs, setJobs] = useState([]);
@@ -721,13 +723,23 @@ function App() {
             <p>本地多任务协议登录</p>
           </div>
         </div>
-        <div className="summary" aria-label="任务统计">
+        {activeWorkspace === "authorization" && <div className="summary" aria-label="任务统计">
           <span><i className="status-dot active" />进行中 <strong>{stats.active}</strong></span>
           <span><i className="status-dot queued" />排队中 <strong>{stats.queued || 0}</strong></span>
           <span><i className="status-dot complete" />已完成 <strong>{stats.completed}</strong></span>
-        </div>
+        </div>}
       </header>
 
+      <nav className="workspace-tabs" aria-label="工作区">
+        <button type="button" className={activeWorkspace === "authorization" ? "active" : ""} aria-pressed={activeWorkspace === "authorization"} onClick={() => setActiveWorkspace("authorization")}>
+          <LogIn size={17} />账号授权
+        </button>
+        <button type="button" className={activeWorkspace === "mfa" ? "active" : ""} aria-pressed={activeWorkspace === "mfa"} onClick={() => setActiveWorkspace("mfa")}>
+          <ShieldCheck size={17} />MFA 修改
+        </button>
+      </nav>
+      {activeWorkspace === "mfa" && <MfaWorkspace token={token} defaultProxyUrl={accountProxyUrl} />}
+      {activeWorkspace === "authorization" && <>
       <section className="workspace">
         <div className="section-heading">
           <div>
@@ -1483,6 +1495,7 @@ function App() {
           </form>
         </div>
       )}
+      </>}
     </main>
   );
 }
@@ -2037,6 +2050,7 @@ function operationLabel(type) {
     automatic_relogin: "号池自动重登并授权",
     resume: "继续中断流程",
     setup_2fa: "设置 2FA",
+    change_mfa: "修改 MFA",
     add_password: "添加密码",
     account_update: "更新账号资料",
     proxy_update: "更新代理 IP",

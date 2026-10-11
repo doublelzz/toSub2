@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WORKER_SCRIPT = path.join(__dirname, "tls_transport.py");
-const DEFAULT_PROFILE = "chrome146";
+export const DEFAULT_TLS_PROFILE = "chrome150";
 const DEFAULT_TIMEOUT_MS = 30_000;
 const PROFILE_PROBE_TIMEOUT_MS = 15_000;
 const PROFILE_PROBE_TOTAL_TIMEOUT_MS = 300_000;
@@ -15,9 +15,9 @@ const DEFAULT_SAME_PROXY_RISK_RETRY_DELAY_MS = 1_000;
 const DEFAULT_CLOUDFLARE_SOLVER_TIMEOUT_MS = 70_000;
 const UNCONFIGURED = Symbol("unconfigured");
 
-export function browserIdentityForTlsProfile(profile = DEFAULT_PROFILE) {
-  const normalizedProfile = String(profile || DEFAULT_PROFILE).trim();
-  const majorVersion = Number(/^chrome(\d+)/i.exec(normalizedProfile)?.[1] || 146);
+export function browserIdentityForTlsProfile(profile = DEFAULT_TLS_PROFILE) {
+  const normalizedProfile = String(profile || DEFAULT_TLS_PROFILE).trim();
+  const majorVersion = Number(/^chrome(\d+)/i.exec(normalizedProfile)?.[1] || 150);
   const usesMacOs = majorVersion >= 119;
   const platformToken = usesMacOs
     ? "Macintosh; Intel Mac OS X 10_15_7"
@@ -47,7 +47,7 @@ export function browserIdentityForTlsProfile(profile = DEFAULT_PROFILE) {
 export class TlsFingerprintTransport {
   constructor({
     enabled = true,
-    profile = DEFAULT_PROFILE,
+    profile = DEFAULT_TLS_PROFILE,
     verbose = false,
     maxProxySessionAttempts = 10,
     sameProxyRiskRetries = DEFAULT_SAME_PROXY_RISK_RETRIES,
@@ -56,7 +56,7 @@ export class TlsFingerprintTransport {
     cloudflareSolverTimeoutMs = DEFAULT_CLOUDFLARE_SOLVER_TIMEOUT_MS,
   } = {}) {
     this.enabled = Boolean(enabled);
-    this.profile = profile || DEFAULT_PROFILE;
+    this.profile = profile || DEFAULT_TLS_PROFILE;
     this.identityProfile = this.profile;
     this.verbose = Boolean(verbose);
     this.child = null;
@@ -453,8 +453,8 @@ function findPythonCommand() {
   const candidates = configured
     ? [{ command: configured, args: [] }]
     : process.platform === "win32"
-      ? [{ command: "python", args: [] }, { command: "py", args: ["-3"] }]
-      : [{ command: "python3", args: [] }, { command: "python", args: [] }];
+      ? [{ command: path.join(__dirname, "..", ".venv", "Scripts", "python.exe"), args: [] }, { command: "python", args: [] }, { command: "py", args: ["-3"] }]
+      : [{ command: path.join(__dirname, "..", ".venv", "bin", "python"), args: [] }, { command: "python3", args: [] }, { command: "python", args: [] }];
   for (const candidate of candidates) {
     const check = spawnSync(candidate.command, [...candidate.args, "-c", "import curl_cffi"], {
       stdio: "ignore",
