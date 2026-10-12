@@ -157,6 +157,7 @@ class ProtocolClient {
   constructor(options = {}) {
     this.jar = options.jar || new CookieJar();
     this.verbose = Boolean(options.verbose);
+    this.hideUrlQuery = Boolean(options.hideUrlQuery);
     this.debugAuth = Boolean(options.debugAuth);
     this.transport = options.transport || null;
   }
@@ -205,7 +206,7 @@ class ProtocolClient {
     }
 
     if (this.verbose) {
-      console.error(`> ${method} ${safeUrl(url)}`);
+      console.error(`> ${method} ${safeUrl(url, this.hideUrlQuery)}`);
     }
 
     const controller = new AbortController();
@@ -235,8 +236,8 @@ class ProtocolClient {
 
     const location = res.headers.get("location");
     if (this.verbose) {
-      const suffix = location ? ` -> ${safeUrl(new URL(location, url).toString())}` : "";
-      console.error(`< ${method} ${safeUrl(url)} ${res.status}${suffix}`);
+      const suffix = location ? ` -> ${safeUrl(new URL(location, url).toString(), this.hideUrlQuery)}` : "";
+      console.error(`< ${method} ${safeUrl(url, this.hideUrlQuery)} ${res.status}${suffix}`);
     }
 
     if (isRiskControlResponse(res, text)) {
@@ -333,6 +334,7 @@ async function run() {
       await logoutAllChatgptDevices({
         email: String(args.email || "").trim().toLowerCase(), chatgptBase, authBase, transport,
         resultPath: path.resolve(args.logoutResult), attemptId: args.logoutAttempt,
+        verbose: Boolean(args.verbose),
         password: process.env.CHATGPT_LOGIN_PASSWORD || "", totpSecret: process.env.CHATGPT_TOTP_SECRET || "",
       });
       return;
@@ -344,6 +346,7 @@ async function run() {
         authBase,
         transport,
         resultPath: path.resolve(args.totpResult || DEFAULT_TOTP_ROTATION_RESULT),
+        verbose: Boolean(args.verbose),
         password: process.env.CHATGPT_LOGIN_PASSWORD || "",
         totpSecret: process.env.CHATGPT_TOTP_SECRET || "",
       });
@@ -851,7 +854,7 @@ function isNewPasswordPage(value) {
   }
 }
 
-async function rotateChatgptTotp({ email, chatgptBase, authBase, transport, resultPath, password, totpSecret }) {
+async function rotateChatgptTotp({ email, chatgptBase, authBase, transport, resultPath, password, totpSecret, verbose = false }) {
   if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     throw new Error("MFA_EMAIL_REQUIRED: A valid account email is required");
   }
@@ -881,11 +884,16 @@ async function rotateChatgptTotp({ email, chatgptBase, authBase, transport, resu
     console.log("[ok] MFA rotation was already confirmed; keeping the existing result.");
     return;
   }
-  let client = new ProtocolClient({ transport, jar: CookieJar.fromJSON(state.cookies) });
+  let client = new ProtocolClient({ transport, verbose, hideUrlQuery: true, jar: CookieJar.fromJSON(state.cookies) });
   let accessToken = "";
+  let loggedStage = "";
   const save = async (stage, fields = {}) => {
     state = { ...state, ...fields, stage, cookies: client.jar.toJSON(), updated_at: new Date().toISOString() };
     await writePrivateJson(resultPath, state);
+    if (stage !== loggedStage) {
+      console.log(`[mfa-stage] ${stage}`);
+      loggedStage = stage;
+    }
   };
   const readSession = async () => {
     let result;
@@ -951,7 +959,7 @@ async function rotateChatgptTotp({ email, chatgptBase, authBase, transport, resu
       try { await readSession(); }
       catch (error) {
         if (!String(error.message).startsWith("MFA_SESSION_INVALID:")) throw error;
-        client = new ProtocolClient({ transport });
+        client = new ProtocolClient({ transport, verbose, hideUrlQuery: true });
       }
     }
     if (!accessToken) {
@@ -1062,17 +1070,22 @@ function mfaOperationError(error, fallback = "MFA_ROTATION_FAILED") {
   return { message, error_code: message.split(":", 1)[0], error_http_status: httpStatus, error_endpoint: endpoint };
 }
 
-async function logoutAllChatgptDevices({ email, chatgptBase, authBase, transport, resultPath, attemptId, password, totpSecret }) {
+async function logoutAllChatgptDevices({ email, chatgptBase, authBase, transport, resultPath, attemptId, password, totpSecret, verbose = false }) {
   const state = { version: 1, mode: "logout_all", email, attempt_id: attemptId, stage: "pending", logout_succeeded: false };
+  let loggedStage = "";
   const save = async (fields = {}) => {
     Object.assign(state, fields, { updated_at: new Date().toISOString() });
     await writePrivateJson(resultPath, state);
+    if (state.stage !== loggedStage) {
+      console.log(`[mfa-stage] ${state.stage}`);
+      loggedStage = state.stage;
+    }
   };
   try {
     await save();
     if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error("MFA_EMAIL_REQUIRED: A valid account email is required");
     if (!password) throw new Error("MFA_PASSWORD_REQUIRED: A login password is required");
-    const client = new ProtocolClient({ transport });
+    const client = new ProtocolClient({ transport, verbose, hideUrlQuery: true });
     const web = await loginChatgptWeb(client, { chatgptBase, authBase, email, password, totpSecret, nonInteractive: true, existingOnly: true });
     const session = await client.request("GET", `${chatgptBase}/api/auth/session`, { referer: `${chatgptBase}/` });
     if (session.res.status !== 200) throw new Error("MFA_SESSION_INVALID: The account session expired");
@@ -2611,9 +2624,10 @@ function base64Url(buffer) {
     .replace(/=+$/g, "");
 }
 
-function safeUrl(url) {
+function safeUrl(url, hideQuery = false) {
   try {
     const parsed = new URL(url);
+    if (hideQuery) return `${parsed.origin}${parsed.pathname}`;
     for (const key of parsed.searchParams.keys()) {
       if (/code|token|state|csrf|nonce|otp|email|phone|login_hint|challenge/i.test(key)) {
         parsed.searchParams.set(key, "<redacted>");

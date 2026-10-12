@@ -681,6 +681,11 @@ async function handleMfaApi(req, res, requestUrl) {
     sendJson(res, 200, mfaWorkspace.history());
     return;
   }
+  const logsMatch = /^accounts\/([a-zA-Z0-9_-]{1,100})\/logs$/.exec(action);
+  if (req.method === "GET" && logsMatch) {
+    sendJson(res, 200, await mfaWorkspace.logs(logsMatch[1]));
+    return;
+  }
   if (req.method !== "POST") throw httpError(404, "MFA 接口不存在");
   if (shuttingDown) throw httpError(503, "服务正在关闭，请稍后重试");
   const body = await readJson(req);

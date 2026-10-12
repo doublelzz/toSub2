@@ -35,6 +35,8 @@ await fs.writeFile(protocolScript, `
 import fs from 'node:fs/promises';
 const arg = (name) => process.argv[process.argv.indexOf(name) + 1];
 if (process.argv.includes('--logout-all')) {
+  console.log('[mfa-stage] logout_requested');
+  console.error('< POST /backend-api/accounts/logout_all 200');
   if (process.env.CHATGPT_TOTP_SECRET !== '${newSecret}') process.exit(98);
   await new Promise((resolve) => setTimeout(resolve, 500));
   await fs.writeFile(arg('--logout-result'), JSON.stringify({
@@ -44,6 +46,15 @@ if (process.argv.includes('--logout-all')) {
   process.exit(0);
 }
 if (!process.argv.includes('--rotate-totp')) process.exit(99);
+console.log('[mfa-stage] authenticated');
+console.error('< GET /api/auth/session 200');
+process.stdout.write('credential fragment: ' + process.env.CHATGPT_LOGIN_PASSWORD.slice(0, 7));
+await new Promise((resolve) => setTimeout(resolve, 30));
+console.log(process.env.CHATGPT_LOGIN_PASSWORD.slice(7));
+console.log('secret="' + process.env.CHATGPT_TOTP_SECRET + '"');
+console.log('access_token="synthetic-private-token"');
+console.log('Cookie: synthetic-private-cookie');
+console.log('[mfa-stage] activating');
 await new Promise((resolve) => setTimeout(resolve, 1600));
 await fs.writeFile(arg('--totp-result'), JSON.stringify({
   version: 1, email: arg('--email'), secret: '${newSecret}',
@@ -74,12 +85,20 @@ try {
   const ids = state.accounts.map((account) => account.id);
   const primaryId = state.accounts.find((account) => account.email === email).id;
   const queuedId = state.accounts.find((account) => account.email === queuedEmail).id;
+  assert.equal((await fetch(`${base}/api/mfa/accounts/${primaryId}/logs`)).status, 403);
+  assert.equal((await request('accounts/missing/logs')).status, 404);
+  assert.equal((await (await request(`accounts/${primaryId}/logs`)).json()).logs, '');
   assert.equal((await request("logout-all", { ids: [primaryId] })).status, 400);
   assert.equal((await request("start", { ids, concurrency: 31 })).status, 400);
   assert.equal((await request("start", { ids, concurrency: 1, proxyUrl: "invalid-proxy" })).status, 400);
-  const started = await request("start", { ids: [primaryId, queuedId], concurrency: 1, proxyUrl: "" });
+  const visibleProxy = 'http://fixture-user:fixture-proxy-secret@127.0.0.1:7890';
+  const started = await request("start", { ids: [primaryId, queuedId], concurrency: 1, proxyUrl: visibleProxy });
   assert.equal(started.status, 200, await started.clone().text());
   assert.equal((await started.json()).started, 2);
+  await until(async () => {
+    const details = await (await request(`accounts/${primaryId}/logs`)).json();
+    return details.running && details.logs.includes('/api/auth/session 200') && details.logs.includes('(activating)');
+  });
   const conflict = await fetch(`${base}/api/jobs/${id}/relogin`, {
     method: "POST", headers: headers(), body: JSON.stringify({}),
   });
@@ -90,9 +109,19 @@ try {
     const { accounts } = await (await request("accounts")).json();
     return accounts.find((account) => account.id === primaryId)?.status === "success";
   });
+  await until(async () => (await (await request(`accounts/${primaryId}/logs`)).json()).logs.includes('[success]'));
   const publicResponse = await request("accounts");
   assert.equal(publicResponse.headers.get("cache-control"), "no-store");
   assert.doesNotMatch(await publicResponse.text(), new RegExp(`${password}|${oldSecret}|${newSecret}|cookies`));
+  const detailsResponse = await request(`accounts/${primaryId}/logs`);
+  assert.equal(detailsResponse.headers.get('cache-control'), 'no-store');
+  const rotationLogs = (await detailsResponse.json()).logs;
+  assert.ok(rotationLogs.includes(visibleProxy), 'proxy must remain visible in detail logs');
+  assert.match(rotationLogs, /\[success\]/);
+  assert.match(rotationLogs, /退出码：0/);
+  assert.match(rotationLogs, /<redacted>/);
+  for (const secret of [password, oldSecret, newSecret, 'synthetic-private-token', 'synthetic-private-cookie']) assert.equal(rotationLogs.includes(secret), false);
+  assert.match((await (await request(`accounts/${queuedId}/logs`)).json()).logs, /\[cancel\]/);
   const txt = await request("export", { format: "txt" });
   assert.equal(txt.status, 200, await txt.clone().text());
   assert.equal(txt.headers.get("cache-control"), "no-store");
@@ -114,9 +143,13 @@ try {
   const logoutConflict = await fetch(`${base}/api/jobs/${id}/relogin`, { method:"POST", headers:headers(), body:"{}" });
   assert.equal(logoutConflict.status, 409);
   await until(async () => (await (await request("accounts")).json()).accounts.find((account) => account.id === primaryId)?.logoutStatus === "success");
+  await until(async () => (await (await request(`accounts/${primaryId}/logs`)).json()).logs.includes('[success] 所有设备登出'));
   const afterLogout = (await (await request("accounts")).json()).accounts.find((account) => account.id === primaryId);
   assert.equal(afterLogout.status, "success");
   assert.ok(afterLogout.logoutAt);
+  const allLogs = (await (await request(`accounts/${primaryId}/logs`)).json()).logs;
+  assert.ok(allLogs.startsWith(rotationLogs), 'logout must preserve the preceding rotation log');
+  assert.match(allLogs, /POST \/backend-api\/accounts\/logout_all 200/);
   assert.equal((await request("export", { ids: [primaryId], format:"txt" })).status, 200);
   const history = await (await request("history")).json();
   assert.ok(history.items.some((item) => item.email === email && item.status === "success"));
@@ -126,6 +159,7 @@ try {
   const restored = await (await request("accounts")).json();
   assert.equal(restored.accounts.find((account) => account.id === primaryId).status, "success");
   assert.equal(restored.accounts.find((account) => account.id === primaryId).logoutStatus, "success");
+  assert.equal((await (await request(`accounts/${primaryId}/logs`)).json()).logs, allLogs);
   const restoredExport = await request("export", { ids: [primaryId], format: "txt" });
   assert.equal((await restoredExport.text()).replace(/^\uFEFF/, "").trim(), `${email}----${password}----${newSecret}`);
   console.log("MFA console API, synchronization, export, and restart smoke passed");

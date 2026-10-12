@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Ban, Check, ChevronLeft, ChevronRight, CircleAlert, Download, History, ListPlus, LoaderCircle, LogOut, RefreshCw, Search, ShieldCheck, X } from "lucide-react";
+import { Ban, Check, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, CircleAlert, Download, FileText, History, ListPlus, LoaderCircle, LogOut, RefreshCw, Search, ShieldCheck, X } from "lucide-react";
 
 const PAGE_SIZE = 20;
 const ACTIVE_STATUSES = new Set(["queued", "running"]);
@@ -25,6 +25,7 @@ export default function MfaWorkspace({ token, defaultProxyUrl }) {
   const [preview, setPreview] = useState(null);
   const [importOpen, setImportOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [expandedAccountId, setExpandedAccountId] = useState(null);
   const [history, setHistory] = useState([]);
   const [historyError, setHistoryError] = useState("");
   const [query, setQuery] = useState("");
@@ -277,17 +278,18 @@ export default function MfaWorkspace({ token, defaultProxyUrl }) {
       </div>
 
       <div className="table-frame"><table className="mfa-table"><thead><tr>
-        <th className="select-heading"><input type="checkbox" checked={allPageSelected} disabled={!pageAccounts.length} onChange={selectPage} aria-label="选择当前页全部 MFA 账号" /></th><th>账号</th><th>状态</th><th>当前进度</th><th>设备登出</th><th>最近更新</th><th>修改成功时间</th>
+        <th className="select-heading"><input type="checkbox" checked={allPageSelected} disabled={!pageAccounts.length} onChange={selectPage} aria-label="选择当前页全部 MFA 账号" /></th><th>账号</th><th>状态</th><th>当前进度</th><th>设备登出</th><th>最近更新</th><th>修改成功时间</th><th>详情</th>
       </tr></thead><tbody>
-        {!pageAccounts.length && <tr><td colSpan="7"><div className="empty-state"><div><ShieldCheck size={24} /></div><h3>{!loaded ? "正在读取 MFA 账号" : accounts.length ? "没有匹配账号" : "暂无 MFA 账号"}</h3><p>{accounts.length ? "调整邮箱或状态筛选。" : "导入账号后，选择需要修改 MFA 的账号。"}</p></div></td></tr>}
-        {pageAccounts.map((account) => <tr key={account.id} className={selectedIds.has(account.id) ? "selected-row" : ""}>
+        {!pageAccounts.length && <tr><td colSpan="8"><div className="empty-state"><div><ShieldCheck size={24} /></div><h3>{!loaded ? "正在读取 MFA 账号" : accounts.length ? "没有匹配账号" : "暂无 MFA 账号"}</h3><p>{accounts.length ? "调整邮箱或状态筛选。" : "导入账号后，选择需要修改 MFA 的账号。"}</p></div></td></tr>}
+        {pageAccounts.map((account) => <React.Fragment key={account.id}><tr className={selectedIds.has(account.id) ? "selected-row" : ""}>
           <td className="select-cell"><input type="checkbox" checked={selectedIds.has(account.id)} onChange={() => toggleSelection(account.id)} aria-label={`选择 MFA 账号 ${account.email}`} /></td>
           <td><strong className="mfa-email">{account.email}</strong><span className="mfa-credentials">{account.hasPassword ? "已导入密码" : "未提供密码"} · {account.hasTotpKey ? "已有 MFA 密钥" : "新建 MFA"}</span></td>
           <td><MfaStatus status={account.status} /></td>
           <td className="mfa-stage"><span>{STAGE_LABELS[account.stage] || account.stage || "等待开始"}</span>{account.error && <div className="row-error">{account.error}</div>}</td>
           <td className="mfa-stage"><span className={`mfa-status mfa-status-${account.logoutStatus || "idle"}`}>{ACTIVE_STATUSES.has(account.logoutStatus) && <LoaderCircle size={12} className="spin" />}{account.logoutStatus === "success" && <Check size={12} />}{LOGOUT_LABELS[account.logoutStatus || "idle"]}</span>{account.logoutError && <div className="row-error">{account.logoutError}</div>}{account.logoutAt && <div className="mfa-date">{formatTime(account.logoutAt)}</div>}</td>
           <td className="mfa-date">{formatTime(account.updatedAt)}</td><td className="mfa-date">{formatTime(account.changedAt)}</td>
-        </tr>)}
+          <td><button type="button" className="icon-button" aria-label={`${expandedAccountId === account.id ? "收起" : "查看"} ${account.email} 的详情日志`} aria-expanded={expandedAccountId === account.id} aria-controls={`mfa-logs-${account.id}`} title={expandedAccountId === account.id ? "收起详情日志" : "查看详情日志"} onClick={() => setExpandedAccountId((current) => current === account.id ? null : account.id)}><FileText size={17} />{expandedAccountId === account.id ? <ChevronUp size={13} /> : <ChevronDown size={13} />}</button></td>
+        </tr>{expandedAccountId === account.id && <tr className="log-row"><td colSpan="8"><MfaLogs key={account.id} accountId={account.id} request={request} /></td></tr>}</React.Fragment>)}
       </tbody></table></div>
       <div className="mfa-pagination"><span>共 {filtered.length} 条，每页 {PAGE_SIZE} 条</span><div><button type="button" className="icon-button" disabled={currentPage <= 1} onClick={() => setPage(currentPage - 1)} title="MFA 上一页"><ChevronLeft size={17} /></button><span>{currentPage} / {totalPages}</span><button type="button" className="icon-button" disabled={currentPage >= totalPages} onClick={() => setPage(currentPage + 1)} title="MFA 下一页"><ChevronRight size={17} /></button></div></div>
 
@@ -317,6 +319,42 @@ export default function MfaWorkspace({ token, defaultProxyUrl }) {
       </form></div>}
     </section>
   );
+}
+
+function MfaLogs({ accountId, request }) {
+  const [logs, setLogs] = useState("");
+  const [error, setError] = useState("");
+  const [loaded, setLoaded] = useState(false);
+  const preRef = useRef(null);
+  const followTail = useRef(true);
+
+  useEffect(() => {
+    let stopped = false;
+    let timer;
+    const controller = new AbortController();
+    const poll = async () => {
+      try {
+        const data = await (await request(`accounts/${accountId}/logs`, { signal: controller.signal })).json();
+        if (!stopped) { setLogs(data.logs || ""); setError(data.error || ""); setLoaded(true); }
+      } catch (requestError) {
+        if (!stopped) setError(`日志读取失败：${requestError.message}`);
+      } finally {
+        if (!stopped) timer = window.setTimeout(poll, 1_200);
+      }
+    };
+    void poll();
+    return () => { stopped = true; controller.abort(); window.clearTimeout(timer); };
+  }, [accountId, request]);
+
+  useEffect(() => {
+    if (followTail.current && preRef.current) preRef.current.scrollTop = preRef.current.scrollHeight;
+  }, [logs]);
+
+  return <div id={`mfa-logs-${accountId}`} className="log-panel">
+    <div className="log-title"><FileText size={15} />2FA 详情日志 · 自动更新</div>
+    {error && <div className="mfa-log-error" role="alert">{error}</div>}
+    <pre ref={preRef} onScroll={(event) => { const element = event.currentTarget; followTail.current = element.scrollHeight - element.scrollTop - element.clientHeight < 30; }}>{logs || (loaded ? "暂无详情日志。后续修改、恢复或登出操作会自动记录。" : "正在读取日志...")}</pre>
+  </div>;
 }
 
 function MfaStatus({ status, logout = false }) {

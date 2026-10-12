@@ -88,7 +88,14 @@ button { letter-spacing: 0; }
 .mfa-export-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin: 14px 0; color: var(--muted); font-size: 12px; }
 .mfa-export-toolbar > div { display: flex; flex-shrink: 0; gap: 8px; }
 .mfa-export-toolbar button { height: 34px; }
-.mfa-table { min-width: 960px; }
+.mfa-table { min-width: 1040px; }
+.mfa-table th:nth-child(1) { width: 4%; }
+.mfa-table th:nth-child(2) { width: 20%; }
+.mfa-table th:nth-child(3) { width: 9%; }
+.mfa-table th:nth-child(4) { width: 19%; }
+.mfa-table th:nth-child(5), .mfa-table th:nth-child(6), .mfa-table th:nth-child(7) { width: 14%; }
+.mfa-table th:nth-child(8) { width: 6%; white-space: nowrap; }
+.mfa-log-error { padding: 8px 12px; color: #ffb4b4; font-size: 12px; }
 .mfa-selection-toolbar .bulk-actions { flex-wrap: wrap; }
 .mfa-email { display: block; font-size: 13px; }
 .mfa-credentials { display: block; margin-top: 5px; color: var(--muted); font-size: 11px; }

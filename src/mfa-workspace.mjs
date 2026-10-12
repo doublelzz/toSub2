@@ -48,6 +48,27 @@ const ERRORS = {
 };
 const MAX_ACCOUNTS = 5000;
 const MAX_HISTORY = 1000;
+const MAX_LOG_CHARS = 80_000;
+const MAX_LOG_LINE_CHARS = 16_000;
+const STAGE_MESSAGES = {
+  pending: "开始登录验证", authenticated: "账号身份已确认",
+  disable_requested: "准备关闭旧 2FA", disabled: "旧 2FA 已关闭",
+  enroll_requested: "准备申请新 2FA", enrolled: "新密钥已保存，等待激活",
+  activating: "正在激活新 2FA", confirmed: "新 2FA 已确认生效",
+  logout_requested: "正在请求登出所有设备", logout_confirmed: "所有设备登出已确认",
+};
+
+function sanitizeProtocolLog(value, credentials = {}) {
+  let text = String(value).replace(/\x1b\[[0-9;]*m/g, "");
+  for (const secret of [credentials.password, credentials.totpSecret].filter(Boolean).sort((a, b) => b.length - a.length)) {
+    text = text.split(secret).join("<redacted>");
+  }
+  return text
+    .replace(/([?&](?:code|token|state|csrf|nonce|otp|code_challenge)=)[^&\s]+/gi, "$1<redacted>")
+    .replace(/(["']?\b(?:access_token|accessToken|refresh_token|id_token|password|totp_secret|totpSecret|2fa_key|secret|session_id|cookie|cookies|authorization|code|otp|csrf|token)["']?\s*[=:]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\r\n]+)/gi, "$1<redacted>")
+    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, "<redacted>")
+    .replace(/otpauth:\/\/[^\s]+/gi, "<redacted>");
+}
 
 function requestError(status, message) {
   return Object.assign(new Error(message), { status });
@@ -129,6 +150,8 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
   const reservations = new Map();
   const activeTasks = new Map();
   const activeCredentials = new Map();
+  const logWrites = new Map();
+  const logErrors = new Map();
   let events = [];
   let concurrency = 3;
   let stopping = false;
@@ -183,6 +206,94 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
 
   function history() {
     return { items: events.map((event) => ({ ...event })) };
+  }
+
+  function logPath(account) {
+    return path.join(directory, "logs", `${account.id}.log`);
+  }
+
+  function appendLog(account, message, credentials = activeCredentials.get(account.id)) {
+    const timestamp = new Date().toISOString();
+    const text = sanitizeProtocolLog(message, credentials);
+    const previous = logWrites.get(account.id) || Promise.resolve();
+    const write = previous.then(async () => {
+      const target = logPath(account);
+      await fs.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
+      let existing = "";
+      try { existing = await fs.readFile(target, "utf8"); }
+      catch (error) { if (error?.code !== "ENOENT") throw error; }
+      const content = `${existing}${text.split(/\r?\n/).filter(Boolean).map((line) => `[${timestamp}] ${line}\n`).join("")}`.slice(-MAX_LOG_CHARS);
+      const temporary = `${target}.${crypto.randomUUID()}.tmp`;
+      try {
+        await fs.writeFile(temporary, content, { mode: 0o600 });
+        await fs.rename(temporary, target);
+        logErrors.delete(account.id);
+      } finally { await fs.rm(temporary, { force: true }).catch(() => {}); }
+    }).catch(() => { logErrors.set(account.id, "详情日志保存失败，请检查本地存储"); }); // Preserve confirmed remote changes.
+    logWrites.set(account.id, write);
+    void write.finally(() => { if (logWrites.get(account.id) === write) logWrites.delete(account.id); });
+    return write;
+  }
+
+  async function logs(id) {
+    const account = accounts.get(id);
+    if (!account) throw requestError(404, "MFA 账号不存在");
+    await logWrites.get(id);
+    let text = "";
+    try { text = await fs.readFile(logPath(account), "utf8"); }
+    catch (error) { if (error?.code !== "ENOENT") throw requestError(500, "无法读取详情日志，请检查本地存储"); }
+    return { accountId: id, logs: text, running: processing(account), error: logErrors.get(id) || "" };
+  }
+
+  async function runProtocol(account, entry, args, credentials) {
+    await appendLog(account, `[process] 开始${entry.operation === "logout_all" ? "登出所有设备" : "修改 2FA"}，账号：${account.email}`);
+    await appendLog(account, `[proxy] ${credentials.proxyUrl || "直连"}`);
+    return new Promise((resolve) => {
+      const child = spawn(process.execPath, [protocolScript, ...args, "--verbose"], {
+        env: { ...process.env, CHATGPT_LOGIN_PASSWORD: credentials.password, CHATGPT_TOTP_SECRET: credentials.totpSecret, CHATGPT_PROXY_URL: credentials.proxyUrl },
+        stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
+      });
+      entry.child = child;
+      const flushers = [];
+      for (const [stream, source] of [[child.stdout, "protocol"], [child.stderr, "http/error"]]) {
+        let pending = "";
+        let skipping = false;
+        const emit = (line) => {
+          if (!line.trim()) return;
+          const stage = /^\[mfa-stage\] ([a-z_]+)\b/.exec(line)?.[1];
+          void appendLog(account, Object.hasOwn(STAGE_MESSAGES, stage) ? `[stage] ${STAGE_MESSAGES[stage]} (${stage})` : `[${source}] ${line}`, credentials);
+          if (entry.operation === "rotate" && Object.hasOwn(STAGE_MESSAGES, stage)) {
+            void serialize(async () => {
+              if (account.status !== "running" || account.stage === "cancel_requested" || entry.interrupted) return;
+              mark(account, "running", stage);
+              await persist();
+            }).catch(() => {});
+          }
+        };
+        stream.setEncoding("utf8");
+        stream.on("data", (chunk) => {
+          const lines = `${pending}${chunk}`.split(/\r?\n/);
+          pending = lines.pop();
+          for (const line of lines) {
+            if (!skipping && line.length <= MAX_LOG_LINE_CHARS) emit(line);
+            else if (!skipping) void appendLog(account, `[${source}] 单行输出过长，已省略`);
+            skipping = false;
+          }
+          if (pending.length > MAX_LOG_LINE_CHARS) {
+            if (!skipping) void appendLog(account, `[${source}] 单行输出过长，已省略`);
+            pending = "";
+            skipping = true;
+          }
+        });
+        flushers.push(() => { if (!skipping) emit(pending); pending = ""; });
+      }
+      child.once("error", (error) => { void appendLog(account, `[process] 启动失败：${error.message}`, credentials); });
+      child.once("close", (code, signal) => {
+        flushers.forEach((flush) => flush());
+        void appendLog(account, `[process] 进程结束，退出码：${code ?? "无"}${signal ? `，信号：${signal}` : ""}`, credentials);
+        resolve();
+      });
+    });
   }
 
   async function persist() {
@@ -258,6 +369,7 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
       mark(account, "running", "saving");
       await persist();
     });
+    await appendLog(account, "[saving] 远端新 2FA 已生效，正在保存并同步登录凭据");
     try {
       const credentials = activeCredentials.get(account.id) || await loadCredentials(account);
       const updated = { ...credentials, totpSecret: normalizeSecret(checkpoint.secret) };
@@ -276,9 +388,11 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
     // The durable success record must precede removal. If cleanup fails, retry
     // finalizes this checkpoint again instead of modifying the remote factor.
     await fs.rm(checkpointPath(account), { force: true }).catch(() => {});
+    await appendLog(account, "[success] 2FA 修改完成，新密钥已保存，可导出成功结果");
   }
 
   async function failAccount(account, code, stage = "") {
+    await appendLog(account, `[error] ${code}：${ERRORS[code] || ERRORS.protocol}${stage ? `，阶段：${STAGE_MESSAGES[stage] || stage}` : ""}`);
     await serialize(async () => {
       mark(account, code === "interrupted" ? "interrupted" : "failed", STAGES.has(stage) ? stage : code === "synchronize" ? "saving" : code === "interrupted" ? "interrupted" : "failed", code);
       record(account);
@@ -297,15 +411,8 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
         if (isAccountBusy(account.email)) throw operationError("busy");
         const credentials = activeCredentials.get(account.id) || await loadCredentials(account);
         if (entry.interrupted) throw operationError("interrupted");
-        await new Promise((resolve) => {
-          const child = spawn(process.execPath, [protocolScript, "--rotate-totp", "--email", account.email, "--totp-result", checkpointPath(account)], {
-            env: { ...process.env, CHATGPT_LOGIN_PASSWORD: credentials.password, CHATGPT_TOTP_SECRET: credentials.totpSecret, CHATGPT_PROXY_URL: credentials.proxyUrl },
-            stdio: ["ignore", "ignore", "ignore"], windowsHide: true,
-          });
-          entry.child = child;
-          child.once("error", () => resolve({ failed: true }));
-          child.once("close", (code) => resolve({ failed: code !== 0 }));
-        });
+        if (checkpoint) await appendLog(account, `[resume] 从检查点继续，阶段：${STAGE_MESSAGES[checkpoint.stage] || checkpoint.stage}`);
+        await runProtocol(account, entry, ["--rotate-totp", "--email", account.email, "--totp-result", checkpointPath(account)], credentials);
         if (entry.interrupted) throw operationError("interrupted");
         checkpoint = await readCheckpoint(account);
         if (checkpoint?.activation_succeeded !== true) {
@@ -314,6 +421,8 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
         }
         // Remote confirmation is authoritative even when a child failed after
         // writing it. Retrying such a result must never rotate a second time.
+      } else {
+        await appendLog(account, "[resume] 远端修改已确认，仅恢复本地保存与同步");
       }
       await finishCheckpoint(account, checkpoint, entry);
     } catch (error) {
@@ -327,16 +436,8 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
       if (entry.interrupted) throw operationError("interrupted");
       const credentials = activeCredentials.get(account.id) || await loadCredentials(account);
       const attemptId = crypto.randomUUID();
-      await new Promise((resolve) => {
-        const child = spawn(process.execPath, [protocolScript, "--logout-all", "--email", account.email,
-          "--logout-result", logoutResultPath(account), "--logout-attempt", attemptId], {
-          env: { ...process.env, CHATGPT_LOGIN_PASSWORD: credentials.password, CHATGPT_TOTP_SECRET: credentials.totpSecret, CHATGPT_PROXY_URL: credentials.proxyUrl },
-          stdio: ["ignore", "ignore", "ignore"], windowsHide: true,
-        });
-        entry.child = child;
-        child.once("error", () => resolve());
-        child.once("close", () => resolve());
-      });
+      await runProtocol(account, entry, ["--logout-all", "--email", account.email,
+        "--logout-result", logoutResultPath(account), "--logout-attempt", attemptId], credentials);
       if (entry.interrupted) throw operationError("interrupted");
       let result;
       try { result = JSON.parse(await fs.readFile(logoutResultPath(account), "utf8")); } catch {}
@@ -352,7 +453,10 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
         record(account, "logout_all");
         await persist();
       });
+      await appendLog(account, "[success] 所有设备登出已确认");
     } catch (error) {
+      const code = entry.interrupted ? "interrupted" : error?.mfaCode || "MFA_LOGOUT_FAILED";
+      await appendLog(account, `[error] ${code}：${ERRORS[code] || ERRORS.MFA_LOGOUT_FAILED}`);
       await serialize(async () => {
         markLogout(account, entry.interrupted ? "interrupted" : "failed", entry.interrupted ? "interrupted" : error?.mfaCode || "MFA_LOGOUT_FAILED");
         record(account, "logout_all");
@@ -496,6 +600,7 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
         try { await persist(); }
         catch (error) { for (const account of previous) Object.assign(accounts.get(account.id), account); throw error; }
         for (const [id, credentials] of loaded) activeCredentials.set(id, credentials);
+        for (const account of selected) await appendLog(account, `[queued] 已加入${logout ? "设备登出" : "2FA 修改"}队列，并发数：${concurrency}`);
       });
     } finally { release(); }
     pump();
@@ -513,6 +618,7 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
           markLogout(account, "interrupted", "canceled");
           activeCredentials.delete(account.id);
           record(account, "logout_all");
+          await appendLog(account, "[cancel] 已取消排队中的设备登出任务");
           canceled++;
         } else if (account.logoutStatus === "running") {
           finishing++;
@@ -520,9 +626,11 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
           mark(account, "interrupted", "interrupted", "canceled");
           activeCredentials.delete(account.id);
           record(account);
+          await appendLog(account, "[cancel] 已取消排队中的 2FA 修改任务");
           canceled++;
         } else if (account.status === "running") {
           mark(account, "running", "cancel_requested");
+          await appendLog(account, "[cancel] 已请求停止，正在等待当前操作完成");
           finishing++;
         }
       }
@@ -589,6 +697,7 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
         else mark(accounts.get(id), "interrupted", "interrupted", "interrupted");
       }
       await serialize(async () => { if (!initializationError) await persist(); }).catch(() => {});
+      await Promise.allSettled([...logWrites.values()]);
     })();
     return shutdownPromise;
   }
@@ -629,8 +738,8 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
       });
     }
     for (const account of accounts.values()) {
-      if (BUSY.has(account.logoutStatus)) { markLogout(account, "interrupted", "interrupted"); record(account, "logout_all"); }
-      if (BUSY.has(account.status)) { mark(account, "interrupted", "interrupted", "interrupted"); record(account); }
+      if (BUSY.has(account.logoutStatus)) { markLogout(account, "interrupted", "interrupted"); record(account, "logout_all"); await appendLog(account, "[restore] 服务重启，设备登出结果未确认，可重试登出"); }
+      if (BUSY.has(account.status)) { mark(account, "interrupted", "interrupted", "interrupted"); record(account); await appendLog(account, "[restore] 服务重启，2FA 修改被中断，可继续恢复"); }
       try {
         const checkpoint = await readCheckpoint(account);
         if (checkpoint?.activation_succeeded === true) {
@@ -645,5 +754,5 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
     initializationError = "MFA 工作区资料无法读取或保存，请检查本地数据文件";
   }
 
-  return { list, preview: (text) => { const rows = parseImport(text); return { accounts: rows.map(({ email }) => ({ email })), count: rows.length }; }, importAccounts, start, logoutAll: (options) => start(options, "logout_all"), cancel, exportAccounts, history, isBusy, shutdown };
+  return { list, logs, preview: (text) => { const rows = parseImport(text); return { accounts: rows.map(({ email }) => ({ email })), count: rows.length }; }, importAccounts, start, logoutAll: (options) => start(options, "logout_all"), cancel, exportAccounts, history, isBusy, shutdown };
 }

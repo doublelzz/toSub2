@@ -32,10 +32,15 @@ const target = process.argv[process.argv.indexOf("--totp-result") + 1];
 const log = path.join(path.dirname(target), "mock-runs.jsonl");
 await fs.appendFile(log, JSON.stringify({email, event:"start", at:Date.now()}) + "\\n");
 if (!process.argv.includes("--rotate-totp") || !process.env.CHATGPT_LOGIN_PASSWORD) process.exit(8);
+console.log('[mfa-stage] authenticated');
+console.error('< GET /api/auth/session 200');
 await new Promise(resolve => setTimeout(resolve, 200));
 if (email.startsWith("failed")) {
   await fs.writeFile(target, JSON.stringify({version:1, email, stage:"activating", secret:"${newSecret}", activation_accepted:true, error_code:"MFA_CONFIRMATION_PENDING"}));
-  console.error("private-password raw-cookie ${oldSecret}");
+  console.error("Cookie: raw-cookie ${oldSecret}");
+  console.error(process.env.CHATGPT_LOGIN_PASSWORD);
+  console.error('[error] MFA_CONFIRMATION_PENDING: HTTP 503');
+  console.log('x'.repeat(20000));
   process.exit(1);
 }
 await fs.writeFile(target, JSON.stringify({version:1, email, stage:"confirmed", secret:"${newSecret}", activation_succeeded:true, activated_at:new Date().toISOString(), old_factor_disabled:true, cookies:"private-cookie"}));
@@ -113,6 +118,16 @@ try {
   assert.equal(instance.list().accounts.find((account) => account.email === "failed@example.com").stage, "activating");
   assert.match(instance.list().accounts.find((account) => account.email === "failed@example.com").error, /生效状态尚未确认/);
   assert.equal(synchronized.length, 3);
+  const failedId = instance.list().accounts.find((account) => account.email === 'failed@example.com').id;
+  const failedLogs = (await instance.logs(failedId)).logs;
+  assert.match(failedLogs, /MFA_CONFIRMATION_PENDING/);
+  assert.match(failedLogs, /HTTP 503/);
+  assert.match(failedLogs, /进程结束，退出码：1/);
+  assert.match(failedLogs, /单行输出过长/);
+  assert.ok(failedLogs.length <= 80000);
+  assert.ok(failedLogs.includes('http://synthetic:proxy-password@localhost:12345'));
+  for (const secret of ['private-password', 'raw-cookie', oldSecret, newSecret]) assert.equal(failedLogs.includes(secret), false);
+  await assert.rejects(instance.logs('../accounts'), { status: 404 });
   const runs = await logRows(directory);
   let active = 0;
   let maximum = 0;
