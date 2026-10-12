@@ -1,9 +1,5 @@
 # toSub2
 
-QQ 交流群：`1085165735`
-
-[点击链接加入群聊【toSub2】](https://qm.qq.com/q/n40xuIClm8)
-
 toSub2 是一个本地网页工具，通过协议请求完成 ChatGPT 登录和 Codex OAuth（授权登录），自动判断账号是否需要绑定手机号，并生成可供 sub2api 导入的 JSON（结构化数据）文件。
 
 > 本项目不是 OpenAI 官方项目。上游登录接口随时可能变化。
@@ -48,7 +44,6 @@ toSub2 是一个本地网页工具，通过协议请求完成 ChatGPT 登录和 
 ## 安装与启动
 
 ```bash
-git clone https://github.com/poxiao33/toSub2.git
 cd toSub2
 npm install
 python -m pip install -r requirements.txt
@@ -269,15 +264,3 @@ node src/protocol-login.mjs --help
 - 不要把 API Key、密码、2FA 密钥、验证码、Cookie 或 Token 提交到 Git 仓库。
 - 网页控制台用于本机或可信局域网，不提供公网部署所需的身份认证。
 - 只处理你本人持有或已获得明确授权的账号。
-
-## 免责声明
-
-本项目仅供学习、研究和管理本人账号使用，不隶属于 OpenAI，也未获得 OpenAI 背书。使用者应自行遵守 OpenAI 服务条款、相关平台规则以及所在地法律法规。因接口变更、账号限制、数据泄露或不当使用造成的后果由使用者自行承担。
-
-## 更新日志
-
-版本变化和升级说明请查看 [CHANGELOG.md](CHANGELOG.md)。
-
-## License（开源许可证）
-
-[MIT](LICENSE)
