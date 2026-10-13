@@ -1562,9 +1562,11 @@ function SubscriptionInfo({ insights }) {
   const subscription = insights.subscription;
   if (subscription?.status !== "ok") return <InsightError item={subscription} />;
   if (subscription.planType !== "plus") return <span className="insight-note">{subscription.planType === "free" ? "未订阅 Plus" : `${subscription.planType || "未知"} 套餐`}</span>;
+  const expiresAt = Date.parse(subscription.expiresAt);
+  const remainingDays = Number.isFinite(expiresAt) ? Math.max(0, Math.ceil((expiresAt - Date.now()) / 86_400_000)) : null;
   return <div className="subscription-info">
     <time dateTime={subscription.expiresAt}>{formatInsightDate(subscription.expiresAt)}</time>
-    <span className="insight-note">{Date.parse(subscription.expiresAt) <= Date.now() ? "已到期" : subscription.willRenew === true ? "自动续订" : subscription.willRenew === false ? "到期不续订" : "Plus"}</span>
+    <span className="insight-note">{remainingDays !== null && `（剩余${remainingDays}天） · `}{remainingDays === 0 ? "已到期" : subscription.willRenew === true ? "自动续订" : subscription.willRenew === false ? "到期不续订" : "Plus"}</span>
   </div>;
 }
 
