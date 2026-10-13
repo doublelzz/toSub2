@@ -84,6 +84,24 @@ async function logRows(directory) {
 }
 
 try {
+  const dated = await workspace("creation-dates");
+  await dated.instance.importAccounts("dated@example.com----synthetic-password");
+  const createdAt = dated.instance.list().accounts[0].createdAt;
+  assert.ok(Number.isFinite(Date.parse(createdAt)), "new imports must have a creation time");
+  await dated.instance.importAccounts("dated@example.com----updated-synthetic-password");
+  assert.equal(dated.instance.list().accounts[0].createdAt, createdAt, "reimport must retain the original creation time");
+  await dated.instance.shutdown();
+  const datedRestart = await workspace("creation-dates", { credentialStore: dated.store });
+  assert.equal(datedRestart.instance.list().accounts[0].createdAt, createdAt, "restart must retain the creation time");
+  await datedRestart.instance.shutdown();
+  const datedMetadataPath = path.join(dated.directory, "mfa", "accounts.json");
+  const datedMetadata = JSON.parse(await fs.readFile(datedMetadataPath, "utf8"));
+  delete datedMetadata.accounts[0].createdAt;
+  await fs.writeFile(datedMetadataPath, JSON.stringify(datedMetadata));
+  const legacy = await workspace("creation-dates", { credentialStore: dated.store });
+  assert.equal(legacy.instance.list().accounts[0].createdAt, "", "legacy dates must stay unknown");
+  await legacy.instance.importAccounts("dated@example.com----synthetic-password");
+  assert.equal(legacy.instance.list().accounts[0].createdAt, "", "reimport must not invent a legacy creation time");
   const busy = new Set();
   const synchronized = [];
   const { instance, directory, store } = await workspace("batch", {

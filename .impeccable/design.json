@@ -1,0 +1,265 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-10-13T02:05:33Z",
+  "title": "Design System: toSub2",
+  "extensions": {
+    "colorMeta": {
+      "green": {
+        "role": "primary",
+        "displayName": "工作台蓝"
+      },
+      "green-dark": {
+        "role": "primary",
+        "displayName": "夜间工作台蓝"
+      },
+      "green-strong": {
+        "role": "primary",
+        "displayName": "主要动作强调"
+      },
+      "green-soft": {
+        "role": "primary",
+        "displayName": "轻蓝选择表面"
+      },
+      "page": {
+        "role": "neutral",
+        "displayName": "冷灰工作区"
+      },
+      "page-dark": {
+        "role": "neutral",
+        "displayName": "石墨工作区"
+      },
+      "surface": {
+        "role": "neutral",
+        "displayName": "白色内容表面"
+      },
+      "surface-dark": {
+        "role": "neutral",
+        "displayName": "石墨内容表面"
+      },
+      "ink": {
+        "role": "neutral",
+        "displayName": "正文石墨"
+      },
+      "ink-dark": {
+        "role": "neutral",
+        "displayName": "夜间正文"
+      },
+      "muted": {
+        "role": "neutral",
+        "displayName": "辅助冷灰"
+      },
+      "line": {
+        "role": "neutral",
+        "displayName": "细分隔线"
+      },
+      "success": {
+        "role": "status",
+        "displayName": "成功绿"
+      },
+      "danger": {
+        "role": "status",
+        "displayName": "错误红"
+      },
+      "amber": {
+        "role": "status",
+        "displayName": "待处理琥珀"
+      }
+    },
+    "typographyMeta": {
+      "title": {
+        "displayName": "工作区标题",
+        "purpose": "工作区主标题；手机使用实际响应覆盖。"
+      },
+      "body": {
+        "displayName": "正文",
+        "purpose": "本机字体回退栈的工作台正文。"
+      },
+      "control": {
+        "displayName": "控制文字",
+        "purpose": "主要和次要按钮。"
+      },
+      "label": {
+        "displayName": "辅助标签",
+        "purpose": "筛选、状态、时间标签。"
+      },
+      "overview": {
+        "displayName": "主数量",
+        "purpose": "今日任务和总任务，配合 tabular-nums。"
+      },
+      "log": {
+        "displayName": "等宽日志",
+        "purpose": "执行日志，保留换行并允许长文本断行。"
+      }
+    },
+    "shadows": [
+      {
+        "name": "menu",
+        "value": "0 8px 28px var(--shadow)",
+        "purpose": "更多操作菜单；--shadow 随当前主题切换。"
+      },
+      {
+        "name": "drawer",
+        "value": "-10px 0 30px var(--shadow)",
+        "purpose": "右侧配置、详情及导入面板。"
+      },
+      {
+        "name": "focus-field",
+        "value": "0 0 0 3px var(--focus-shadow)",
+        "purpose": "邮件、配置和导入输入的原有焦点处理。"
+      },
+      {
+        "name": "focus-compact",
+        "value": "0 0 0 2px var(--focus-shadow)",
+        "purpose": "MFA、代理和紧凑输入的原有焦点处理。"
+      }
+    ],
+    "motion": [
+      {
+        "name": "loader-animation",
+        "value": ".9s linear infinite",
+        "purpose": "styles.css 的 spin：to { transform: rotate(360deg); }，仅加载图标使用。"
+      },
+      {
+        "name": "reduced-animation-duration",
+        "value": ".01ms",
+        "purpose": "prefers-reduced-motion: reduce；动画迭代次数设为 1。"
+      },
+      {
+        "name": "reduced-transition-duration",
+        "value": ".01ms",
+        "purpose": "减少动态效果时的通用覆盖；没有常规主题或抽屉 transition 定义。"
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "workspace-wide-min",
+        "value": "1600px",
+        "purpose": "增大工作区水平留白。"
+      },
+      {
+        "name": "sidebar-narrow-max",
+        "value": "1100px",
+        "purpose": "152px 侧栏与授权时间折叠。"
+      },
+      {
+        "name": "top-navigation-max",
+        "value": "900px",
+        "purpose": "横向顶部工作区导航与 MFA 时间摘要。"
+      },
+      {
+        "name": "phone-max",
+        "value": "640px",
+        "purpose": "紧凑列表、筛选换行与详情承接次要字段。"
+      },
+      {
+        "name": "legacy-form-max",
+        "value": "760px",
+        "purpose": "styles.css 保留的表单和对话框响应规则；workspace.css 后加载。"
+      },
+      {
+        "name": "legacy-bulk-max",
+        "value": "430px",
+        "purpose": "styles.css 保留的批量工具栏规则；workspace.css 后加载。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "主要按钮",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "新建任务等主要动作；保留真实禁用条件，示例仅展示样式。",
+      "html": "<button type=\"button\" class=\"ds-primary\"><svg aria-hidden=\"true\" width=\"17\" height=\"17\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M12 5v14M5 12h14\"/></svg>新建任务</button>",
+      "css": ".ds-primary{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:36px;padding:8px 12px;border:0;border-radius:8px;background:var(--green, #365edb);color:var(--button-ink, #ffffff);font-family:\"IBM Plex Sans\",\"Noto Sans SC\",\"Segoe UI\",\"Microsoft YaHei\",sans-serif;font-size:13px;font-weight:500;letter-spacing:0;cursor:pointer;}.ds-primary:hover:not(:disabled){background:var(--green-strong, #294dbb);}.ds-primary:disabled{opacity:.48;cursor:not-allowed;}.ds-primary:focus-visible{outline:2px solid var(--green, #365edb);outline-offset:3px;}@media(pointer:coarse){.ds-primary{min-height:44px;}}"
+    },
+    {
+      "name": "次要按钮",
+      "kind": "button",
+      "refersTo": "button-secondary",
+      "description": "取消或补充操作，以边框区分表面。",
+      "html": "<button type=\"button\" class=\"ds-secondary\">取消</button>",
+      "css": ".ds-secondary{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:36px;padding:8px 12px;border:1px solid var(--line, #e1e6ef);border-radius:8px;background:var(--surface, #ffffff);color:var(--ink, #202a3b);font-family:\"IBM Plex Sans\",\"Noto Sans SC\",\"Segoe UI\",\"Microsoft YaHei\",sans-serif;font-size:13px;font-weight:500;letter-spacing:0;cursor:pointer;}.ds-secondary:hover:not(:disabled){background:var(--surface-subtle, #f3f5f8);color:var(--green-strong, #294dbb);}.ds-secondary:disabled{opacity:.48;cursor:not-allowed;}.ds-secondary:focus-visible{outline:2px solid var(--green, #365edb);outline-offset:3px;}@media(pointer:coarse){.ds-secondary{min-height:44px;}}"
+    },
+    {
+      "name": "邮箱搜索",
+      "kind": "input",
+      "refersTo": "input-search",
+      "description": "统一筛选条中的图标与文字输入，使用原有焦点轮廓。",
+      "html": "<label class=\"ds-search\"><svg aria-hidden=\"true\" width=\"16\" height=\"16\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><circle cx=\"11\" cy=\"11\" r=\"8\"/><path d=\"m21 21-4.3-4.3\"/></svg><input type=\"search\" aria-label=\"搜索邮箱\" placeholder=\"搜索邮箱\"/></label>",
+      "css": ".ds-search{display:flex;align-items:center;gap:8px;min-width:180px;flex:1;height:38px;padding:0 11px;color:var(--muted, #5f6c80);background:var(--surface, #ffffff);border:1px solid var(--line, #e1e6ef);border-radius:8px;}.ds-search input{min-width:0;width:100%;color:var(--ink, #202a3b);background:transparent;border:0;padding:7px 0;font-family:\"IBM Plex Sans\",\"Noto Sans SC\",\"Segoe UI\",\"Microsoft YaHei\",sans-serif;font-size:13px;caret-color:var(--green, #365edb);}.ds-search input::placeholder{color:var(--muted, #5f6c80);opacity:1;}.ds-search input:focus-visible{outline:2px solid var(--green, #365edb);outline-offset:3px;}@media(pointer:coarse){.ds-search{height:44px;}.ds-search input{font-size:16px;}}"
+    },
+    {
+      "name": "工作区导航",
+      "kind": "nav",
+      "refersTo": "navigation-active",
+      "description": "授权与 MFA 的当前工作区状态；窄屏改为横排。",
+      "html": "<nav class=\"ds-nav\" aria-label=\"工作区\"><button type=\"button\" class=\"ds-nav-active\" aria-pressed=\"true\">账号授权</button><button type=\"button\" aria-pressed=\"false\">MFA 修改</button><button type=\"button\" class=\"ds-nav-settings\">配置</button></nav>",
+      "css": ".ds-nav{display:flex;flex-direction:column;gap:5px;}.ds-nav button{display:inline-flex;align-items:center;gap:8px;min-height:42px;padding:10px 12px;border:0;border-radius:8px;background:transparent;color:var(--muted, #5f6c80);font-family:\"IBM Plex Sans\",\"Noto Sans SC\",\"Segoe UI\",\"Microsoft YaHei\",sans-serif;font-size:13px;font-weight:500;text-align:left;cursor:pointer;}.ds-nav button:hover{background:var(--surface-subtle, #f3f5f8);color:var(--ink, #202a3b);}.ds-nav button.ds-nav-active,.ds-nav button.ds-nav-active:hover{background:var(--green-soft, #eaf0ff);color:var(--green, #365edb);}.ds-nav .ds-nav-settings{margin-top:20px;}.ds-nav button:focus-visible{outline:2px solid var(--green, #365edb);outline-offset:3px;}@media(max-width:900px){.ds-nav{flex-direction:row;flex-wrap:wrap;}.ds-nav button{min-height:36px;padding:8px 11px;}.ds-nav .ds-nav-settings{margin-top:0;}}@media(pointer:coarse){.ds-nav button{min-height:44px;}}"
+    },
+    {
+      "name": "日期快捷筛选",
+      "kind": "chip",
+      "refersTo": "date-preset-active",
+      "description": "透明常态与选中轻底色，保留 aria-pressed。",
+      "html": "<div class=\"ds-presets\"><button type=\"button\" aria-pressed=\"false\">全部日期</button><button type=\"button\" aria-pressed=\"true\">今天</button><button type=\"button\" aria-pressed=\"false\">近 7 天</button></div>",
+      "css": ".ds-presets{display:flex;align-items:center;gap:4px;flex-wrap:wrap;margin-top:11px;}.ds-presets button{padding:5px 10px;border:0;border-radius:6px;background:transparent;color:var(--muted, #5f6c80);font-family:\"IBM Plex Sans\",\"Noto Sans SC\",\"Segoe UI\",\"Microsoft YaHei\",sans-serif;font-size:12px;min-height:30px;cursor:pointer;}.ds-presets button:hover{background:var(--surface-subtle, #f3f5f8);color:var(--ink, #202a3b);}.ds-presets button[aria-pressed=\"true\"]{background:var(--green-soft, #eaf0ff);color:var(--green, #365edb);}.ds-presets button:focus-visible{outline:2px solid var(--green, #365edb);outline-offset:3px;}@media(pointer:coarse){.ds-presets button{min-height:44px;}}"
+    },
+    {
+      "name": "任务表容器",
+      "kind": "card",
+      "refersTo": "table-container",
+      "description": "任务列表的平面表面、标题与分隔线；示例为空表。",
+      "html": "<div class=\"ds-table\"><div class=\"ds-list-heading\"><strong>授权任务</strong><span>匹配数量</span></div><table><thead><tr><th>账号</th><th>状态与进度</th></tr></thead><tbody><tr><td colspan=\"2\">暂无授权任务</td></tr></tbody></table></div>",
+      "css": ".ds-table{overflow:visible;border:1px solid var(--line, #e1e6ef);border-radius:12px;background:var(--surface, #ffffff);color:var(--ink, #202a3b);font-family:\"IBM Plex Sans\",\"Noto Sans SC\",\"Segoe UI\",\"Microsoft YaHei\",sans-serif;}.ds-list-heading{display:flex;align-items:center;flex-wrap:wrap;gap:10px;padding:13px 16px;border-bottom:1px solid var(--line, #e1e6ef);font-size:13px;}.ds-list-heading strong{font-weight:500;}.ds-list-heading span{color:var(--muted, #5f6c80);font-size:12px;}.ds-table table{width:100%;border-collapse:collapse;color:var(--ink, #202a3b);}.ds-table th{background:var(--surface-subtle, #f3f5f8);color:var(--muted, #5f6c80);font-size:12px;font-weight:400;padding:11px 12px;text-align:left;}.ds-table td{border-bottom:1px solid var(--line, #e1e6ef);padding:15px 12px;vertical-align:middle;font-size:13px;overflow-wrap:anywhere;}.ds-table tr:last-child td{border-bottom:0;}"
+    },
+    {
+      "name": "任务概览带",
+      "kind": "custom",
+      "refersTo": "overview-metric",
+      "description": "用大数量和分隔线组织主统计；示例破折号表示尚未读取数据。",
+      "html": "<section class=\"ds-overview\" aria-label=\"任务统计\"><div class=\"ds-overview-totals\"><button type=\"button\" class=\"ds-metric\" title=\"按创建时间筛选今天\"><span>今日任务</span><strong>—</strong></button><button type=\"button\" class=\"ds-metric\" title=\"恢复全部日期\"><span>总任务</span><strong>—</strong></button></div></section>",
+      "css": ".ds-overview{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:22px;border-top:1px solid var(--line, #e1e6ef);border-bottom:1px solid var(--line, #e1e6ef);padding:23px 0;font-family:\"IBM Plex Sans\",\"Noto Sans SC\",\"Segoe UI\",\"Microsoft YaHei\",sans-serif;}.ds-overview-totals{display:flex;gap:40px;}.ds-metric{display:flex;flex-direction:column;gap:5px;padding:0;border:0;background:transparent;text-align:left;color:var(--ink, #202a3b);font-family:\"IBM Plex Sans\",\"Noto Sans SC\",\"Segoe UI\",\"Microsoft YaHei\",sans-serif;cursor:pointer;}.ds-metric span{font-size:12px;color:var(--muted, #5f6c80);}.ds-metric strong{font-size:34px;font-weight:500;line-height:1.15;letter-spacing:-.6px;font-variant-numeric:tabular-nums;}.ds-metric:hover span{color:var(--green, #365edb);}.ds-metric:focus-visible{outline:2px solid var(--green, #365edb);outline-offset:3px;}"
+    },
+    {
+      "name": "更多操作菜单",
+      "kind": "custom",
+      "refersTo": "actions-menu",
+      "description": "原生 details/summary 的展开样式；应用另外处理外部点击与 Escape。",
+      "html": "<details class=\"ds-more\"><summary>更多操作<svg aria-hidden=\"true\" width=\"13\" height=\"13\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"m6 9 6 6 6-6\"/></svg></summary><div class=\"ds-menu\"><button type=\"button\">重新授权</button><button type=\"button\" class=\"ds-menu-danger\">删除</button></div></details>",
+      "css": ".ds-more{position:relative;display:inline-block;font-family:\"IBM Plex Sans\",\"Noto Sans SC\",\"Segoe UI\",\"Microsoft YaHei\",sans-serif;}.ds-more summary{display:inline-flex;align-items:center;gap:5px;color:var(--muted, #5f6c80);padding:7px 8px;border:1px solid var(--line, #e1e6ef);border-radius:7px;font-size:12px;list-style:none;cursor:pointer;white-space:nowrap;background:var(--surface, #ffffff);}.ds-more summary::-webkit-details-marker{display:none;}.ds-more summary:hover,.ds-more[open] summary{color:var(--green, #365edb);background:var(--green-soft, #eaf0ff);}.ds-menu{position:absolute;right:0;top:calc(100% + 6px);z-index:8;width:228px;padding:6px;border:1px solid var(--line, #e1e6ef);border-radius:10px;box-shadow:0 8px 28px var(--shadow, rgb(32 42 59 / .12));background:var(--surface, #ffffff);display:grid;gap:3px;text-align:left;}.ds-menu button{width:100%;height:auto;min-height:36px;display:flex;gap:8px;justify-content:flex-start;padding:9px 10px;background:transparent;color:var(--ink, #202a3b);border:0;border-radius:6px;font-family:\"IBM Plex Sans\",\"Noto Sans SC\",\"Segoe UI\",\"Microsoft YaHei\",sans-serif;font-size:12px;cursor:pointer;}.ds-menu button:hover:not(:disabled){background:var(--surface-subtle, #f3f5f8);}.ds-menu .ds-menu-danger{color:var(--danger, #b4404b);}.ds-more summary:focus-visible{outline:2px solid var(--green, #365edb);outline-offset:3px;}.ds-menu button:focus-visible{outline:2px solid var(--green, #365edb);outline-offset:3px;}@media(pointer:coarse){.ds-more summary{min-height:44px;}}"
+    }
+  ],
+  "narrative": {
+    "northStar": "侧栏工作台",
+    "overview": "这是一个克制、紧凑、以任务为中心的工作台。石墨中性色组织文字、表面和边界，蓝色标记主要动作与当前选择。通过对齐、分隔线和文字层级建立秩序，让任务状态和下一步操作容易扫描。\n\n授权与 MFA 使用同一套外壳和交互语言。概览是连续的信息带；筛选先于任务列表；偶尔使用的配置和详情进入抽屉。此方向来自已批准的 UI 方案，具体数值以当前实现为准。",
+    "keyCharacteristics": [
+      "紧凑概览带、任务表和有条件出现的批量工具栏。",
+      "桌面稳定侧栏，窄屏顶部导航；次要数据仍能从详情访问。",
+      "统一浅色、深色和跟随系统主题；文字与颜色共同表达状态。"
+    ],
+    "rules": [
+      {
+        "name": "The Status Text Rule",
+        "body": "状态必须同时保留文字；颜色不能承担唯一的状态解释。",
+        "section": "colors"
+      },
+      {
+        "name": "The Flat Surface Rule",
+        "body": "表格和概览在静态状态保持平面；菜单及抽屉使用现有层级阴影。",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "**Do** 共用现有主题变量，并按后加载的 workspace.css 判断最终样式。",
+      "**Do** 为状态、未知值和错误保留可读文字。",
+      "**Do** 把手机折叠的数据保留在详情中，并维持粗指针点击尺寸。",
+      "**Do** 把新增的真实颜色、组件状态和动效同步到本文与 sidecar。"
+    ],
+    "donts": [
+      "**Don't** 用装饰性渐变替代已批准的石墨与蓝色方向。",
+      "**Don't** 为无来源的数据增加趋势图、成功率或统计卡片。",
+      "**Don't** 声称本地字体已打包，或把尚未实现的抽屉过渡写成现有能力。",
+      "**Don't** 把样式示例和测试账号当作真实业务结果。"
+    ]
+  }
+}

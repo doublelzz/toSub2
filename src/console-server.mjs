@@ -11,6 +11,7 @@ import react from "@vitejs/plugin-react";
 import { createServer as createViteServer } from "vite";
 import { createCredentialStore } from "./credential-store.mjs";
 import { createMfaWorkspace } from "./mfa-workspace.mjs";
+import { matchesTaskQuery, normalizeTaskQuery, summarizeTasks } from "./task-query.mjs";
 import { loadAccountInsights, publicAccountInsights } from "./account-insights.mjs";
 import {
   fetchMailboxOtpCandidates,
@@ -256,14 +257,14 @@ async function handleApi(req, res, requestUrl) {
 
   if (req.method === "GET" && requestUrl.pathname === "/api/jobs") {
     const requestedPage = Math.max(1, Number.parseInt(requestUrl.searchParams.get("page") || "1", 10) || 1);
-    await sendJobsPage(res, requestedPage);
+    await sendJobsPage(res, requestedPage, null, Object.fromEntries(requestUrl.searchParams));
     return;
   }
 
   if (req.method === "POST" && requestUrl.pathname === "/api/jobs/query") {
     const body = await readJson(req);
     const requestedPage = Math.max(1, Number.parseInt(body.page || "1", 10) || 1);
-    await sendJobsPage(res, requestedPage, normalizeEmailFilter(body.emails));
+    await sendJobsPage(res, requestedPage, Object.hasOwn(body, "emails") ? normalizeEmailFilter(body.emails) : null, body);
     return;
   }
 
@@ -649,13 +650,12 @@ async function handleApi(req, res, requestUrl) {
   sendJson(res, 405, { error: "Method not allowed" });
 }
 
-async function sendJobsPage(res, requestedPage, emailFilter = null) {
+async function sendJobsPage(res, requestedPage, emailFilter = null, filters = {}) {
+  const query = normalizeTaskQuery(filters);
   await syncCompletedOutputs();
   const allJobs = listUniqueJobs();
   const emailSet = emailFilter?.length ? new Set(emailFilter) : null;
-  const visibleJobs = emailSet
-    ? allJobs.filter((job) => emailSet.has(job.email.toLowerCase()))
-    : allJobs;
+  const visibleJobs = allJobs.filter((job) => (!emailSet || emailSet.has(job.email.toLowerCase())) && matchesTaskQuery(job, query));
   const total = visibleJobs.length;
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const page = Math.min(requestedPage, totalPages);
@@ -664,8 +664,9 @@ async function sendJobsPage(res, requestedPage, emailFilter = null) {
     jobs: visibleJobs.slice(start, start + PAGE_SIZE).map(publicJob),
     selection: visibleJobs.map(publicSelectionJob),
     pagination: { page, pageSize: PAGE_SIZE, total, totalPages, totalAll: allJobs.length },
-    filter: { active: Boolean(emailSet), requested: emailFilter?.length || 0, matched: total },
+    filter: { active: Boolean(emailSet || query.search || query.status !== "all" || query.start !== null), requested: emailFilter?.length || 0, matched: total },
     stats: {
+      ...summarizeTasks(allJobs, query),
       active: allJobs.filter(occupiesActiveSlot).length,
       queued: allJobs.filter((job) => job.status === "queued").length,
       completed: allJobs.filter((job) => job.status === "completed").length,

@@ -1,5 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Ban, Check, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, CircleAlert, Download, FileText, History, ListPlus, LoaderCircle, LogOut, RefreshCw, Search, ShieldCheck, X } from "lucide-react";
+import { Drawer, MoreActions, TaskFilters, TaskOverview, useCalendarDay, useDialogFocus } from "./WorkspaceUi.jsx";
+import { DEFAULT_FILTERS, matchesDate } from "./task-filters.mjs";
 
 const PAGE_SIZE = 20;
 const ACTIVE_STATUSES = new Set(["queued", "running"]);
@@ -18,7 +20,7 @@ const STAGE_LABELS = {
 };
 const LOGOUT_LABELS = { idle: "尚未登出", queued: "等待登出", running: "正在登出", success: "已登出", failed: "登出失败", interrupted: "登出中断" };
 
-export default function MfaWorkspace({ token, defaultProxyUrl }) {
+export default function MfaWorkspace({ token, defaultProxyUrl, onReconnect }) {
   const [accounts, setAccounts] = useState([]);
   const [selectedIds, setSelectedIds] = useState(() => new Set());
   const [text, setText] = useState("");
@@ -28,8 +30,8 @@ export default function MfaWorkspace({ token, defaultProxyUrl }) {
   const [expandedAccountId, setExpandedAccountId] = useState(null);
   const [history, setHistory] = useState([]);
   const [historyError, setHistoryError] = useState("");
-  const [query, setQuery] = useState("");
-  const [statusFilter, setStatusFilter] = useState("all");
+  const [filters, setFilters] = useState(DEFAULT_FILTERS);
+  const calendarDay = useCalendarDay();
   const [page, setPage] = useState(1);
   const [concurrency, setConcurrency] = useState(3);
   const [proxyUrl, setProxyUrl] = useState(defaultProxyUrl || "");
@@ -39,7 +41,9 @@ export default function MfaWorkspace({ token, defaultProxyUrl }) {
   const [notice, setNotice] = useState("");
   const [loaded, setLoaded] = useState(false);
   const [running, setRunning] = useState(false);
+  const [reading, setReading] = useState(false);
   const concurrencyLoaded = useRef(false);
+  useDialogFocus(importOpen, () => { if (!action) setImportOpen(false); });
 
   const request = useCallback(async (path, options = {}) => {
     const response = await fetch(`/api/mfa/${path}`, {
@@ -71,6 +75,14 @@ export default function MfaWorkspace({ token, defaultProxyUrl }) {
   }, []);
 
   const refresh = useCallback(async () => applyAccounts(await (await request("accounts")).json()), [request, applyAccounts]);
+  const retryRead = async () => {
+    setReading(true);
+    setError("");
+    onReconnect?.();
+    try { await refresh(); }
+    catch (requestError) { setPollError(requestError.message); }
+    finally { setReading(false); }
+  };
 
   useEffect(() => {
     if (!token) return undefined;
@@ -111,9 +123,10 @@ export default function MfaWorkspace({ token, defaultProxyUrl }) {
   }, [token, request, historyOpen]);
 
   const filtered = useMemo(() => accounts.filter((account) => (
-    (statusFilter === "all" || account.status === statusFilter)
-    && account.email.toLowerCase().includes(query.trim().toLowerCase())
-  )), [accounts, query, statusFilter]);
+    (filters.status === "all" || account.status === filters.status)
+    && account.email.toLowerCase().includes(filters.search.trim().toLowerCase())
+    && matchesDate(account, filters)
+  )), [accounts, filters, calendarDay]);
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const currentPage = Math.min(page, totalPages);
   const pageAccounts = filtered.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
@@ -126,6 +139,16 @@ export default function MfaWorkspace({ token, defaultProxyUrl }) {
   const allPageSelected = pageAccounts.length > 0 && pageAccounts.every((account) => selectedIds.has(account.id));
   const counts = accounts.reduce((result, account) => ({ ...result, [account.status]: (result[account.status] || 0) + 1 }), {});
   const validConcurrency = Number.isInteger(Number(concurrency)) && Number(concurrency) >= 1 && Number(concurrency) <= 30;
+  const todayCount = accounts.filter((account) => matchesDate(account, { ...DEFAULT_FILTERS, preset: "today" })).length;
+  const unknownCreatedCount = accounts.filter((account) => !account.createdAt).length;
+  const detailAccount = accounts.find((account) => account.id === expandedAccountId);
+
+  function updateFilters(next) {
+    setFilters(next);
+    setPage(1);
+    setSelectedIds(new Set());
+    setExpandedAccountId(null);
+  }
 
   function toggleSelection(id) {
     setSelectedIds((current) => {
@@ -239,26 +262,30 @@ export default function MfaWorkspace({ token, defaultProxyUrl }) {
         </div>
       </div>
 
-      <div className="mfa-stats" aria-label="MFA 处理统计">
-        <div><span>账号总数</span><strong>{accounts.length}</strong></div>
-        <div><span>待处理 / 排队</span><strong>{(counts.ready || 0) + (counts.queued || 0)}</strong></div>
-        <div><span>修改中</span><strong>{counts.running || 0}</strong></div>
-        <div className="mfa-stat-success"><span>修改成功</span><strong>{counts.success || 0}</strong></div>
-        <div className="mfa-stat-failed"><span>失败 / 中断</span><strong>{(counts.failed || 0) + (counts.interrupted || 0)}</strong></div>
-      </div>
+      <TaskOverview label="MFA 任务统计" today={loaded ? todayCount : null} total={loaded ? accounts.length : null}
+        onToday={() => updateFilters({ ...filters, dateField: "createdAt", preset: "today" })}
+        onTotal={() => updateFilters({ ...filters, preset: "all" })}
+        note={unknownCreatedCount ? `${unknownCreatedCount} 个历史账号的创建时间未知，不计入今日任务。` : ""}
+        items={[
+          { key: "ready", label: "待处理", count: counts.ready, tone: "waiting" },
+          { key: "queued", label: "排队中", count: counts.queued, tone: "queued" },
+          { key: "running", label: "修改中", count: counts.running, tone: "running" },
+          { key: "success", label: "已成功", count: counts.success, tone: "complete" },
+          { key: "failed", label: "失败", count: counts.failed, tone: "failed" },
+        ].map((item) => ({ ...item, onClick: () => updateFilters({ ...filters, status: item.key }) }))} />
+      <TaskFilters value={filters} onChange={updateFilters} statuses={{ all: "所有状态", ...STATUS_LABELS }} dateFields={{ createdAt: "创建时间", updatedAt: "最近更新时间", changedAt: "修改成功时间" }} day={calendarDay}
+        extra={<button type="button" className="selection-text-button" onClick={() => updateFilters(DEFAULT_FILTERS)}>清除筛选</button>} />
 
-      {(error || pollError) && <div className="global-error" role="alert"><CircleAlert size={17} /><span>{error || pollError}</span><button type="button" title="关闭错误提示" onClick={() => { setError(""); setPollError(""); }}><X size={16} /></button></div>}
+      {(error || pollError) && <div className="global-error" role="alert"><CircleAlert size={17} /><span>{error || pollError}</span><button type="button" className="error-retry" disabled={reading} onClick={retryRead}>{reading ? <LoaderCircle size={15} className="spin" /> : <RefreshCw size={15} />}重新读取</button><button type="button" title="关闭错误提示" onClick={() => { setError(""); setPollError(""); }}><X size={16} /></button></div>}
       {notice && <div className="global-success" role="status"><Check size={17} /><span>{notice}</span><button type="button" title="关闭提示" onClick={() => setNotice("")}><X size={16} /></button></div>}
 
       <div className="mfa-controls">
         <label className="mfa-control"><span>并发数</span><input type="number" min="1" max="30" step="1" value={concurrency} onChange={(event) => { concurrencyLoaded.current = true; setConcurrency(event.target.value); }} /></label>
         <label className="mfa-control mfa-proxy-control"><span>代理地址</span><input type="text" value={proxyUrl} onChange={(event) => setProxyUrl(event.target.value)} autoComplete="off" spellCheck="false" placeholder="留空使用默认网络" /></label>
-        <label className="mfa-control mfa-search-control"><span><Search size={13} />筛选邮箱</span><input type="search" value={query} onChange={(event) => { setQuery(event.target.value); setPage(1); }} placeholder="输入邮箱关键词" /></label>
-        <label className="mfa-control"><span>状态</span><select value={statusFilter} onChange={(event) => { setStatusFilter(event.target.value); setPage(1); }}><option value="all">全部状态</option>{Object.entries(STATUS_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
       </div>
       {!validConcurrency && <div className="global-error" role="alert">并发数需为 1 到 30 的整数。</div>}
 
-      <div className="selection-toolbar mfa-selection-toolbar">
+      {selectedIds.size > 0 && <div className="selection-toolbar mfa-selection-toolbar">
         <div className="selection-summary">
           <span>匹配 {filtered.length} 条 · 跨页已选 {selectedIds.size} 条</span>
           <button type="button" className="selection-text-button" disabled={!filtered.length} onClick={() => setSelectedIds((current) => new Set([...current, ...filtered.map((account) => account.id)]))}>全选筛选结果</button>
@@ -270,44 +297,55 @@ export default function MfaWorkspace({ token, defaultProxyUrl }) {
           <button type="button" className="secondary-button bulk-button" disabled={!token || running || !logoutable.length || !validConcurrency || Boolean(action)} onClick={logoutDevices} title={selectedIds.size ? "登出所选成功账号的所有设备" : "登出当前筛选中成功账号的所有设备"}>{action === "logout-all" ? <LoaderCircle className="spin" size={15} /> : <LogOut size={15} />}登出所有设备 {logoutable.length || ""}</button>
           <button type="button" className="secondary-button bulk-button" disabled={!cancelable.length || Boolean(action)} onClick={cancelAccounts}><Ban size={15} />停止所选</button>
         </div>
-      </div>
+      </div>}
 
       <div className="mfa-export-toolbar">
         <span>{selectedIds.size ? "所选账号中" : "全部账号中"}可导出 {exportable.length} 条成功结果 · TXT：邮箱----密码----新 MFA 密钥</span>
         <div><button type="button" className="secondary-button" disabled={running || !exportable.length || Boolean(action)} onClick={() => exportAccounts("txt")}>{action === "export-txt" ? <LoaderCircle className="spin" size={15} /> : <Download size={15} />}导出 TXT</button><button type="button" className="secondary-button" disabled={running || !exportable.length || Boolean(action)} onClick={() => exportAccounts("json")}>{action === "export-json" ? <LoaderCircle className="spin" size={15} /> : <Download size={15} />}导出 JSON</button></div>
       </div>
 
+      <div className="list-heading mfa-list-heading"><strong>任务列表</strong><span aria-live="polite">匹配 {filtered.length} 条</span><div><button type="button" className="selection-text-button" disabled={!filtered.length} onClick={() => setSelectedIds(new Set(filtered.map((account) => account.id)))}>全选筛选结果</button><MoreActions label="更多操作">
+          <button type="button" className="secondary-button bulk-button" disabled={running || !retryable.length || !validConcurrency || Boolean(action)} onClick={() => startAccounts(retryable, true)} title={running ? "当前批次结束后可重试" : selectedIds.size ? "重试所选账号中的失败和中断任务" : "重试筛选结果中的失败和中断任务"}>{action === "retry" ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}重试失败 / 中断 {retryable.length || ""}</button>
+          <button type="button" className="secondary-button bulk-button" disabled={!token || running || !logoutable.length || !validConcurrency || Boolean(action)} onClick={logoutDevices} title={selectedIds.size ? "登出所选成功账号的所有设备" : "登出当前筛选中成功账号的所有设备"}>{action === "logout-all" ? <LoaderCircle className="spin" size={15} /> : <LogOut size={15} />}登出所有设备 {logoutable.length || ""}</button>
+      </MoreActions></div></div>
       <div className="table-frame"><table className="mfa-table"><thead><tr>
-        <th className="select-heading"><input type="checkbox" checked={allPageSelected} disabled={!pageAccounts.length} onChange={selectPage} aria-label="选择当前页全部 MFA 账号" /></th><th>账号</th><th>状态</th><th>当前进度</th><th>设备登出</th><th>最近更新</th><th>修改成功时间</th><th>详情</th>
+        <th className="select-heading"><input type="checkbox" checked={allPageSelected} disabled={!pageAccounts.length} onChange={selectPage} aria-label="选择当前页全部 MFA 账号" /></th><th>账号</th><th>状态</th><th>当前进度</th><th>设备登出</th><th>时间</th><th>详情</th>
       </tr></thead><tbody>
-        {!pageAccounts.length && <tr><td colSpan="8"><div className="empty-state"><div><ShieldCheck size={24} /></div><h3>{!loaded ? "正在读取 MFA 账号" : accounts.length ? "没有匹配账号" : "暂无 MFA 账号"}</h3><p>{accounts.length ? "调整邮箱或状态筛选。" : "导入账号后，选择需要修改 MFA 的账号。"}</p></div></td></tr>}
+        {!pageAccounts.length && <tr><td colSpan="7"><div className="empty-state"><div><ShieldCheck size={24} /></div><h3>{!loaded ? "正在读取 MFA 账号" : accounts.length ? "没有匹配账号" : "暂无 MFA 账号"}</h3><p>{accounts.length ? "调整邮箱或状态筛选。" : "导入账号后，选择需要修改 MFA 的账号。"}</p></div></td></tr>}
         {pageAccounts.map((account) => <React.Fragment key={account.id}><tr className={selectedIds.has(account.id) ? "selected-row" : ""}>
           <td className="select-cell"><input type="checkbox" checked={selectedIds.has(account.id)} onChange={() => toggleSelection(account.id)} aria-label={`选择 MFA 账号 ${account.email}`} /></td>
-          <td><strong className="mfa-email">{account.email}</strong><span className="mfa-credentials">{account.hasPassword ? "已导入密码" : "未提供密码"} · {account.hasTotpKey ? "已有 MFA 密钥" : "新建 MFA"}</span></td>
-          <td><MfaStatus status={account.status} /></td>
+          <td><strong className="mfa-email">{account.email}</strong><span className="mfa-credentials">{account.hasPassword ? "已导入密码" : "未提供密码"} · {account.hasTotpKey ? "已有 MFA 密钥" : "新建 MFA"}</span><div className="mfa-mobile-status"><MfaStatus status={account.status} /></div><span className="mfa-mobile-time">更新 {formatTime(account.updatedAt)}</span></td>
+          <td className="mfa-status-column"><MfaStatus status={account.status} /></td>
           <td className="mfa-stage"><span>{STAGE_LABELS[account.stage] || account.stage || "等待开始"}</span>{account.error && <div className="row-error">{account.error}</div>}</td>
-          <td className="mfa-stage"><span className={`mfa-status mfa-status-${account.logoutStatus || "idle"}`}>{ACTIVE_STATUSES.has(account.logoutStatus) && <LoaderCircle size={12} className="spin" />}{account.logoutStatus === "success" && <Check size={12} />}{LOGOUT_LABELS[account.logoutStatus || "idle"]}</span>{account.logoutError && <div className="row-error">{account.logoutError}</div>}{account.logoutAt && <div className="mfa-date">{formatTime(account.logoutAt)}</div>}</td>
-          <td className="mfa-date">{formatTime(account.updatedAt)}</td><td className="mfa-date">{formatTime(account.changedAt)}</td>
+          <td className="mfa-stage mfa-device-column"><span className={`mfa-status mfa-status-${account.logoutStatus || "idle"}`}>{ACTIVE_STATUSES.has(account.logoutStatus) && <LoaderCircle size={12} className="spin" />}{account.logoutStatus === "success" && <Check size={12} />}{LOGOUT_LABELS[account.logoutStatus || "idle"]}</span>{account.logoutError && <div className="row-error">{account.logoutError}</div>}{account.logoutAt && <div className="mfa-date">{formatTime(account.logoutAt)}</div>}</td>
+          <td className="mfa-date mfa-time-column"><div>更新 {formatTime(account.updatedAt)}</div><div className="insight-note">成功 {formatTime(account.changedAt)}</div></td>
           <td><button type="button" className="icon-button" aria-label={`${expandedAccountId === account.id ? "收起" : "查看"} ${account.email} 的详情日志`} aria-expanded={expandedAccountId === account.id} aria-controls={`mfa-logs-${account.id}`} title={expandedAccountId === account.id ? "收起详情日志" : "查看详情日志"} onClick={() => setExpandedAccountId((current) => current === account.id ? null : account.id)}><FileText size={17} />{expandedAccountId === account.id ? <ChevronUp size={13} /> : <ChevronDown size={13} />}</button></td>
-        </tr>{expandedAccountId === account.id && <tr className="log-row"><td colSpan="8"><MfaLogs key={account.id} accountId={account.id} request={request} /></td></tr>}</React.Fragment>)}
+        </tr></React.Fragment>)}
       </tbody></table></div>
       <div className="mfa-pagination"><span>共 {filtered.length} 条，每页 {PAGE_SIZE} 条</span><div><button type="button" className="icon-button" disabled={currentPage <= 1} onClick={() => setPage(currentPage - 1)} title="MFA 上一页"><ChevronLeft size={17} /></button><span>{currentPage} / {totalPages}</span><button type="button" className="icon-button" disabled={currentPage >= totalPages} onClick={() => setPage(currentPage + 1)} title="MFA 下一页"><ChevronRight size={17} /></button></div></div>
 
-      {historyOpen && <section className="mfa-history" aria-labelledby="mfa-history-title">
-        <div className="section-heading"><div><h2 id="mfa-history-title">操作历史</h2><p>最近 {Math.min(history.length, 50)} 条记录</p></div></div>
+      {detailAccount && <Drawer title="MFA 任务详情" onClose={() => setExpandedAccountId(null)} wide>
+        <p className="detail-email">{detailAccount.email}</p>
+        <section className="detail-section"><h3>修改进度</h3><MfaStatus status={detailAccount.status} /><p className="prompt-line">{STAGE_LABELS[detailAccount.stage] || detailAccount.stage}</p>{detailAccount.error && <p className="row-error">{detailAccount.error}</p>}</section>
+        <section className="detail-section"><h3>设备登出</h3><MfaStatus status={detailAccount.logoutStatus || "idle"} logout />{detailAccount.logoutError && <p className="row-error">{detailAccount.logoutError}</p>}{detailAccount.logoutAt && <p className="prompt-line">{formatTime(detailAccount.logoutAt)}</p>}</section>
+        <section className="detail-section"><h3>时间</h3><dl className="detail-dates"><div><dt>创建时间</dt><dd>{detailAccount.createdAt ? formatTime(detailAccount.createdAt) : "未知"}</dd></div><div><dt>最近更新</dt><dd>{formatTime(detailAccount.updatedAt)}</dd></div><div><dt>修改成功</dt><dd>{formatTime(detailAccount.changedAt)}</dd></div></dl></section>
+        <section className="detail-section"><h3>详情日志</h3><MfaLogs key={detailAccount.id} accountId={detailAccount.id} request={request} /></section>
+      </Drawer>}
+      {historyOpen && <Drawer title="操作历史" onClose={() => setHistoryOpen(false)} wide><section className="mfa-history" aria-labelledby="mfa-history-title">
+        <p id="mfa-history-title" className="drawer-description">最近 {Math.min(history.length, 50)} 条记录</p>
         {historyError && <div className="global-error" role="alert">{historyError}</div>}
         <div className="table-frame"><table>
           <thead><tr><th>账号</th><th>操作</th><th>结果</th><th>进度 / 错误</th><th>开始时间</th><th>结束时间</th></tr></thead>
           <tbody>
             {history.slice(0, 50).map((item) => <tr key={item.id}>
-              <td>{item.email}</td><td>{item.operation === "logout_all" ? "登出所有设备" : "修改 MFA"}</td><td><MfaStatus status={item.status} logout={item.operation === "logout_all"} /></td>
-              <td className="mfa-stage">{STAGE_LABELS[item.stage] || item.stage || "—"}{item.error && <div className="row-error">{item.error}</div>}</td>
-              <td className="mfa-date">{formatTime(item.startedAt)}</td><td className="mfa-date">{formatTime(item.finishedAt)}</td>
+              <td data-label="账号">{item.email}</td><td data-label="操作">{item.operation === "logout_all" ? "登出所有设备" : "修改 MFA"}</td><td data-label="结果"><MfaStatus status={item.status} logout={item.operation === "logout_all"} /></td>
+              <td data-label="进度" className="mfa-stage">{STAGE_LABELS[item.stage] || item.stage || "—"}{item.error && <div className="row-error">{item.error}</div>}</td>
+              <td data-label="开始" className="mfa-date">{formatTime(item.startedAt)}</td><td data-label="结束" className="mfa-date">{formatTime(item.finishedAt)}</td>
             </tr>)}
             {!history.length && <tr><td colSpan="6" className="mfa-history-empty">暂无操作记录</td></tr>}
           </tbody>
         </table></div>
-      </section>}
+      </section></Drawer>}
 
       {importOpen && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !action) setImportOpen(false); }}><form className="batch-dialog mfa-import-dialog" onSubmit={previewImport} role="dialog" aria-modal="true" aria-labelledby="mfa-import-title">
         <div className="dialog-header"><div><h2 id="mfa-import-title">导入 MFA 账号</h2><span>每行一个账号，预览确认后导入</span></div><button type="button" className="icon-button" title="关闭导入" disabled={Boolean(action)} onClick={() => setImportOpen(false)}><X size={18} /></button></div>

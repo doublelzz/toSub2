@@ -124,7 +124,7 @@ function publicAccount(account) {
     id: account.id, email: account.email, status: account.status,
     stage: account.stage, error: account.error || "",
     hasPassword: Boolean(account.hasPassword), hasTotpKey: Boolean(account.hasTotpKey),
-    updatedAt: account.updatedAt, changedAt: account.changedAt || "",
+    createdAt: validDate(account.createdAt), updatedAt: account.updatedAt, changedAt: account.changedAt || "",
     logoutStatus: LOGOUT_STATUSES.has(account.logoutStatus) ? account.logoutStatus : "idle",
     logoutError: Object.values(ERRORS).includes(account.logoutError) ? account.logoutError : "",
     logoutAt: validDate(account.logoutAt),
@@ -527,7 +527,7 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
           return [row.email, account ? { ...account } : null];
         }));
         const imported = parsed.map((row) => {
-          const account = byEmail.get(row.email) || { id: crypto.randomUUID(), email: row.email, changedAt: "" };
+          const account = byEmail.get(row.email) || { id: crypto.randomUUID(), email: row.email, createdAt: new Date().toISOString(), changedAt: "" };
           mark(account, "ready", "ready");
           markLogout(account, "idle");
           account.logoutAt = "";

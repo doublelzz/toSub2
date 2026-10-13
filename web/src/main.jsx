@@ -32,7 +32,10 @@ import {
   X,
 } from "lucide-react";
 import "./styles.css";
+import "./workspace.css";
 import MfaWorkspace from "./MfaWorkspace.jsx";
+import { Drawer, MoreActions, TaskFilters, TaskOverview, ThemeControl, useCalendarDay, useDialogFocus } from "./WorkspaceUi.jsx";
+import { AUTH_STATUSES, DEFAULT_FILTERS, hasFilters, queryFilters } from "./task-filters.mjs";
 
 const POLL_INTERVAL_MS = 900;
 const LUBAN_API_KEY_STORAGE_KEY = "chatgpt-onboarding.luban-api-key";
@@ -57,6 +60,14 @@ const REGION_NAMES = typeof Intl.DisplayNames === "function"
 
 function App() {
   const [activeWorkspace, setActiveWorkspace] = useState("authorization");
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [singleOpen, setSingleOpen] = useState(false);
+  const [filters, setFilters] = useState(DEFAULT_FILTERS);
+  const [loaded, setLoaded] = useState(false);
+  const [connectionAttempt, setConnectionAttempt] = useState(0);
+  const [density, setDensity] = useState(() => readLocalTextSetting("tosub2.density") === "compact" ? "compact" : "comfortable");
+  const calendarDay = useCalendarDay();
+  const requestFilters = useMemo(() => queryFilters(filters), [filters, calendarDay]);
   const [token, setToken] = useState("");
   const [features, setFeatures] = useState({});
   const [jobs, setJobs] = useState([]);
@@ -111,10 +122,19 @@ function App() {
   const [uploadNotice, setUploadNotice] = useState("");
   const [accountProxyUrl, setAccountProxyUrl] = useState(() => readLocalTextSetting(ACCOUNT_PROXY_STORAGE_KEY));
 
+  useDialogFocus(smsSettingsOpen || mailRequestSettingsOpen || sub2apiSettingsOpen || batchOpen || filterOpen, () => {
+    setSmsSettingsOpen(false);
+    if (!mailRequestSettingsSaving) setMailRequestSettingsOpen(false);
+    if (!sub2apiSettingsSaving) setSub2apiSettingsOpen(false);
+    if (!batchBusy) setBatchOpen(false);
+    setFilterOpen(false);
+  });
+
   useEffect(() => writeLocalJson(SMS_PROVIDER_SETTINGS_KEY, smsSettings), [smsSettings]);
   useEffect(() => writeLocalJson(MAIL_REQUEST_SETTINGS_KEY, mailRequestSettings), [mailRequestSettings]);
   useEffect(() => writeLocalJson(SUB2API_UPLOAD_SETTINGS_KEY, sub2apiSettings), [sub2apiSettings]);
   useEffect(() => writeLocalTextSetting(ACCOUNT_PROXY_STORAGE_KEY, accountProxyUrl.trim()), [accountProxyUrl]);
+  useEffect(() => writeLocalTextSetting("tosub2.density", density), [density]);
 
   useEffect(() => {
     let stopped = false;
@@ -126,11 +146,11 @@ function App() {
           setFeatures(data.features || {});
         }
       })
-      .catch((requestError) => setError(requestError.message));
+      .catch((requestError) => { if (!stopped) setError(requestError.message); });
     return () => {
       stopped = true;
     };
-  }, []);
+  }, [connectionAttempt]);
 
   useEffect(() => {
     if (!token) return;
@@ -142,21 +162,30 @@ function App() {
 
   useEffect(() => {
     if (!token) return undefined;
+    if (requestFilters.error) {
+      setJobs([]);
+      setJobSelectionIndex([]);
+      setPagination({ page: 1, pageSize: 20, total: 0, totalPages: 1 });
+      return undefined;
+    }
     let stopped = false;
     let timer;
+    const controller = new AbortController();
     const poll = async () => {
       try {
         const data = emailFilter.length
           ? await apiFetch(token, "/api/jobs/query", {
               method: "POST",
-              body: JSON.stringify({ page, emails: emailFilter }),
+              body: JSON.stringify({ page, emails: emailFilter, ...requestFilters }),
+              signal: controller.signal,
             })
-          : await apiFetch(token, `/api/jobs?page=${page}`);
+          : await apiFetch(token, `/api/jobs?${new URLSearchParams({ page, ...requestFilters })}`, { signal: controller.signal });
         if (!stopped) {
           setJobs(data.jobs);
           setJobSelectionIndex(data.selection || data.jobs);
           setPagination(data.pagination || { page, pageSize: 20, total: data.jobs.length, totalPages: 1 });
           setStats(data.stats || { active: 0, queued: 0, completed: 0 });
+          setLoaded(true);
           if (data.pagination?.page && data.pagination.page !== page) setPage(data.pagination.page);
           setError("");
         }
@@ -169,9 +198,10 @@ function App() {
     poll();
     return () => {
       stopped = true;
+      controller.abort();
       window.clearTimeout(timer);
     };
-  }, [token, page, emailFilter]);
+  }, [token, page, emailFilter, requestFilters, connectionAttempt]);
 
   useEffect(() => {
     if (!token || !features.sub2apiMonitor) return undefined;
@@ -474,6 +504,18 @@ function App() {
     setExpandedJobId(null);
   }, [page]);
 
+  function updateFilters(next) {
+    setFilters(next);
+    setPage(1);
+    setSelectedJobIds(new Set());
+    setExpandedJobId(null);
+  }
+
+  function clearFilters() {
+    updateFilters(DEFAULT_FILTERS);
+    clearEmailFilter();
+  }
+
   async function createJob(event) {
     event.preventDefault();
     if (!email.trim() || busy) return;
@@ -486,6 +528,7 @@ function App() {
       setPage(1);
       if (page === 1) setJobs((current) => mergeJobs([data.job], current).slice(0, 20));
       setEmail("");
+      setSingleOpen(false);
       setError("");
     } catch (requestError) {
       setError(requestError.message);
@@ -714,174 +757,41 @@ function App() {
   }
 
   return (
-    <main className="app-shell">
-      <header className="topbar">
-        <div className="brand-block">
-          <div className="brand-mark"><ShieldCheck size={21} strokeWidth={2.2} /></div>
-          <div>
-            <h1>ChatGPT 账号授权控制台</h1>
-            <p>本地多任务协议登录</p>
-          </div>
-        </div>
-        {activeWorkspace === "authorization" && <div className="summary" aria-label="任务统计">
-          <span><i className="status-dot active" />进行中 <strong>{stats.active}</strong></span>
-          <span><i className="status-dot queued" />排队中 <strong>{stats.queued || 0}</strong></span>
-          <span><i className="status-dot complete" />已完成 <strong>{stats.completed}</strong></span>
-        </div>}
-      </header>
-
-      <nav className="workspace-tabs" aria-label="工作区">
-        <button type="button" className={activeWorkspace === "authorization" ? "active" : ""} aria-pressed={activeWorkspace === "authorization"} onClick={() => setActiveWorkspace("authorization")}>
-          <LogIn size={17} />账号授权
-        </button>
-        <button type="button" className={activeWorkspace === "mfa" ? "active" : ""} aria-pressed={activeWorkspace === "mfa"} onClick={() => setActiveWorkspace("mfa")}>
-          <ShieldCheck size={17} />MFA 修改
-        </button>
-      </nav>
-      {activeWorkspace === "mfa" && <MfaWorkspace token={token} defaultProxyUrl={accountProxyUrl} />}
+    <main className={`app-shell density-${density}`}>
+      <aside className="app-sidebar">
+        <div className="brand-block"><div className="brand-mark"><ShieldCheck size={21} /></div><h1>toSub2</h1></div>
+        <nav className="workspace-tabs" aria-label="工作区">
+          <button type="button" className={activeWorkspace === "authorization" ? "active" : ""} aria-pressed={activeWorkspace === "authorization"} onClick={() => setActiveWorkspace("authorization")}><LogIn size={17} />账号授权</button>
+          <button type="button" className={activeWorkspace === "mfa" ? "active" : ""} aria-pressed={activeWorkspace === "mfa"} onClick={() => setActiveWorkspace("mfa")}><ShieldCheck size={17} />MFA 修改</button>
+          <button type="button" className="sidebar-settings" onClick={() => setSettingsOpen(true)}><Settings2 size={17} />配置</button>
+        </nav>
+        <div className="sidebar-footer"><span>本地工作区</span><p>授权与 MFA 独立管理</p></div>
+      </aside>
+      <div className="workspace-content">
+      <header className="topbar"><div className="workspace-path"><span>工作区</span><ChevronRight size={14} /><strong>{activeWorkspace === "authorization" ? "账号授权" : "MFA 修改"}</strong></div><div className="topbar-actions"><button type="button" className="density-control" aria-pressed={density === "compact"} onClick={() => setDensity(density === "compact" ? "comfortable" : "compact")}>{density === "compact" ? "紧凑列表" : "舒适列表"}</button><ThemeControl /><button type="button" className="secondary-button" onClick={() => setSettingsOpen(true)}><Settings2 size={16} />配置</button></div></header>
+      {activeWorkspace === "mfa" && <MfaWorkspace token={token} defaultProxyUrl={accountProxyUrl} onReconnect={() => setConnectionAttempt((current) => current + 1)} />}
       {activeWorkspace === "authorization" && <>
       <section className="workspace">
-        <div className="section-heading">
-          <div>
-            <h2>授权任务</h2>
-            <p>{emailFilter.length
-              ? `匹配 ${pagination.total} 条，共 ${pagination.totalAll ?? pagination.total} 条任务`
-              : (pagination.total ? `共 ${pagination.total} 条任务` : "添加邮箱后开始第一条任务")}</p>
-          </div>
-          <form className="add-form" onSubmit={createJob}>
-            <div className="email-field">
-              <Mail size={17} aria-hidden="true" />
-              <input
-                type="email"
-                value={email}
-                onChange={(event) => setEmail(event.target.value)}
-                placeholder="输入邮箱地址"
-                autoComplete="email"
-                aria-label="邮箱地址"
-                required
-              />
-            </div>
-            <button className="primary-button" type="submit" disabled={!token || busy}>
-              {busy ? <LoaderCircle className="spin" size={17} /> : <Plus size={17} />}
-              添加任务
-            </button>
-            <button className="secondary-button" type="button" onClick={() => { setBatchError(""); setBatchOpen(true); }} disabled={!token}>
-              <ListPlus size={17} />
-              批量添加
-            </button>
-            <button
-              className={`secondary-button ${emailFilter.length ? "filter-active" : ""}`}
-              type="button"
-              onClick={() => { setFilterError(""); setFilterText(emailFilter.join("\n")); setFilterOpen(true); }}
-              disabled={!token}
-            >
-              <Filter size={17} />
-              {emailFilter.length ? `筛选 ${emailFilter.length}` : "筛选账号"}
-            </button>
-            {emailFilter.length > 0 && (
-              <button className="selection-text-button clear-filter-button" type="button" onClick={clearEmailFilter}>
-                清除筛选
-              </button>
-            )}
-          </form>
-        </div>
-
-        <div className="provider-toolbar sms-provider-toolbar" aria-label="接码平台配置">
-          <div className="provider-heading"><PhoneIncoming size={17} /><strong>接码平台</strong></div>
-          <span className="provider-name">{activeSmsProvider.name || "未选择"}</span>
-          <span className={`provider-ready ${activeSmsProvider.ready ? "" : "incomplete"}`}>
-            {activeSmsProvider.ready ? <Check size={14} /> : <CircleAlert size={14} />}
-            {activeSmsProvider.ready
-              ? (activeSmsProvider.summary ? `已配置 · ${activeSmsProvider.summary}` : "已配置")
-              : "未完成配置"}
-          </span>
-          <button type="button" className="secondary-button provider-settings-button" onClick={openSmsSettings} disabled={!smsProviderDefinitions.length}>
-            <Settings2 size={16} />配置
-          </button>
-        </div>
-
-        <div className="provider-toolbar mail-request-toolbar" aria-label="邮件接码请求配置">
-          <div className="provider-heading"><MailCheck size={17} /><strong>邮件 API</strong></div>
-          <span className="provider-name">{mailRequestSettings.method}</span>
-          <span className="provider-ready">
-            <Check size={14} />
-            {formatMailRequestSummary(mailRequestSettings)}
-          </span>
-          <button type="button" className="secondary-button provider-settings-button" onClick={openMailRequestSettings} disabled={!token}>
-            <Settings2 size={16} />配置
-          </button>
-        </div>
-
-        <div className="provider-toolbar sub2api-toolbar" aria-label="Sub2API 配置与号池监控">
-          <div className="provider-heading"><Send size={17} /><strong>Sub2API</strong></div>
-          <span className="provider-name">{sub2apiSettings.baseUrl || "未配置后端"}</span>
-          <span className={`provider-ready ${sub2apiSettings.adminApiKey ? "" : "incomplete"}`}>
-            {sub2apiSettings.adminApiKey ? <Check size={14} /> : <CircleAlert size={14} />}
-            {sub2apiSettings.adminApiKey
-              ? `${sub2apiSettings.groupIds.length ? `已配置 · ${sub2apiSettings.groupIds.length} 个号池` : "已配置 · 默认号池"}${sub2apiSettings.proxyId ? " · 已指定代理" : ""}`
-              : "未完成配置"}
-          </span>
-          {features.sub2apiMonitor && (
-            <span className={`provider-ready monitor-ready ${sub2apiMonitorStatus.enabled ? "" : "incomplete"}`}>
-              {sub2apiMonitorStatus.running
-                ? <LoaderCircle className="spin" size={14} />
-                : sub2apiMonitorStatus.enabled ? <ShieldCheck size={14} /> : <CircleAlert size={14} />}
-              {sub2apiMonitorStatus.running
-                ? "正在巡检"
-                : sub2apiMonitorStatus.enabled
-                  ? `号池监控已启用${sub2apiMonitorStatus.lastCheckAt ? ` · ${formatRelativeMonitorTime(sub2apiMonitorStatus.lastCheckAt)}` : ""}`
-                  : "号池监控未启用"}
-            </span>
-          )}
-          {features.sub2apiMonitor && sub2apiMonitorStatus.enabled && (
-            <button
-              type="button"
-              className="icon-button monitor-check-button"
-              onClick={checkSub2ApiMonitorNow}
-              disabled={sub2apiMonitorChecking || sub2apiMonitorStatus.running}
-              title="立即检查 Sub2API 异常账号"
-            >
-              <RefreshCw className={sub2apiMonitorChecking || sub2apiMonitorStatus.running ? "spin" : ""} size={16} />
-            </button>
-          )}
-          <button type="button" className="secondary-button provider-settings-button" onClick={openSub2ApiSettings} disabled={!token}>
-            <Settings2 size={16} />配置
-          </button>
-        </div>
-
-        <div className="provider-toolbar account-proxy-toolbar" aria-label="代理 IP 配置">
-          <div className="provider-heading"><Globe2 size={17} /><strong>代理 IP</strong></div>
-          <div className="account-proxy-input">
-            <label className="provider-field account-proxy-field" title="支持 http://、https://、socks5:// 和 socks5h://；用户名中包含 -sid- 时会自动轮换会话编号">
-              <Globe2 size={15} aria-hidden="true" />
-              <input
-                value={accountProxyUrl}
-                onChange={(event) => setAccountProxyUrl(event.target.value)}
-                placeholder="socks5h://用户名:密码@主机:端口"
-                spellCheck="false"
-                aria-label="代理 IP 地址"
-              />
-            </label>
-          </div>
-          <span className={`provider-ready ${accountProxyUrl.trim() ? "" : "incomplete"}`}>
-            {accountProxyUrl.trim() ? <Check size={14} /> : <CircleAlert size={14} />}
-            {accountProxyUrl.trim() ? "已配置，按账号检测出口" : "未配置，使用本地 IP"}
-          </span>
-          <a
-            className="provider-external-link"
-            href="https://invite.zooproxy.com/share/ez2v2jdb7"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <ExternalLink size={13} aria-hidden="true" />
-            点击获取代理 IP
-          </a>
-        </div>
+        <div className="section-heading"><div><h2>账号授权</h2><p>查看任务进度、管理授权和账号额度</p></div><button type="button" className="primary-button" disabled={!token} onClick={() => setSingleOpen(true)}><Plus size={17} />新建任务</button></div>
+        <TaskOverview today={loaded ? stats.today : null} total={loaded ? stats.total : null}
+          onToday={() => updateFilters({ ...filters, dateField: "createdAt", preset: "today" })}
+          onTotal={() => updateFilters({ ...filters, preset: "all" })}
+          items={[
+            { key: "running", label: "进行中", count: stats.running, tone: "running" },
+            { key: "queued", label: "排队中", count: stats.queued, tone: "queued" },
+            { key: "waiting", label: "待输入", count: stats.waiting, tone: "waiting" },
+            { key: "completed", label: "已完成", count: stats.completed, tone: "complete" },
+            { key: "failed", label: "失败", count: stats.failed, tone: "failed" },
+          ].map((item) => ({ ...item, onClick: () => updateFilters({ ...filters, status: item.key }) }))} />
+        <TaskFilters value={filters} onChange={updateFilters} statuses={AUTH_STATUSES} dateFields={{ createdAt: "创建时间", lastOperationAt: "最近操作时间" }} day={calendarDay}
+          extra={<button className={`secondary-button ${emailFilter.length ? "filter-active" : ""}`} type="button" onClick={() => { setFilterError(""); setFilterText(emailFilter.join("\n")); setFilterOpen(true); }} disabled={!token}><Filter size={16} />{emailFilter.length ? `精确邮箱 ${emailFilter.length}` : "精确邮箱"}</button>} />
+        <div className="config-summary"><Settings2 size={14} /><button type="button" onClick={() => setSettingsOpen(true)}>配置摘要</button><span>代理 · {accountProxyUrl.trim() ? "已配置" : "本地网络"}</span><span>短信 · {activeSmsProvider.ready ? activeSmsProvider.name : "未配置"}</span><span>邮件 · {mailRequestSettings.method}</span><span>Sub2API · {sub2apiSettings.adminApiKey ? "已配置" : "未配置"}</span>{sub2apiMonitorStatus.enabled && <span>号池巡检 · {sub2apiMonitorStatus.running ? "正在检查" : "已开启"}</span>}</div>
 
         {error && (
           <div className="global-error" role="alert">
             <CircleAlert size={17} />
             <span>{error}</span>
+            <button type="button" className="error-retry" onClick={() => setConnectionAttempt((current) => current + 1)}><RefreshCw size={15} />重新读取</button>
             <button type="button" onClick={() => setError("")} title="关闭"><X size={16} /></button>
           </div>
         )}
@@ -893,7 +803,7 @@ function App() {
           </div>
         )}
 
-        {features.bulkActions && jobs.length > 0 && (
+        {features.bulkActions && selectedJobIds.size > 0 && (
           <div className="selection-toolbar">
             <div className="selection-summary">
               <span>当前页 {jobs.length} 条，跨页已选 {selectedJobIds.size} 条，可下载 {downloadableSelectedCount} 条</span>
@@ -926,6 +836,7 @@ function App() {
                   上传到 Sub2API
                 </button>
               )}
+              <MoreActions label="更多">
               {features.sourceExport && (
                 <button type="button" className="secondary-button bulk-button" onClick={exportSelectedSource} disabled={!selectedJobIds.size || Boolean(batchAction)}>
                   {batchAction === "source" ? <LoaderCircle className="spin" size={16} /> : <FileText size={16} />}
@@ -958,39 +869,19 @@ function App() {
                 {batchAction === "delete" ? <LoaderCircle className="spin" size={16} /> : <Trash2 size={16} />}
                 批量删除
               </button>
+              </MoreActions>
             </div>
           </div>
         )}
 
-        <div className="table-frame">
-          <table className="authorization-table">
-            <thead>
-              <tr>
-                <th className="select-heading">
-                  <input
-                    type="checkbox"
-                    checked={allPageSelected}
-                    onChange={toggleAllOnPage}
-                    disabled={!features.bulkActions || !pageJobIds.length}
-                    aria-label="选择当前页全部任务"
-                  />
-                </th>
-                <th>账号</th>
-                <th>状态</th>
-                <th>额度剩余</th>
-                <th>Plus 到期时间</th>
-                <th>剩余重置次数</th>
-                <th>当前操作</th>
-                <th>开始时间</th>
-                <th>最近操作时间</th>
-                <th className="actions-heading">操作</th>
-              </tr>
-            </thead>
-            <tbody>
-              {!jobs.length && <EmptyState filtered={emailFilter.length > 0} />}
-              {jobs.map((job) => (
-                <React.Fragment key={job.id}>
-                  <JobRow
+        <div className="table-frame task-list-panel">
+          <div className="list-heading"><strong>任务列表</strong><span aria-live="polite">匹配 {pagination.total} 条{emailFilter.length ? ` · 精确邮箱 ${emailFilter.length} 个` : ""}</span><div>{features.cancelAll && <button type="button" className="selection-text-button" onClick={cancelAllRunningJobs} disabled={!(stats.active || stats.queued) || Boolean(batchAction)} title="停止所有运行和排队任务，不受当前筛选影响"><Ban size={14} />停止全部</button>}<button type="button" className="selection-text-button" onClick={clearFilters} disabled={!hasFilters(filters) && !emailFilter.length}>清除筛选</button></div></div>
+          <table className="authorization-table"><thead><tr>
+            <th className="select-heading"><input type="checkbox" checked={allPageSelected} onChange={toggleAllOnPage} disabled={!features.bulkActions || !pageJobIds.length} aria-label="选择当前页全部任务" /></th>
+            <th>账号</th><th>状态与进度</th><th>额度与订阅</th><th>时间</th><th className="actions-heading">操作</th>
+          </tr></thead><tbody>
+            {!jobs.length && <EmptyState filtered={hasFilters(filters) || emailFilter.length > 0} loaded={loaded} onCreate={() => setSingleOpen(true)} onClear={clearFilters} />}
+            {jobs.map((job) => <JobRow key={job.id}
                     job={job}
                     token={token}
                     expanded={expandedJobId === job.id}
@@ -1007,28 +898,31 @@ function App() {
                     passwordAddAvailable={Boolean(features.passwordAdd)}
                     forceReloginAvailable={Boolean(features.forceRelogin)}
                     accountProxyUrl={accountProxyUrl}
-                  />
-                  {expandedJobId === job.id && (
-                    <tr className="log-row">
-                      <td colSpan="10"><JobLogs token={token} jobId={job.id} /></td>
-                    </tr>
-                  )}
-                </React.Fragment>
-              ))}
-            </tbody>
-          </table>
+            />)}
+          </tbody></table>
+          <nav className="pagination" aria-label="任务分页"><span>共 {pagination.total} 条 · 每页 {pagination.pageSize} 条</span><div><button type="button" className="icon-button" onClick={() => setPage((current) => Math.max(1, current - 1))} disabled={page <= 1} aria-label="上一页"><ChevronLeft size={17} /></button><span>{pagination.page} / {pagination.totalPages}</span><button type="button" className="icon-button" onClick={() => setPage((current) => Math.min(pagination.totalPages, current + 1))} disabled={page >= pagination.totalPages} aria-label="下一页"><ChevronRight size={17} /></button></div></nav>
         </div>
-        {features.pagination && pagination.totalPages > 1 && (
-          <nav className="pagination" aria-label="任务分页">
-            <button type="button" className="icon-button" onClick={() => setPage((current) => Math.max(1, current - 1))} disabled={page <= 1} title="上一页">
-              <ChevronLeft size={17} />
-            </button>
-            <span>第 <strong>{pagination.page}</strong> / {pagination.totalPages} 页</span>
-            <button type="button" className="icon-button" onClick={() => setPage((current) => Math.min(pagination.totalPages, current + 1))} disabled={page >= pagination.totalPages} title="下一页">
-              <ChevronRight size={17} />
-            </button>
-          </nav>
-        )}
+        {expandedJobId && jobs.find((job) => job.id === expandedJobId) && <Drawer title="任务详情" onClose={() => setExpandedJobId(null)} wide>
+          {(() => { const job = jobs.find((item) => item.id === expandedJobId); return <JobRow key={job.id} detail
+                    job={job}
+                    token={token}
+                    expanded={expandedJobId === job.id}
+                    onToggleLogs={() => setExpandedJobId((current) => current === job.id ? null : job.id)}
+                    onError={setError}
+                    selected={selectedJobIds.has(job.id)}
+                    onToggleSelected={() => toggleJobSelection(job.id)}
+                    selectionSupported={Boolean(features.bulkActions)}
+                    smsProviderAvailable={smsProviderDefinitions.length > 0}
+                    smsProvider={activeSmsProvider}
+                    onUpload={() => uploadSelected([job.id])}
+                    sub2apiUploadAvailable={Boolean(features.sub2apiUpload && sub2apiSettings.baseUrl && sub2apiSettings.adminApiKey)}
+                    totpSetupAvailable={Boolean(features.totpSetup)}
+                    passwordAddAvailable={Boolean(features.passwordAdd)}
+                    forceReloginAvailable={Boolean(features.forceRelogin)}
+                    accountProxyUrl={accountProxyUrl}
+          />; })()}
+        </Drawer>}
+        {singleOpen && <Drawer title="新建授权任务" onClose={() => setSingleOpen(false)}><div className="creation-switch"><strong>单个添加</strong><button type="button" className="text-action" onClick={() => { setSingleOpen(false); setBatchError(""); setBatchOpen(true); }}><ListPlus size={16} />批量导入</button></div><form className="add-form" onSubmit={createJob}><label className="creation-email"><span>邮箱地址</span><div className="email-field"><Mail size={17} /><input type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="name@example.com" autoComplete="email" required /></div></label>{error && <p className="dialog-error" role="alert">{error}</p>}<button className="primary-button" type="submit" disabled={!token || busy}>{busy ? <LoaderCircle className="spin" size={17} /> : <Plus size={17} />}添加任务</button></form></Drawer>}
       </section>
       {smsSettingsOpen && (
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
@@ -1499,22 +1393,107 @@ function App() {
         </div>
       )}
       </>}
+      {settingsOpen && <Drawer title="工作区配置" onClose={() => setSettingsOpen(false)} wide><p className="drawer-description">配置代理、收码方式和 Sub2API，任务页面会显示当前配置摘要。</p>
+        <div className="provider-toolbar sms-provider-toolbar" aria-label="接码平台配置">
+          <div className="provider-heading"><PhoneIncoming size={17} /><strong>接码平台</strong></div>
+          <span className="provider-name">{activeSmsProvider.name || "未选择"}</span>
+          <span className={`provider-ready ${activeSmsProvider.ready ? "" : "incomplete"}`}>
+            {activeSmsProvider.ready ? <Check size={14} /> : <CircleAlert size={14} />}
+            {activeSmsProvider.ready
+              ? (activeSmsProvider.summary ? `已配置 · ${activeSmsProvider.summary}` : "已配置")
+              : "未完成配置"}
+          </span>
+          <button type="button" className="secondary-button provider-settings-button" onClick={() => { setSettingsOpen(false); openSmsSettings(); }} disabled={!smsProviderDefinitions.length}>
+            <Settings2 size={16} />配置
+          </button>
+        </div>
+
+        <div className="provider-toolbar mail-request-toolbar" aria-label="邮件接码请求配置">
+          <div className="provider-heading"><MailCheck size={17} /><strong>邮件 API</strong></div>
+          <span className="provider-name">{mailRequestSettings.method}</span>
+          <span className="provider-ready">
+            <Check size={14} />
+            {formatMailRequestSummary(mailRequestSettings)}
+          </span>
+          <button type="button" className="secondary-button provider-settings-button" onClick={() => { setSettingsOpen(false); openMailRequestSettings(); }} disabled={!token}>
+            <Settings2 size={16} />配置
+          </button>
+        </div>
+
+        <div className="provider-toolbar sub2api-toolbar" aria-label="Sub2API 配置与号池监控">
+          <div className="provider-heading"><Send size={17} /><strong>Sub2API</strong></div>
+          <span className="provider-name">{sub2apiSettings.baseUrl || "未配置后端"}</span>
+          <span className={`provider-ready ${sub2apiSettings.adminApiKey ? "" : "incomplete"}`}>
+            {sub2apiSettings.adminApiKey ? <Check size={14} /> : <CircleAlert size={14} />}
+            {sub2apiSettings.adminApiKey
+              ? `${sub2apiSettings.groupIds.length ? `已配置 · ${sub2apiSettings.groupIds.length} 个号池` : "已配置 · 默认号池"}${sub2apiSettings.proxyId ? " · 已指定代理" : ""}`
+              : "未完成配置"}
+          </span>
+          {features.sub2apiMonitor && (
+            <span className={`provider-ready monitor-ready ${sub2apiMonitorStatus.enabled ? "" : "incomplete"}`}>
+              {sub2apiMonitorStatus.running
+                ? <LoaderCircle className="spin" size={14} />
+                : sub2apiMonitorStatus.enabled ? <ShieldCheck size={14} /> : <CircleAlert size={14} />}
+              {sub2apiMonitorStatus.running
+                ? "正在巡检"
+                : sub2apiMonitorStatus.enabled
+                  ? `号池监控已启用${sub2apiMonitorStatus.lastCheckAt ? ` · ${formatRelativeMonitorTime(sub2apiMonitorStatus.lastCheckAt)}` : ""}`
+                  : "号池监控未启用"}
+            </span>
+          )}
+          {features.sub2apiMonitor && sub2apiMonitorStatus.enabled && (
+            <button
+              type="button"
+              className="icon-button monitor-check-button"
+              onClick={checkSub2ApiMonitorNow}
+              disabled={sub2apiMonitorChecking || sub2apiMonitorStatus.running}
+              title="立即检查 Sub2API 异常账号"
+            >
+              <RefreshCw className={sub2apiMonitorChecking || sub2apiMonitorStatus.running ? "spin" : ""} size={16} />
+            </button>
+          )}
+          <button type="button" className="secondary-button provider-settings-button" onClick={() => { setSettingsOpen(false); openSub2ApiSettings(); }} disabled={!token}>
+            <Settings2 size={16} />配置
+          </button>
+        </div>
+
+        <div className="provider-toolbar account-proxy-toolbar" aria-label="代理 IP 配置">
+          <div className="provider-heading"><Globe2 size={17} /><strong>代理 IP</strong></div>
+          <div className="account-proxy-input">
+            <label className="provider-field account-proxy-field" title="支持 http://、https://、socks5:// 和 socks5h://；用户名中包含 -sid- 时会自动轮换会话编号">
+              <Globe2 size={15} aria-hidden="true" />
+              <input
+                value={accountProxyUrl}
+                onChange={(event) => setAccountProxyUrl(event.target.value)}
+                placeholder="socks5h://用户名:密码@主机:端口"
+                spellCheck="false"
+                aria-label="代理 IP 地址"
+              />
+            </label>
+          </div>
+          <span className={`provider-ready ${accountProxyUrl.trim() ? "" : "incomplete"}`}>
+            {accountProxyUrl.trim() ? <Check size={14} /> : <CircleAlert size={14} />}
+            {accountProxyUrl.trim() ? "已配置，按账号检测出口" : "未配置，使用本地 IP"}
+          </span>
+          <a
+            className="provider-external-link"
+            href="https://invite.zooproxy.com/share/ez2v2jdb7"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            <ExternalLink size={13} aria-hidden="true" />
+            点击获取代理 IP
+          </a>
+        </div>
+
+      </Drawer>}
+      </div>
     </main>
   );
 }
 
-function EmptyState({ filtered = false }) {
-  return (
-    <tr>
-      <td colSpan="10">
-        <div className="empty-state">
-          <div><Mail size={24} /></div>
-          <h3>{filtered ? "没有匹配账号" : "暂无授权任务"}</h3>
-          <p>{filtered ? "当前筛选邮箱不在任务列表中。" : "在右上方输入邮箱地址开始登录。"}</p>
-        </div>
-      </td>
-    </tr>
-  );
+function EmptyState({ filtered = false, loaded, onCreate, onClear }) {
+  return <tr><td colSpan="6"><div className="empty-state"><div><Mail size={24} /></div><h3>{!loaded ? "正在读取任务" : filtered ? "没有匹配的任务" : "暂无授权任务"}</h3><p>{filtered ? "调整邮箱、状态或日期范围。" : "添加一个账号或批量导入，开始第一条任务。"}</p>{loaded && <button type="button" className="secondary-button" onClick={filtered ? onClear : onCreate}>{filtered ? "清除筛选" : "新建任务"}</button>}</div></td></tr>;
 }
 
 function InsightError({ item }) {
@@ -1570,7 +1549,7 @@ function SubscriptionInfo({ insights }) {
   </div>;
 }
 
-function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl }) {
+function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, detail = false }) {
   const [value, setValue] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
@@ -1728,44 +1707,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
   const inputConfig = getInputConfig(job.status, job.currentPhone);
   const terminal = ["completed", "failed", "canceled", "reauth_required", "resume_available"].includes(job.status);
 
-  return (
-    <tr className={`job-row status-${job.status}`}>
-      <td className="select-cell">
-        <input
-          type="checkbox"
-          checked={selected}
-          onChange={onToggleSelected}
-          disabled={!selectionSupported}
-          aria-label={`选择 ${job.email}`}
-        />
-      </td>
-      <td>
-        <div className="account-cell">
-          <div className="account-avatar">{job.email.slice(0, 1).toUpperCase()}</div>
-          <div className="account-details"><strong>{job.email}</strong><span>{shortId(job.id)}</span></div>
-          <LoginMethodBadge job={job} />
-        </div>
-      </td>
-      <td><StatusBadge status={job.status} /></td>
-      <td className="insight-cell">
-        <QuotaInfo insights={job.accountInsights} />
-        <button type="button" className="text-action insight-check" onClick={checkInsights}
-          disabled={!job.canCheckAccountInsights || submitting}
-          title="使用现有授权和账号代理查询，不重新登录">
-          {job.accountInsightsChecking ? <LoaderCircle className="spin" size={13} /> : <RefreshCw size={13} />}
-          {job.accountInsightsChecking ? "检测中" : "检测额度"}
-        </button>
-        {job.accountInsights?.checkedAt && <span className="insight-note" title={formatInsightDate(job.accountInsights.checkedAt)}>检测于 {formatDateTime(job.accountInsights.checkedAt)}</span>}
-        {job.accountInsightsError && <span className="insight-error">{job.accountInsightsError}</span>}
-      </td>
-      <td className="insight-cell"><SubscriptionInfo insights={job.accountInsights} /></td>
-      <td className="insight-cell">
-        {!job.accountInsights ? <span className="insight-note">未检测</span>
-          : job.accountInsights.resetCredits?.status === "ok"
-            ? <strong className="insight-count">{job.accountInsights.resetCredits.availableCount} <small>次</small></strong>
-            : <InsightError item={job.accountInsights.resetCredits} />}
-      </td>
-      <td className="step-cell">
+  const stepContent = <>
         <div className="prompt-line">{job.prompt}</div>
         {job.lastError && <div className="row-error">{extractResponseMessage(job.lastError)}</div>}
         {job.autoRepairBlocked && (
@@ -1850,15 +1792,34 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
               </>
             )}
           </div>
-        )}
-      </td>
-      <td className="time-cell"><time dateTime={job.createdAt}>{formatDateTime(job.createdAt)}</time></td>
-      <td className="operation-time-cell">
-        <time dateTime={job.lastOperationAt || job.createdAt}>{formatDateTime(job.lastOperationAt || job.createdAt)}</time>
-        <span>{operationLabel(job.lastOperationType)}</span>
-      </td>
-      <td>
-        <div className="row-actions">
+        )}</>;
+  const quotaContent = <div className="account-insights">      <div className="account-insight-section">
+        <QuotaInfo insights={job.accountInsights} />
+        <button type="button" className="text-action insight-check" onClick={checkInsights}
+          disabled={!job.canCheckAccountInsights || submitting}
+          title="使用现有授权和账号代理查询，不重新登录">
+          {job.accountInsightsChecking ? <LoaderCircle className="spin" size={13} /> : <RefreshCw size={13} />}
+          {job.accountInsightsChecking ? "检测中" : "检测额度"}
+        </button>
+        {job.accountInsights?.checkedAt && <span className="insight-note" title={formatInsightDate(job.accountInsights.checkedAt)}>检测于 {formatDateTime(job.accountInsights.checkedAt)}</span>}
+        {job.accountInsightsError && <span className="insight-error">{job.accountInsightsError}</span>}
+      </div>
+      <div className="account-insight-section"><span className="insight-label">Plus 到期</span><SubscriptionInfo insights={job.accountInsights} /></div>
+      <div className="account-insight-section">
+        <span className="insight-label">剩余重置次数</span>
+        <div>{!job.accountInsights ? <span className="insight-note">未检测</span>
+          : job.accountInsights.resetCredits?.status === "ok"
+            ? <strong className="insight-count">{job.accountInsights.resetCredits.availableCount} <small>次</small></strong>
+            : <InsightError item={job.accountInsights.resetCredits} />}</div>
+        <button type="button" className="text-action insight-check" onClick={checkInsights}
+          disabled={!job.canCheckAccountInsights || submitting}
+          aria-label="刷新剩余重置次数" title="使用现有授权和账号代理刷新剩余重置次数">
+          {job.accountInsightsChecking ? <LoaderCircle className="spin" size={13} /> : <RefreshCw size={13} />}
+          {job.accountInsightsChecking ? "刷新中" : "刷新"}
+        </button>
+      </div>
+</div>;
+  const actionContent = <>
           {job.canDownload && (
             <button type="button" className="download-button" onClick={download}>
               <Download size={16} />下载
@@ -1883,12 +1844,12 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
           )}
           {totpSetupAvailable && job.canSetupTotp && (
             <button type="button" className="icon-button" onClick={setupTotp} disabled={submitting} title="设置 2FA">
-              {submitting ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}
+              {submitting ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}设置 2FA
             </button>
           )}
           {passwordAddAvailable && job.canAddPassword && (
             <button type="button" className="icon-button" onClick={addPassword} disabled={submitting} title="添加密码">
-              {submitting ? <LoaderCircle className="spin" size={16} /> : <KeyRound size={16} />}
+              {submitting ? <LoaderCircle className="spin" size={16} /> : <KeyRound size={16} />}添加密码
             </button>
           )}
           {job.canRetry && (
@@ -1897,19 +1858,20 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
               {job.securityCheckRequired ? "手动重试" : job.canResume ? "继续流程" : "重新授权"}
             </button>
           )}
-          <button type="button" className="icon-button" onClick={onToggleLogs} title={expanded ? "收起日志" : "查看日志"}>
-            <FileText size={17} />
-            {expanded ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
-          </button>
           {!terminal && (
             <button type="button" className="icon-button danger" onClick={cancel} disabled={submitting} title="取消任务">
-              <Ban size={17} />
+              <Ban size={17} />取消任务
             </button>
-          )}
-        </div>
-      </td>
-    </tr>
-  );
+          )}</>;
+  if (detail) return <div className="job-detail-content"><p className="detail-email">{job.email}</p><section className="detail-section"><h3>状态与当前操作</h3><StatusBadge status={job.status} />{stepContent}</section><section className="detail-section"><h3>额度与订阅</h3>{quotaContent}</section><section className="detail-section"><h3>时间</h3><dl className="detail-dates"><div><dt>创建时间</dt><dd>{formatInsightDate(job.createdAt)}</dd></div><div><dt>最近操作</dt><dd>{formatInsightDate(job.lastOperationAt || job.createdAt)}</dd></div></dl></section><section className="detail-section"><h3>任务操作</h3><div className="detail-actions">{actionContent}</div></section><section className="detail-section"><h3>执行日志</h3><JobLogs token={token} jobId={job.id} /></section></div>;
+  return <tr className={`job-row status-${job.status} ${selected ? "selected-row" : ""}`}>
+    <td className="select-cell"><input type="checkbox" checked={selected} onChange={onToggleSelected} disabled={!selectionSupported} aria-label={`选择 ${job.email}`} /></td>
+    <td className="account-column"><div className="account-details"><strong title={job.email}>{job.email}</strong><span>{shortId(job.id)}</span></div><LoginMethodBadge job={job} /><div className="mobile-task-meta">{formatDateTime(job.createdAt)}</div></td>
+    <td className="status-step-cell"><StatusBadge status={job.status} />{inputConfig ? <div className="task-inline-step">{stepContent}</div> : <><div className="prompt-line">{job.prompt}</div>{job.lastError && <div className="row-error">{extractResponseMessage(job.lastError)}</div>}</>}</td>
+    <td className="insight-cell quota-column">{quotaContent}</td>
+    <td className="task-time-cell"><div><span>创建</span><time dateTime={job.createdAt} title={formatInsightDate(job.createdAt)}>{formatDateTime(job.createdAt)}</time></div><div><span>操作</span><time dateTime={job.lastOperationAt || job.createdAt} title={formatInsightDate(job.lastOperationAt || job.createdAt)}>{formatDateTime(job.lastOperationAt || job.createdAt)}</time></div><small>{operationLabel(job.lastOperationType)}</small></td>
+    <td className="actions-cell"><div className="row-actions"><button type="button" className="text-action" onClick={onToggleLogs} aria-label={`查看 ${job.email} 的任务详情`}>查看</button>{job.canDownload && <button type="button" className="text-action" onClick={download}><Download size={14} />下载</button>}{job.canRetry && !job.canDownload && <button type="button" className="text-action" onClick={retry} disabled={submitting}>{job.canResume ? "继续" : "重试"}</button>}<MoreActions label="更多">{actionContent}</MoreActions></div></td>
+  </tr>;
 }
 
 function JobLogs({ token, jobId }) {
