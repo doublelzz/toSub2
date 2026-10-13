@@ -226,6 +226,15 @@ input::placeholder, textarea::placeholder { color: var(--muted); opacity: 1; }
 .mfa-date { white-space: normal; line-height: 1.6; font-variant-numeric: tabular-nums; }
 .mfa-selection-toolbar .bulk-actions { margin-left: auto; }
 .mfa-export-toolbar { margin: 14px 0; flex-wrap: wrap; gap: 10px; }
+.mfa-export-backdrop { place-items: center; justify-content: normal; align-items: center; padding: 16px; }
+.mfa-export-dialog { width: min(760px, 100%); min-width: 0; max-height: calc(100dvh - 32px); padding: 24px; overflow-y: auto; overscroll-behavior: contain; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 18px 50px var(--shadow); }
+.mfa-export-dialog .drawer-heading { margin-bottom: 16px; }
+.mfa-export-description { margin: 0 0 18px; color: var(--muted); font-size: 13px; line-height: 1.7; }
+.mfa-export-label { display: block; margin-bottom: 8px; color: var(--ink); font-size: 13px; font-weight: 500; }
+.mfa-export-dialog textarea { display: block; width: 100%; height: min(360px, 42dvh); min-height: 120px; padding: 12px; resize: none; color: var(--ink); background: var(--surface-subtle); border: 1px solid var(--line); border-radius: 7px; font: 13px/1.7 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+.mfa-export-feedback { margin-top: 10px; color: var(--muted); font-size: 13px; line-height: 1.6; }
+.mfa-export-feedback.is-error { color: var(--danger); }
+.mfa-export-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 10px; margin-top: 20px; }
 .mfa-history table { min-width: 0; table-layout: fixed; }
 .mfa-history { margin-top: 0; }
 .mfa-history th:nth-child(1) { width: 26%; }

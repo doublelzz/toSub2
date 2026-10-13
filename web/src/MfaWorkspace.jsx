@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Ban, Check, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, CircleAlert, Download, FileText, History, ListPlus, LoaderCircle, LogOut, RefreshCw, Search, ShieldCheck, X } from "lucide-react";
+import { Ban, Check, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, CircleAlert, Copy, Download, FileText, History, ListPlus, LoaderCircle, LogOut, RefreshCw, Search, ShieldCheck, X } from "lucide-react";
 import { Drawer, MoreActions, TaskFilters, TaskOverview, useCalendarDay, useDialogFocus } from "./WorkspaceUi.jsx";
 import { DEFAULT_FILTERS, matchesDate } from "./task-filters.mjs";
 
@@ -25,6 +25,7 @@ export default function MfaWorkspace({ token, defaultProxyUrl, onReconnect }) {
   const [selectedIds, setSelectedIds] = useState(() => new Set());
   const [text, setText] = useState("");
   const [preview, setPreview] = useState(null);
+  const [exportPreview, setExportPreview] = useState(null);
   const [importOpen, setImportOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [expandedAccountId, setExpandedAccountId] = useState(null);
@@ -228,14 +229,13 @@ export default function MfaWorkspace({ token, defaultProxyUrl, onReconnect }) {
   }
 
   function exportAccounts(format) {
+    const returnFocus = document.activeElement;
     void perform(`export-${format}`, async () => {
       const response = await request("export", {
         method: "POST", body: JSON.stringify({ ...(selectedIds.size ? { ids: [...selectedIds] } : {}), format }),
       });
       const blob = await response.blob();
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = url;
+      const content = (await blob.text()).replace(/^\uFEFF/, "");
       const disposition = response.headers.get("content-disposition") || "";
       const rawName = /filename\*\s*=\s*(?:UTF-8'')?([^;]+)/i.exec(disposition)?.[1]
         || /filename\s*=\s*"?([^";]+)/i.exec(disposition)?.[1];
@@ -243,12 +243,7 @@ export default function MfaWorkspace({ token, defaultProxyUrl, onReconnect }) {
       if (rawName) {
         try { filename = decodeURIComponent(rawName.trim().replace(/^"|"$/g, "")).replace(/[\\/]/g, "_"); } catch {}
       }
-      link.download = filename;
-      document.body.append(link);
-      link.click();
-      link.remove();
-      window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
-      setNotice(`已导出 ${selectedIds.size ? "所选账号中的" : "全部"}成功结果。`);
+      setExportPreview({ blob, content, filename, format, returnFocus, scope: selectedIds.size ? "所选账号中的成功结果" : "全部成功结果" });
     });
   }
 
@@ -347,6 +342,8 @@ export default function MfaWorkspace({ token, defaultProxyUrl, onReconnect }) {
         </table></div>
       </section></Drawer>}
 
+      {exportPreview && <MfaExportDialog data={exportPreview} onClose={() => setExportPreview(null)} />}
+
       {importOpen && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !action) setImportOpen(false); }}><form className="batch-dialog mfa-import-dialog" onSubmit={previewImport} role="dialog" aria-modal="true" aria-labelledby="mfa-import-title">
         <div className="dialog-header"><div><h2 id="mfa-import-title">导入 MFA 账号</h2><span>每行一个账号，预览确认后导入</span></div><button type="button" className="icon-button" title="关闭导入" disabled={Boolean(action)} onClick={() => setImportOpen(false)}><X size={18} /></button></div>
         <label className="batch-label" htmlFor="mfa-import-text">邮箱----密码----当前 MFA 密钥；未启用 MFA 可省略密钥</label>
@@ -357,6 +354,53 @@ export default function MfaWorkspace({ token, defaultProxyUrl, onReconnect }) {
       </form></div>}
     </section>
   );
+}
+
+function MfaExportDialog({ data, onClose }) {
+  const dialogRef = useRef(null);
+  const contentRef = useRef(null);
+  const [copyState, setCopyState] = useState("");
+  useDialogFocus(true, onClose, dialogRef, data.returnFocus);
+
+  async function copyContent() {
+    setCopyState("copying");
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error("Clipboard unavailable");
+      await navigator.clipboard.writeText(data.content);
+      setCopyState("copied");
+    } catch {
+      setCopyState("failed");
+      contentRef.current?.focus();
+      contentRef.current?.select();
+    }
+  }
+
+  function downloadContent() {
+    const url = URL.createObjectURL(data.blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = data.filename;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+  }
+
+  return <div className="modal-backdrop mfa-export-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+    <section ref={dialogRef} className="mfa-export-dialog" role="dialog" aria-modal="true" aria-labelledby="mfa-export-title" aria-describedby="mfa-export-description">
+      <header className="drawer-heading"><h2 id="mfa-export-title">导出 MFA 结果</h2><button type="button" className="icon-button" aria-label="关闭导出预览" onClick={onClose}><X size={19} /></button></header>
+      <p id="mfa-export-description" className="mfa-export-description">{data.scope} · {data.format.toUpperCase()}<br />{data.format === "txt" ? "每行格式：邮箱----密码----新 MFA 密钥" : "JSON 格式，保留完整导出字段"}</p>
+      <label className="mfa-export-label" htmlFor="mfa-export-content">导出内容</label>
+      <textarea ref={contentRef} id="mfa-export-content" value={data.content} readOnly spellCheck="false" autoComplete="off" />
+      <div className={`mfa-export-feedback${copyState === "failed" ? " is-error" : ""}`} role={copyState === "failed" ? "alert" : "status"}>
+        {copyState === "copied" ? "已复制全部内容。" : copyState === "failed" ? "无法访问剪贴板，内容已选中，请手动复制。" : "可直接复制全部内容，也可选中部分内容复制。"}
+      </div>
+      <footer className="mfa-export-actions">
+        <button type="button" className="secondary-button" onClick={downloadContent}><Download size={16} />下载 {data.format.toUpperCase()}</button>
+        <button type="button" className="primary-button" disabled={copyState === "copying"} onClick={copyContent}>{copyState === "copying" ? <LoaderCircle size={16} className="spin" /> : copyState === "copied" ? <Check size={16} /> : <Copy size={16} />}{copyState === "copying" ? "正在复制" : copyState === "copied" ? "已复制" : "复制全部"}</button>
+      </footer>
+    </section>
+  </div>;
 }
 
 function MfaLogs({ accountId, request }) {

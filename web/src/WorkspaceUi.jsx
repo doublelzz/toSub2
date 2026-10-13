@@ -55,14 +55,14 @@ export function Drawer({ title, onClose, children, wide = false }) {
   return <div className="drawer-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section ref={ref} className={`workspace-drawer ${wide ? "drawer-wide" : ""}`} role="dialog" aria-modal="true" aria-labelledby={id}><header className="drawer-heading"><h2 id={id}>{title}</h2><button type="button" className="icon-button" aria-label="关闭面板" onClick={onClose}><X size={19} /></button></header>{children}</section></div>;
 }
 
-export function useDialogFocus(active, onClose, rootRef) {
+export function useDialogFocus(active, onClose, rootRef, returnFocus) {
   const closeRef = useRef(onClose);
   closeRef.current = onClose;
   useEffect(() => {
     if (!active) return undefined;
     const panel = rootRef?.current || document.querySelector('.modal-backdrop [role="dialog"]');
     if (!panel) return undefined;
-    const previous = document.activeElement;
+    const previous = returnFocus || document.activeElement;
     const previousOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
     if (!panel.contains(previous)) panel.querySelector("button:not(:disabled),input:not(:disabled),textarea:not(:disabled)")?.focus();
@@ -77,7 +77,7 @@ export function useDialogFocus(active, onClose, rootRef) {
     };
     document.addEventListener("keydown", onKey);
     return () => { document.body.style.overflow = previousOverflow; document.removeEventListener("keydown", onKey); if (previous?.isConnected) previous.focus(); };
-  }, [active, rootRef]);
+  }, [active, rootRef, returnFocus]);
 }
 
 export function MoreActions({ label = "更多操作", children }) {
