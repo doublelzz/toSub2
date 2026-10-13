@@ -58,16 +58,25 @@ const REGION_NAMES = typeof Intl.DisplayNames === "function"
   ? new Intl.DisplayNames(["zh-CN"], { type: "region" })
   : null;
 
+function PhoneBindingOption({ enabled, onChange, disabled }) {
+  return <label className="phone-binding-option">
+    <input type="checkbox" role="switch" checked={enabled} onChange={(event) => onChange(event.target.checked)} disabled={disabled} aria-label="允许手机号接码" />
+    <span><strong>允许手机号接码</strong><small>{enabled ? "需要验证手机号时，可取号或手动填写手机号，继续授权。" : "不取号、不提交手机号；继续检测额度、Plus 到期和重置次数。若服务端要求手机号，保留登录状态并标记授权未完成。"}</small></span>
+  </label>;
+}
+
 function App() {
   const [activeWorkspace, setActiveWorkspace] = useState("authorization");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [singleOpen, setSingleOpen] = useState(false);
   const [filters, setFilters] = useState(DEFAULT_FILTERS);
+  const [phoneTab, setPhoneTab] = useState("all");
+  const [phoneBindingEnabled, setPhoneBindingEnabled] = useState(true);
   const [loaded, setLoaded] = useState(false);
   const [connectionAttempt, setConnectionAttempt] = useState(0);
   const [density, setDensity] = useState(() => readLocalTextSetting("tosub2.density") === "compact" ? "compact" : "comfortable");
   const calendarDay = useCalendarDay();
-  const requestFilters = useMemo(() => queryFilters(filters), [filters, calendarDay]);
+  const requestFilters = useMemo(() => ({ ...queryFilters(filters), phoneBinding: phoneTab }), [filters, calendarDay, phoneTab]);
   const [token, setToken] = useState("");
   const [features, setFeatures] = useState({});
   const [jobs, setJobs] = useState([]);
@@ -521,12 +530,13 @@ function App() {
     if (!email.trim() || busy) return;
     setBusy(true);
     try {
-      const data = await apiFetch(token, "/api/jobs", {
+      await apiFetch(token, "/api/jobs", {
         method: "POST",
-        body: JSON.stringify({ email: email.trim(), proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify({ email: email.trim(), proxyUrl: accountProxyUrl.trim(), phoneBindingEnabled }),
       });
       setPage(1);
-      if (page === 1) setJobs((current) => mergeJobs([data.job], current).slice(0, 20));
+      setPhoneTab(phoneBindingEnabled ? "enabled" : "disabled");
+      setSelectedJobIds(new Set());
       setEmail("");
       setSingleOpen(false);
       setError("");
@@ -542,12 +552,13 @@ function App() {
     if (!batchText.trim() || batchBusy) return;
     setBatchBusy(true);
     try {
-      const data = await apiFetch(token, "/api/jobs/batch", {
+      await apiFetch(token, "/api/jobs/batch", {
         method: "POST",
-        body: JSON.stringify({ text: batchText, proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify({ text: batchText, proxyUrl: accountProxyUrl.trim(), phoneBindingEnabled }),
       });
       setPage(1);
-      if (page === 1) setJobs((current) => mergeJobs(data.jobs, current).slice(0, 20));
+      setPhoneTab(phoneBindingEnabled ? "enabled" : "disabled");
+      setSelectedJobIds(new Set());
       setBatchText("");
       setBatchError("");
       setBatchOpen(false);
@@ -783,6 +794,17 @@ function App() {
             { key: "completed", label: "已完成", count: stats.completed, tone: "complete" },
             { key: "failed", label: "失败", count: stats.failed, tone: "failed" },
           ].map((item) => ({ ...item, onClick: () => updateFilters({ ...filters, status: item.key }) }))} />
+        <div className="task-mode-tabs" role="tablist" aria-label="按接码设置切换任务" onKeyDown={(event) => {
+          const tabs = [...event.currentTarget.querySelectorAll('[role="tab"]')];
+          const index = tabs.indexOf(document.activeElement);
+          const next = event.key === "ArrowRight" ? (index + 1) % tabs.length : event.key === "ArrowLeft" ? (index + tabs.length - 1) % tabs.length : event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : null;
+          if (next !== null) { event.preventDefault(); tabs[next].focus(); tabs[next].click(); }
+        }}>
+          {[["all", "全部任务", stats.total], ["enabled", "接码任务", stats.phoneEnabled], ["disabled", "不接码任务", stats.phoneDisabled]].map(([key, label, count]) => <button key={key} id={`phone-tab-${key}`} type="button" role="tab" aria-selected={phoneTab === key} aria-controls="authorization-task-panel" tabIndex={phoneTab === key ? 0 : -1} onClick={() => { setPhoneTab(key); setPage(1); setSelectedJobIds(new Set()); setExpandedJobId(null); }}>
+            {label}<span>{loaded && count !== undefined ? count : "—"}</span>
+          </button>)}
+        </div>
+        <div id="authorization-task-panel" role="tabpanel" aria-labelledby={`phone-tab-${phoneTab}`}>
         <TaskFilters value={filters} onChange={updateFilters} statuses={AUTH_STATUSES} dateFields={{ createdAt: "创建时间", lastOperationAt: "最近操作时间" }} day={calendarDay}
           extra={<button className={`secondary-button ${emailFilter.length ? "filter-active" : ""}`} type="button" onClick={() => { setFilterError(""); setFilterText(emailFilter.join("\n")); setFilterOpen(true); }} disabled={!token}><Filter size={16} />{emailFilter.length ? `精确邮箱 ${emailFilter.length}` : "精确邮箱"}</button>} />
         <div className="config-summary"><Settings2 size={14} /><button type="button" onClick={() => setSettingsOpen(true)}>配置摘要</button><span>代理 · {accountProxyUrl.trim() ? "已配置" : "本地网络"}</span><span>短信 · {activeSmsProvider.ready ? activeSmsProvider.name : "未配置"}</span><span>邮件 · {mailRequestSettings.method}</span><span>Sub2API · {sub2apiSettings.adminApiKey ? "已配置" : "未配置"}</span>{sub2apiMonitorStatus.enabled && <span>号池巡检 · {sub2apiMonitorStatus.running ? "正在检查" : "已开启"}</span>}</div>
@@ -922,7 +944,8 @@ function App() {
                     accountProxyUrl={accountProxyUrl}
           />; })()}
         </Drawer>}
-        {singleOpen && <Drawer title="新建授权任务" onClose={() => setSingleOpen(false)}><div className="creation-switch"><strong>单个添加</strong><button type="button" className="text-action" onClick={() => { setSingleOpen(false); setBatchError(""); setBatchOpen(true); }}><ListPlus size={16} />批量导入</button></div><form className="add-form" onSubmit={createJob}><label className="creation-email"><span>邮箱地址</span><div className="email-field"><Mail size={17} /><input type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="name@example.com" autoComplete="email" required /></div></label>{error && <p className="dialog-error" role="alert">{error}</p>}<button className="primary-button" type="submit" disabled={!token || busy}>{busy ? <LoaderCircle className="spin" size={17} /> : <Plus size={17} />}添加任务</button></form></Drawer>}
+        {singleOpen && <Drawer title="新建授权任务" onClose={() => setSingleOpen(false)}><div className="creation-switch"><strong>单个添加</strong><button type="button" className="text-action" onClick={() => { setSingleOpen(false); setBatchError(""); setBatchOpen(true); }}><ListPlus size={16} />批量导入</button></div><form className="add-form" onSubmit={createJob}><label className="creation-email"><span>邮箱地址</span><div className="email-field"><Mail size={17} /><input type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="name@example.com" autoComplete="email" required /></div></label><PhoneBindingOption enabled={phoneBindingEnabled} onChange={setPhoneBindingEnabled} disabled={busy} />{error && <p className="dialog-error" role="alert">{error}</p>}<button className="primary-button" type="submit" disabled={!token || busy}>{busy ? <LoaderCircle className="spin" size={17} /> : <Plus size={17} />}添加任务</button></form></Drawer>}
+        </div>
       </section>
       {smsSettingsOpen && (
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
@@ -1348,6 +1371,7 @@ function App() {
               spellCheck="false"
               autoFocus
             />
+            <PhoneBindingOption enabled={phoneBindingEnabled} onChange={setPhoneBindingEnabled} disabled={batchBusy} />
             {batchError && <div className="dialog-error" role="alert"><CircleAlert size={15} />{batchError}</div>}
             <div className="dialog-footer">
               <button type="button" className="cancel-button" onClick={() => setBatchOpen(false)} disabled={batchBusy}>取消</button>
@@ -1705,7 +1729,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
   }
 
   const inputConfig = getInputConfig(job.status, job.currentPhone);
-  const terminal = ["completed", "failed", "canceled", "reauth_required", "resume_available"].includes(job.status);
+  const terminal = ["completed", "failed", "canceled", "reauth_required", "resume_available", "phone_skipped"].includes(job.status);
 
   const stepContent = <>
         <div className="prompt-line">{job.prompt}</div>
@@ -1855,7 +1879,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
           {job.canRetry && (
             <button type="button" className="retry-button" onClick={retry} disabled={submitting}>
               {submitting ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}
-              {job.securityCheckRequired ? "手动重试" : job.canResume ? "继续流程" : "重新授权"}
+              {job.securityCheckRequired ? "手动重试" : job.status === "phone_skipped" ? "重试授权" : job.canResume ? "继续流程" : "重新授权"}
             </button>
           )}
           {!terminal && (
@@ -1924,6 +1948,7 @@ function StatusBadge({ status }) {
     canceled: ["已取消", <Ban size={14} />],
     reauth_required: ["待重新授权", <RefreshCw size={14} />],
     resume_available: ["可继续", <RotateCcw size={14} />],
+    phone_skipped: ["已跳过接码", <Ban size={14} />],
   }[status] || [status, null];
   return <span className={`status-badge ${status}`}>{config[1]}{config[0]}</span>;
 }
@@ -2395,14 +2420,6 @@ function writeLocalTextSetting(key, value) {
   } catch {
     // Private browsing modes may disable localStorage; the current tab still works.
   }
-}
-
-function mergeJobs(...groups) {
-  const unique = new Map();
-  groups.flat().forEach((job) => {
-    if (!unique.has(job.id)) unique.set(job.id, job);
-  });
-  return [...unique.values()];
 }
 
 const appRoot = globalThis.__chatgptOnboardingRoot || createRoot(document.getElementById("root"));

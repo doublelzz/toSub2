@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 export const ACCOUNT_INSIGHTS_FILENAME = "account-insights.json";
+export const ACCOUNT_SESSION_FILENAME = "account-session.json";
 const AUTH_CLAIM = "https://api.openai.com/auth";
 const ERROR_MESSAGES = {
   authorization_invalid: "授权文件无效，请重新授权",
@@ -54,6 +55,18 @@ export function authorizationIdentity(data, expectedEmail = "") {
   if (!accountId) throw new Error("identity_missing");
   if (number(access.exp) !== null && access.exp * 1000 <= Date.now()) throw new Error("token_expired");
   return { email, accountId, accessToken: credentials.access_token, planType: plan(id[AUTH_CLAIM]?.chatgpt_plan_type) };
+}
+
+export function sessionIdentity(data, expectedEmail = "") {
+  if (data?.type !== "chatgpt-session" || data.version !== 1 || !text(data.accessToken)) throw new Error("authorization_invalid");
+  const claims = decodeJwt(data.accessToken);
+  const emails = [data.email, claims.email, claims["https://api.openai.com/profile"]?.email].map(normalizeEmail).filter(Boolean);
+  const email = normalizeEmail(expectedEmail) || emails[0];
+  if (!email || !emails.length || emails.some((candidate) => candidate !== email)) throw new Error("identity_mismatch");
+  const accountId = text(claims[AUTH_CLAIM]?.chatgpt_account_id);
+  if (!accountId) throw new Error("identity_missing");
+  if (number(claims.exp) !== null && claims.exp * 1000 <= Date.now()) throw new Error("token_expired");
+  return { email, accountId, accessToken: data.accessToken, planType: plan(claims[AUTH_CLAIM]?.chatgpt_plan_type) };
 }
 
 function windowInfo(value, key) {
@@ -130,9 +143,9 @@ function parseSubscription(data, identity) {
 
 export async function collectAccountInsights(data, { expectedEmail, fetcher = fetch, chatgptBase = "https://chatgpt.com", timeoutMs = 15_000 } = {}) {
   const checkedAt = new Date().toISOString();
-  const snapshot = { version: 1, email: normalizeEmail(expectedEmail || data?.accounts?.[0]?.credentials?.email), checkedAt };
+  const snapshot = { version: 1, email: normalizeEmail(expectedEmail || data?.email || data?.accounts?.[0]?.credentials?.email), checkedAt };
   let identity;
-  try { identity = authorizationIdentity(data, expectedEmail); } catch (error) {
+  try { identity = data?.type === "chatgpt-session" ? sessionIdentity(data, expectedEmail) : authorizationIdentity(data, expectedEmail); } catch (error) {
     return { ...snapshot, status: "error", quota: failure(error.message), subscription: failure(error.message), resetCredits: failure(error.message) };
   }
   snapshot.email = identity.email;

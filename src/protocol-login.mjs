@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
-import { checkAccountInsights } from "./account-insights.mjs";
+import { ACCOUNT_SESSION_FILENAME, checkAccountInsights, sessionIdentity } from "./account-insights.mjs";
 import {
   browserIdentityForTlsProfile,
   DEFAULT_TLS_PROFILE,
@@ -541,15 +541,16 @@ async function run() {
     }
     const rl = readline.createInterface({ input, output });
     const checkpointPath = path.resolve(args.checkpoint || args.resumeCheckpoint || `${sub2apiOutPath}.checkpoint.json`);
-    try {
     let client = null;
     let email = args.email || "";
+    try {
     let web = null;
     let codex = null;
     const codexOptions = {
       authBase,
       rl,
       phone: args.phone,
+      skipPhoneBinding: Boolean(args.skipPhoneBinding),
       codexClientId: args.codexClientId || DEFAULT_CODEX_CLIENT_ID,
       codexRedirectUri: args.codexRedirectUri || DEFAULT_CODEX_REDIRECT_URI,
       debugAuth: Boolean(args.debugAuth),
@@ -691,6 +692,21 @@ async function run() {
     } else if (args.webOnly) {
       await removeProtocolCheckpoint(checkpointPath);
     }
+    } catch (error) {
+      if (error.message !== "PHONE_BINDING_DISABLED") throw error;
+      const sourcePath = path.join(path.dirname(sub2apiOutPath), ACCOUNT_SESSION_FILENAME);
+      let source = { type: "chatgpt-session", version: 1, email, accessToken: "" };
+      try {
+        const { data } = await client.getJson("GET", `${chatgptBase}/api/auth/session`, { referer: `${chatgptBase}/` });
+        const candidate = { ...source, email: data?.user?.email, accessToken: data?.accessToken };
+        sessionIdentity(candidate, email);
+        source = candidate;
+      } catch {
+        console.log("[account-insights] 登录会话信息暂不可用，检测结果将显示具体错误。");
+      }
+      await writePrivateJson(sourcePath, source);
+      await detectAccountInsights(sourcePath, { chatgptBase, transport, expectedEmail: email });
+      console.log("[phone-skipped] 接码已关闭，未申请或提交手机号；登录检查点已保留，OAuth 授权尚未完成。");
     } finally {
       rl.close();
     }
@@ -1875,6 +1891,7 @@ async function finishCodexOauth(client, options, initial, oauth) {
 }
 
 async function bindPhoneIfNeeded(client, options, current, addPhoneUrl) {
+  if (options.skipPhoneBinding) throw new Error("PHONE_BINDING_DISABLED");
   console.log("[4/5] Phone binding is required");
   const addPhonePageUrl = addPhoneUrl || `${options.authBase}/add-phone`;
   const addPhoneReferer = await prepareAddPhonePage(client, addPhonePageUrl);
@@ -2580,6 +2597,7 @@ function parseArgs(argv) {
     else if (item === "--email") args.email = argv[++i];
     else if (item.startsWith("--phone=")) args.phone = item.slice("--phone=".length);
     else if (item === "--phone") args.phone = argv[++i];
+    else if (item === "--skip-phone-binding") args.skipPhoneBinding = true;
     else if (item.startsWith("--out=")) args.out = item.slice("--out=".length);
     else if (item === "--out") args.out = argv[++i];
     else if (item.startsWith("--sub2api-out=")) args.sub2apiOut = item.slice("--sub2api-out=".length);
@@ -2718,6 +2736,7 @@ function printHelp() {
 Options:
   --email <email>                 Email address. If omitted, prompt manually.
   --phone <phone>                 Phone number in E.164 format. If omitted, prompt when needed.
+  --skip-phone-binding           Stop when phone binding is required; detect account info from the verified web session.
   --web-only                      Only complete ChatGPT web login, skip Codex OAuth.
   --setup-totp                    Sign in and set up TOTP 2FA; skip Codex OAuth.
   --rotate-totp                   Replace existing TOTP or set it up, with resumable private state.

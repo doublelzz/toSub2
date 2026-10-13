@@ -22,7 +22,7 @@ try {
     await fs.mkdir(directory);
     const email = `query-${String(index).padStart(2, "0")}@example.com`;
     await fs.writeFile(path.join(directory, "sub2api-import-oauth.json"), JSON.stringify({ type: "sub2api-data", version: 1, accounts: [{ credentials: { email } }] }));
-    await fs.writeFile(path.join(directory, "job-meta.json"), JSON.stringify({ version: 1, email, status: "completed", result_saved: true, created_at: index < 25 ? "2026-10-13T01:00:00.000Z" : "2026-10-11T01:00:00.000Z", updated_at: "2026-10-13T02:00:00.000Z", last_operation_at: "2026-10-13T02:00:00.000Z" }));
+    await fs.writeFile(path.join(directory, "job-meta.json"), JSON.stringify({ version: 1, email, status: "completed", result_saved: true, ...(index < 25 ? { phone_binding_enabled: false } : {}), created_at: index < 25 ? "2026-10-13T01:00:00.000Z" : "2026-10-11T01:00:00.000Z", updated_at: "2026-10-13T02:00:00.000Z", last_operation_at: "2026-10-13T02:00:00.000Z" }));
   }
   child = spawn(process.execPath, ["src/console-server.mjs", "--host", "127.0.0.1", "--port", String(port)], { cwd: projectRoot, env: { ...process.env, ONBOARDING_OUTPUT_ROOT: root }, stdio: ["ignore", "pipe", "pipe"] });
   child.stdout.on("data", (data) => { output += data; });
@@ -42,6 +42,16 @@ try {
   assert.equal(first.selection.length, 25);
   assert.equal(first.stats.total, 29);
   assert.equal(first.stats.today, 25);
+  const disabled = await get({ phoneBinding: "disabled", page: 2 });
+  assert.equal(disabled.pagination.total, 25);
+  assert.equal(disabled.jobs.length, 5);
+  assert(disabled.jobs.every(job => job.phoneBindingEnabled === false));
+  assert.equal(disabled.selection.length, 25);
+  assert.equal(disabled.stats.phoneDisabled, 25);
+  assert.equal(disabled.stats.phoneEnabled, 4);
+  const enabled = await get({ phoneBinding: "enabled" });
+  assert.equal(enabled.pagination.total, 4);
+  assert(enabled.jobs.every(job => job.phoneBindingEnabled === true));
   const second = await get({ ...dates, page: 2 });
   assert.equal(second.jobs.length, 5);
   assert.equal(new Set([...first.jobs, ...second.jobs].map((job) => job.id)).size, 25);
@@ -55,6 +65,7 @@ try {
   assert.equal(exact.jobs[0].email, "query-00@example.com");
   assert.equal((await get({ ...dates, dateField: "lastOperationAt" })).pagination.total, 29);
   assert.equal((await fetch(`${base}/api/jobs?status=unknown`, { headers })).status, 400);
+  assert.equal((await fetch(`${base}/api/jobs?phoneBinding=unknown`, { headers })).status, 400);
   assert.equal((await fetch(`${base}/api/jobs?start=${encodeURIComponent(dates.start)}`, { headers })).status, 400);
   console.log("Task query HTTP: filtering before pagination, global statistics and exact email intersection passed");
 } finally {

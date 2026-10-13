@@ -14,10 +14,16 @@ const idTokenPayload = Buffer.from(JSON.stringify({
 
 let lastLoginHint = "";
 let addPasswordMode = false;
+const phoneRequests = { send: 0, validate: 0 };
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", base);
   const body = await readBody(req);
+  if (url.pathname === "/__phone-requests") return sendJson(res, 200, phoneRequests);
+  if (req.method === "GET" && url.pathname === "/api/auth/session") return sendJson(res, 200, {
+    user: { email: "add-phone-page@example.com" },
+    accessToken: `e30.${Buffer.from(JSON.stringify({ email: "add-phone-page@example.com", exp: Math.floor(Date.now() / 1000) + 3600, "https://api.openai.com/auth": { chatgpt_account_id: "mock-personal-account", chatgpt_plan_type: "plus" } })).toString("base64url")}.synthetic-session-signature`,
+  });
 
   if (req.method === "GET" && url.pathname === "/") {
     res.setHeader("set-cookie", [
@@ -172,6 +178,7 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === "POST" && url.pathname === "/api/accounts/session/select") {
     res.setHeader("set-cookie", "oai-client-auth-session=mock-auth-session; Path=/");
+    if (lastLoginHint === "no-phone-needed@example.com") return sendJson(res, 200, { "oai-client-auth-session": { workspaces: [{ id: "workspace-personal", kind: "personal" }] } });
     return sendJson(res, 200, {
       continue_url: `${publicBase}/add-phone`,
       "oai-client-auth-session": {},
@@ -182,6 +189,7 @@ const server = http.createServer(async (req, res) => {
     return sendText(res, 200, "<html><title>Add phone</title></html>", "text/html");
   }
   if (req.method === "POST" && url.pathname === "/api/accounts/add-phone/send") {
+    phoneRequests.send++;
     const payload = JSON.parse(body || "{}");
     if (lastLoginHint === "phone-risk-control@example.com") {
       return sendText(
@@ -228,6 +236,7 @@ const server = http.createServer(async (req, res) => {
     });
   }
   if (req.method === "POST" && url.pathname === "/api/accounts/phone-otp/validate") {
+    phoneRequests.validate++;
     return sendJson(res, 200, {
       "oai-client-auth-session": {
         workspaces: [{ id: "workspace-personal", kind: "personal" }],
@@ -244,11 +253,11 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 200, {
       access_token: "mock-access-token",
       refresh_token: "mock-refresh-token",
-      id_token: `e30.${idTokenPayload}.signature`,
+      id_token: `e30.${lastLoginHint === "no-phone-needed@example.com" ? Buffer.from(JSON.stringify({ email: lastLoginHint, "https://api.openai.com/auth": { chatgpt_account_id: "mock-personal-account", chatgpt_plan_type: "plus" } })).toString("base64url") : idTokenPayload}.signature`,
     });
   }
   if (req.method === "GET" && url.pathname === "/backend-api/wham/usage") return sendJson(res, 200, {
-    email: "add-phone-page@example.com", account_id: "mock-personal-account", plan_type: "plus",
+    email: lastLoginHint === "no-phone-needed@example.com" ? lastLoginHint : "add-phone-page@example.com", account_id: "mock-personal-account", plan_type: "plus",
     rate_limit: { allowed: true, primary_window: { used_percent: 25, limit_window_seconds: 18000 }, secondary_window: null },
     rate_limit_reset_credits: { available_count: 2 },
   });

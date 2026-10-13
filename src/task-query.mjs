@@ -1,6 +1,6 @@
 const RUNNING = new Set(["starting", "working", "finalizing", "refreshing", "checking_account", "totp_starting", "password_add_starting"]);
 const WAITING = new Set(["password", "mfa_otp", "totp_setup_otp", "email_otp", "phone", "phone_otp"]);
-const RECOVERABLE = new Set(["reauth_required", "resume_available"]);
+const RECOVERABLE = new Set(["reauth_required", "resume_available", "phone_skipped"]);
 const GROUPS = new Set(["all", "running", "queued", "waiting", "completed", "failed", "canceled", "recoverable"]);
 
 function badQuery(message) {
@@ -22,6 +22,8 @@ export function normalizeTaskQuery(value = {}, now = new Date()) {
   if (search.length > 200) throw badQuery("邮箱关键词最多 200 个字符");
   const status = value.status || "all";
   if (!GROUPS.has(status)) throw badQuery("任务状态筛选无效");
+  const phoneBinding = value.phoneBinding || "all";
+  if (!["all", "enabled", "disabled"].includes(phoneBinding)) throw badQuery("接码任务筛选无效");
   const dateField = value.dateField || "createdAt";
   if (!["createdAt", "lastOperationAt"].includes(dateField)) throw badQuery("日期字段筛选无效");
   const start = instant(value.start, "开始时间");
@@ -38,7 +40,7 @@ export function normalizeTaskQuery(value = {}, now = new Date()) {
     todayEnd = local.getTime();
   }
   if (todayEnd <= todayStart || todayEnd - todayStart > 27 * 60 * 60 * 1000) throw badQuery("当天统计时间范围无效");
-  return { search, status, dateField, start, end, todayStart, todayEnd };
+  return { search, status, phoneBinding, dateField, start, end, todayStart, todayEnd };
 }
 
 export function taskStatusGroup(status) {
@@ -49,6 +51,8 @@ export function taskStatusGroup(status) {
 }
 
 export function matchesTaskQuery(job, query) {
+  if (query.phoneBinding === "enabled" && job.phoneBindingEnabled === false) return false;
+  if (query.phoneBinding === "disabled" && job.phoneBindingEnabled !== false) return false;
   if (query.search && !String(job.email).toLowerCase().includes(query.search)) return false;
   if (query.status !== "all" && taskStatusGroup(job.status) !== query.status) return false;
   if (query.start !== null) {
@@ -59,8 +63,9 @@ export function matchesTaskQuery(job, query) {
 }
 
 export function summarizeTasks(jobs, query) {
-  const stats = { total: jobs.length, today: 0, running: 0, waiting: 0, queued: 0, completed: 0, failed: 0, canceled: 0, recoverable: 0 };
+  const stats = { total: jobs.length, today: 0, running: 0, waiting: 0, queued: 0, completed: 0, failed: 0, canceled: 0, recoverable: 0, phoneEnabled: 0, phoneDisabled: 0 };
   for (const job of jobs) {
+    if (job.phoneBindingEnabled === false) stats.phoneDisabled++; else stats.phoneEnabled++;
     const timestamp = Date.parse(job.createdAt);
     if (timestamp >= query.todayStart && timestamp < query.todayEnd) stats.today++;
     const group = taskStatusGroup(job.status);

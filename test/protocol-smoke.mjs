@@ -65,6 +65,43 @@ try {
   assert.equal(initialInsights.quota.windows[0].remainingPercent, 75);
   assert.equal(initialInsights.resetCredits.availableCount, 1);
 
+  const noPhoneDir = path.join(tempRoot, "no-phone");
+  const noPhoneOutput = path.join(noPhoneDir, "sub2api-import-oauth.json");
+  const noPhoneCheckpoint = path.join(noPhoneDir, "login-checkpoint.json");
+  const beforePhoneRequests = await (await fetch(`${baseUrl}/__phone-requests`)).json();
+  const noPhone = await runNode([
+    path.join(projectRoot, "src", "protocol-login.mjs"), "--email", "add-phone-page@example.com",
+    "--chatgpt-base", baseUrl, "--auth-base", baseUrl, "--output-mode", "sub2api", "--sub2api-out", noPhoneOutput,
+    "--checkpoint", noPhoneCheckpoint, "--skip-phone-binding", "--verbose",
+  ], [{ pattern: /Email OTP \(r=resend/, value: "123456" }]);
+  assert.equal(noPhone.code, 0, processFailure("disabled phone binding", noPhone));
+  assert.match(noPhone.output, /\[phone-skipped\]/);
+  assert.doesNotMatch(noPhone.output, /Phone number, E\.164|Phone OTP|synthetic-session-signature/);
+  assert.equal(await fileExists(noPhoneOutput), false, "web sessions must not be exported as OAuth files");
+  assert.equal(await fileExists(noPhoneCheckpoint), true);
+  const noPhoneInsights = JSON.parse(await fs.readFile(path.join(noPhoneDir, "account-insights.json"), "utf8"));
+  assert.equal(noPhoneInsights.status, "ok");
+  assert.equal(noPhoneInsights.quota.windows[0].remainingPercent, 75);
+  assert.equal(noPhoneInsights.resetCredits.availableCount, 1);
+  const resumedNoPhone = await runNode([
+    path.join(projectRoot, "src", "protocol-login.mjs"), "--email", "add-phone-page@example.com",
+    "--chatgpt-base", baseUrl, "--auth-base", baseUrl, "--output-mode", "sub2api", "--sub2api-out", noPhoneOutput,
+    "--resume-checkpoint", noPhoneCheckpoint, "--skip-phone-binding",
+  ], []);
+  assert.equal(resumedNoPhone.code, 0, processFailure("disabled phone checkpoint resume", resumedNoPhone));
+  assert.match(resumedNoPhone.output, /\[phone-skipped\]/);
+  assert.deepEqual(await (await fetch(`${baseUrl}/__phone-requests`)).json(), beforePhoneRequests);
+  const alreadyBound = await runNode([
+    path.join(projectRoot, "src", "protocol-login.mjs"), "--email", "no-phone-needed@example.com",
+    "--chatgpt-base", baseUrl, "--auth-base", baseUrl, "--output-mode", "sub2api", "--sub2api-out", path.join(tempRoot, "already-bound", "sub2api-import-oauth.json"),
+    "--skip-phone-binding",
+  ], [{ pattern: /Email OTP \(r=resend/, value: "123456" }]);
+  assert.equal(alreadyBound.code, 0, processFailure("authorization without phone requirement", alreadyBound));
+  assert.match(alreadyBound.output, /Saved sub2api import/);
+  assert.equal(JSON.parse(await fs.readFile(path.join(tempRoot, "already-bound", "account-insights.json"), "utf8")).status, "ok");
+  assert.doesNotMatch(alreadyBound.output, /\[phone-skipped\]/);
+  assert.deepEqual(await (await fetch(`${baseUrl}/__phone-requests`)).json(), beforePhoneRequests);
+
   const passwordAddResultPath = path.join(tempRoot, "password-add-result.json");
   const newPassword = "Added_Test_4826!";
   const passwordAdd = await runNode([

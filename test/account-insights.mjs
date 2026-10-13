@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { authorizationIdentity, collectAccountInsights, parseResetCredits, parseUsage, publicAccountInsights, checkAccountInsights, loadAccountInsights } from "../src/account-insights.mjs";
+import { authorizationIdentity, sessionIdentity, collectAccountInsights, parseResetCredits, parseUsage, publicAccountInsights, checkAccountInsights, loadAccountInsights } from "../src/account-insights.mjs";
 
 const authClaim = "https://api.openai.com/auth";
 const jwt = (claims) => `e30.${Buffer.from(JSON.stringify(claims)).toString("base64url")}.signature`;
@@ -25,6 +25,17 @@ assert.throws(() => authorizationIdentity(mismatch), /identity_mismatch/);
 const expired = structuredClone(data);
 expired.accounts[0].credentials.access_token = jwt({ exp: 1 });
 assert.throws(() => authorizationIdentity(expired), /token_expired/);
+const session = { type: "chatgpt-session", version: 1, email: identity.email, accessToken: jwt({ email: identity.email, exp: Math.floor(Date.now() / 1000) + 60, [authClaim]: { chatgpt_account_id: identity.accountId } }) };
+assert.equal(sessionIdentity(session, identity.email).accountId, identity.accountId);
+assert.throws(() => sessionIdentity(session, "other@example.com"), /identity_mismatch/);
+assert.throws(() => sessionIdentity({ ...session, email: "other@example.com" }, identity.email), /identity_mismatch/);
+assert.throws(() => sessionIdentity({ ...session, accessToken: jwt({ exp: 1, [authClaim]: { chatgpt_account_id: identity.accountId } }) }), /token_expired/);
+assert.throws(() => sessionIdentity({ ...session, accessToken: "opaque-token" }), /identity_missing/);
+assert.throws(() => authorizationIdentity(session), /authorization_invalid/, "session credentials must never be treated as Codex OAuth");
+let invalidSessionRequests = 0;
+const invalidSession = await collectAccountInsights({ ...session, email: "other@example.com" }, { expectedEmail: identity.email, fetcher: async () => { invalidSessionRequests++; } });
+assert.equal(invalidSession.quota.error, "identity_mismatch");
+assert.equal(invalidSessionRequests, 0);
 
 const usage = {
   ...identity, account_id: identity.accountId, plan_type: "plus",
