@@ -60,6 +60,10 @@ try {
   const firstExport = JSON.parse(await fs.readFile(outputPath, "utf8"));
   assert.equal(firstExport.type, "sub2api-data");
   assert.equal(firstExport.accounts?.[0]?.credentials?.email, "add-phone-page@example.com");
+  const initialInsights = JSON.parse(await fs.readFile(path.join(tempRoot, "account-insights.json"), "utf8"));
+  assert.equal(initialInsights.status, "ok");
+  assert.equal(initialInsights.quota.windows[0].remainingPercent, 75);
+  assert.equal(initialInsights.resetCredits.availableCount, 1);
 
   const passwordAddResultPath = path.join(tempRoot, "password-add-result.json");
   const newPassword = "Added_Test_4826!";
@@ -157,6 +161,8 @@ try {
     outputPath,
     "--auth-base",
     baseUrl,
+    "--chatgpt-base",
+    baseUrl,
   ]);
   assert.equal(refresh.code, 0, processFailure("OAuth refresh", refresh));
   assert.match(refresh.output, /Refreshed OAuth account/);
@@ -164,6 +170,9 @@ try {
   const refreshedExport = JSON.parse(await fs.readFile(outputPath, "utf8"));
   assert.equal(refreshedExport.type, "sub2api-data");
   assert.equal(refreshedExport.accounts?.[0]?.credentials?.refresh_token, "mock-refresh-token");
+  const refreshedInsights = JSON.parse(await fs.readFile(path.join(tempRoot, "account-insights.json"), "utf8"));
+  assert.equal(refreshedInsights.status, "ok");
+  assert.notEqual(refreshedInsights.authorizationFingerprint, initialInsights.authorizationFingerprint);
 
   const riskOutputPath = path.join(tempRoot, "risk-sub2api.json");
   const riskLogin = await runNode([

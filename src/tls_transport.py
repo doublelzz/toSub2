@@ -268,12 +268,19 @@ class Worker:
         body = message.get("body")
         body_bytes = base64.b64decode(body) if body else None
         timeout_ms = max(1, int(message.get("timeoutMs") or 30000))
-        response = self._request_with_profile_fallback(
-            method, url, headers, body_bytes, timeout_ms
-        )
+        saved_cookies = self.session.cookies if message.get("noSessionCookies") else None
+        if saved_cookies is not None:
+            self.session.cookies = {}
+        try:
+            response = self._request_with_profile_fallback(
+                method, url, headers, body_bytes, timeout_ms
+            )
+        finally:
+            if saved_cookies is not None:
+                self.session.cookies = saved_cookies
         header_items = list(response.headers.multi_items()) if hasattr(response.headers, "multi_items") else list(response.headers.items())
         cookies = []
-        cookie_jar = getattr(self.session.cookies, "jar", None)
+        cookie_jar = None if message.get("noSessionCookies") else getattr(self.session.cookies, "jar", None)
         if cookie_jar is not None:
             for cookie in cookie_jar:
                 cookies.append({

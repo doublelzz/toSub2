@@ -9,6 +9,7 @@ const idTokenPayload = Buffer.from(JSON.stringify({
   email: "add-phone-page@example.com",
   sid: "mock-account-id",
   sub: "mock-user-id",
+  "https://api.openai.com/auth": { chatgpt_account_id: "mock-personal-account", chatgpt_plan_type: "plus" },
 })).toString("base64url");
 
 let lastLoginHint = "";
@@ -246,6 +247,13 @@ const server = http.createServer(async (req, res) => {
       id_token: `e30.${idTokenPayload}.signature`,
     });
   }
+  if (req.method === "GET" && url.pathname === "/backend-api/wham/usage") return sendJson(res, 200, {
+    email: "add-phone-page@example.com", account_id: "mock-personal-account", plan_type: "plus",
+    rate_limit: { allowed: true, primary_window: { used_percent: 25, limit_window_seconds: 18000 }, secondary_window: null },
+    rate_limit_reset_credits: { available_count: 2 },
+  });
+  if (req.method === "GET" && url.pathname === "/backend-api/wham/rate-limit-reset-credits") return sendJson(res, 200, { available_count: 1 });
+  if (req.method === "GET" && url.pathname === "/backend-api/subscriptions") return sendJson(res, 200, { plan_type: "plus", active_until: "2099-01-01T00:00:00Z", will_renew: true });
   return sendJson(res, 404, { error: "not found" });
 });
 

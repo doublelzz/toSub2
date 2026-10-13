@@ -11,6 +11,7 @@ import react from "@vitejs/plugin-react";
 import { createServer as createViteServer } from "vite";
 import { createCredentialStore } from "./credential-store.mjs";
 import { createMfaWorkspace } from "./mfa-workspace.mjs";
+import { loadAccountInsights, publicAccountInsights } from "./account-insights.mjs";
 import {
   fetchMailboxOtpCandidates,
   filterMailboxOtpCandidatesByRequestTime,
@@ -558,7 +559,7 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
-  const match = /^\/api\/jobs\/([a-f0-9-]+)(?:\/(input|cancel|retry|regenerate|relogin|setup-2fa|add-password|logs|download|sms-number|luban-number))?$/.exec(requestUrl.pathname);
+  const match = /^\/api\/jobs\/([a-f0-9-]+)(?:\/(input|cancel|retry|regenerate|relogin|setup-2fa|add-password|account-insights|logs|download|sms-number|luban-number))?$/.exec(requestUrl.pathname);
   if (!match) {
     sendJson(res, 404, { error: "Not found" });
     return;
@@ -571,6 +572,20 @@ async function handleApi(req, res, requestUrl) {
   }
 
   const action = match[2];
+  if (req.method === "POST" && action === "account-insights") {
+    await withEmailJobLock(job.email, async () => {
+      assertMfaIdle(job.email);
+      if (job.status !== "completed" || !job.resultSaved) throw httpError(409, "请等待授权完成后再检测额度");
+      job.accountInsightsError = null;
+      job.accountInsightsStartedAt = new Date().toISOString();
+      job.parserTail = "";
+      recordJobOperation(job, "check_account_insights");
+      appendJobLog(job, "[account-insights] 使用现有授权和账号代理检测，无需重新登录。\n");
+      enqueueJob(job, "account_insights", "正在检测额度和订阅信息");
+    });
+    sendJson(res, 200, { job: publicJob(job) });
+    return;
+  }
   if (req.method === "GET" && action === "logs") {
     sendJson(res, 200, { id: job.id, logs: job.logs });
     return;
@@ -849,8 +864,9 @@ function scheduleQueuedJobs() {
     const mode = job.queuedMode || "full";
     const queueRunId = crypto.randomUUID();
     job.queueRunId = queueRunId;
-    job.status = mode === "refresh"
-      ? "refreshing"
+    job.status = mode === "account_insights"
+      ? "checking_account"
+      : mode === "refresh" ? "refreshing"
       : mode === "totp_setup"
         ? "totp_starting"
         : mode === "password_add"
@@ -882,6 +898,8 @@ async function prepareAndLaunchJob(job, mode, queueRunId) {
       restoreTotpSetupFailure(job, `准备 2FA 设置失败：${error.message}`);
     } else if (mode === "password_add") {
       restorePasswordAddFailure(job, `准备添加密码失败：${error.message}`);
+    } else if (mode === "account_insights") {
+      await finishAccountInsights(job, "无法启动检测，请稍后重试");
     } else {
       failJob(job, `准备登录任务失败：${error.message}`);
     }
@@ -910,7 +928,13 @@ function launchJob(job, options = {}) {
   job.runId = runId;
   job.runMode = mode;
   job.mailOtpRequestedAt = null;
-  const args = mode === "refresh"
+  if (["full", "refresh"].includes(mode)) {
+    job.accountInsights = null;
+    job.accountInsightsError = null;
+  }
+  const args = mode === "account_insights"
+    ? [PROTOCOL_SCRIPT, "--check-account-insights", job.outputPath, "--email", job.email]
+    : mode === "refresh"
     ? [
         PROTOCOL_SCRIPT,
         "--refresh-sub2api",
@@ -983,6 +1007,7 @@ function launchJob(job, options = {}) {
       if (job.runId !== runId) return;
       if (mode === "totp_setup") restoreTotpSetupFailure(job, `无法启动 2FA 设置进程：${error.message}`);
       else if (mode === "password_add") restorePasswordAddFailure(job, `无法启动添加密码进程：${error.message}`);
+      else if (mode === "account_insights") await finishAccountInsights(job, "无法启动检测，请稍后重试");
       else failJob(job, `无法启动登录进程：${error.message}`);
     });
   });
@@ -998,6 +1023,11 @@ async function handleChildClose(job, { code, signal, mode, runId }) {
   if (job.runId !== runId) return;
   stopMailPolling(job);
   job.child = null;
+  if (mode === "account_insights") {
+    await finishAccountInsights(job, code !== 0 || signal ? "检测进程中断，请稍后重试" : null);
+    scheduleQueuedJobs();
+    return;
+  }
   if (mode === "totp_setup") {
     await finishTotpSetup(job, code, signal);
     scheduleQueuedJobs();
@@ -1014,6 +1044,8 @@ async function handleChildClose(job, { code, signal, mode, runId }) {
     return;
   }
   if (code === 0 && job.resultSaved && (await fileExists(job.outputPath))) {
+    job.accountInsights = await loadAccountInsights(job.outputPath, job.email);
+    job.accountInsightsError = job.accountInsights ? null : "账号信息未检测成功，可点击检测额度重试";
     if (mode === "full") completeAuthorizationAutomationAttempt(job);
     job.loginCheckpointAvailable = false;
     job.status = "completed";
@@ -1037,9 +1069,16 @@ async function handleChildClose(job, { code, signal, mode, runId }) {
 }
 
 function handleChildCloseFailure(job, mode, runId, error) {
-  if (job.runId !== runId && !(["totp_setup", "password_add"].includes(mode) && job.runId === null)) return;
+  if (job.runId !== runId && !(["totp_setup", "password_add", "account_insights"].includes(mode) && job.runId === null)) return;
   const message = `收尾处理失败：${error.message}`;
-  if (mode === "totp_setup") {
+  if (mode === "account_insights") {
+    job.status = "completed";
+    job.prompt = "授权完成，可以下载导入文件";
+    job.accountInsightsError = "检测结果读取失败，请稍后重试";
+    job.runMode = null;
+    job.queuedMode = null;
+    job.runId = null;
+  } else if (mode === "totp_setup") {
     job.status = "completed";
     job.prompt = "原授权文件仍然可用，2FA 密钥尚未完成安全保存";
     job.totpSetupError = `${message}；已保留 2FA 结果文件，请重试保存`;
@@ -1052,6 +1091,21 @@ function handleChildCloseFailure(job, mode, runId, error) {
   }
   touch(job);
   void saveJobMetadata(job).catch(() => {});
+  scheduleQueuedJobs();
+}
+
+async function finishAccountInsights(job, error = null) {
+  job.accountInsights = await loadAccountInsights(job.outputPath, job.email);
+  const fresh = job.accountInsights && Date.parse(job.accountInsights.checkedAt) >= Date.parse(job.accountInsightsStartedAt || 0);
+  job.accountInsightsError = error || job.accountInsightsError || (!fresh ? "账号信息未检测成功，请稍后重试" : null);
+  job.status = "completed";
+  job.prompt = "授权完成，可以下载导入文件";
+  job.runMode = null;
+  job.queuedMode = null;
+  job.queueRunId = null;
+  job.runId = null;
+  touch(job);
+  await saveJobMetadata(job);
   scheduleQueuedJobs();
 }
 
@@ -1544,6 +1598,11 @@ function consumeOutput(job, rawText) {
   job.logs = `${job.logs}${text}`.slice(-MAX_LOG_CHARS);
   const scan = `${job.parserTail}${text}`;
   job.parserTail = scan.slice(-2_000);
+  if (job.runMode === "account_insights") {
+    if (scan.includes("[account-insights-failed]") || scan.includes("[error]")) job.accountInsightsError = "检测失败，请检查代理或稍后重试";
+    touch(job);
+    return;
+  }
 
   if (scan.includes("[3/5] Password login page reached.")) {
     markAuthorizationRequirement(job, "password");
@@ -2563,6 +2622,14 @@ async function submitJobInput(job, body, options = {}) {
 
 async function cancelJob(job) {
   if (!isActive(job.status)) return;
+  if (job.runMode === "account_insights" || job.queuedMode === "account_insights") {
+    job.runId = crypto.randomUUID();
+    job.child?.kill("SIGTERM");
+    job.child = null;
+    await finishAccountInsights(job, "本次检测已取消");
+    scheduleQueuedJobs();
+    return;
+  }
   if (job.runMode === "totp_setup" || job.queuedMode === "totp_setup") {
     stopMailPolling(job);
     job.runId = crypto.randomUUID();
@@ -3309,6 +3376,10 @@ function publicJob(job) {
     completedAt: job.completedAt,
     lastError: job.lastError,
     canDownload: Boolean(job.resultSaved),
+    accountInsights: publicAccountInsights(job.accountInsights),
+    accountInsightsError: job.accountInsightsError || null,
+    accountInsightsChecking: job.status === "checking_account" || (job.status === "queued" && job.queuedMode === "account_insights"),
+    canCheckAccountInsights: job.status === "completed" && Boolean(job.resultSaved),
     loginMode: job.loginMode || (job.mailApiUrl ? "email_otp" : "manual"),
     hasTotpKey: Boolean(job.totpSecret || job.hasTotpCredential),
     autoEmailOtp: Boolean(job.mailApiUrl),
@@ -3638,6 +3709,7 @@ async function syncCompletedOutputs(force = false) {
         });
         storedCredentials = totpRecovery.credentials;
         const restoredOperation = restoredOutputOperationState(metadata, completedAt, totpRecovery, passwordRecovery);
+        const accountInsights = await loadAccountInsights(outputPath, email);
         jobs.set(entry.name, {
           id: entry.name,
           email,
@@ -3657,6 +3729,7 @@ async function syncCompletedOutputs(force = false) {
           child: null,
           parserTail: "",
           resultSaved: true,
+          accountInsights,
           loginMode: metadata.login_mode === "password" || storedCredentials.password ? "password" : (mailApiUrl ? "email_otp" : metadata.login_mode || "manual"),
           password: storedCredentials.password,
           totpSecret: storedCredentials.totpSecret,
@@ -3963,6 +4036,13 @@ function restoredOutputOperationState(metadata, completedAt, totpRecovery, passw
   const status = !savedStatus || savedStatus === "completed"
     ? "completed"
     : interrupted ? "failed" : savedStatus;
+  if (savedStatus === "checking_account" || metadata.queued_mode === "account_insights") {
+    return {
+      status: "completed", prompt: "授权完成，可以下载导入文件", lastError: null,
+      totpSetupError: null, passwordAddError: null,
+      log: "[restore] 服务重启中断了额度检测，可点击检测额度重试，原授权文件仍可下载。\n",
+    };
+  }
   if (passwordRecovery.recovered) {
     return {
       status: "completed",
@@ -4636,6 +4716,7 @@ async function updateJobProxy(job, proxyUrl) {
 }
 
 function restartJobAfterConfigurationUpdate(job) {
+  const checkingInsights = job.runMode === "account_insights";
   stopMailPolling(job);
   releaseSmsNumber(job, "idle");
   job.queueRunId = null;
@@ -4648,6 +4729,12 @@ function restartJobAfterConfigurationUpdate(job) {
   job.phoneError = null;
   job.securityCheckRequired = false;
   job.restartRequired = false;
+  if (checkingInsights) {
+    job.accountInsightsError = null;
+    job.accountInsightsStartedAt = new Date().toISOString();
+    enqueueJob(job, "account_insights", "代理配置已更新，正在重新检测额度");
+    return;
+  }
   job.attempt += 1;
   beginAuthorizationAutomationAttempt(job, "configuration_update");
   appendJobLog(job, "[account] 已停止使用旧配置的登录进程，并使用新配置重新排队。\n");

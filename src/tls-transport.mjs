@@ -200,6 +200,7 @@ export class TlsFingerprintTransport {
       body,
       timeoutMs: options.timeoutMs || DEFAULT_TIMEOUT_MS,
       discardBody: Boolean(options.discardBody),
+      noSessionCookies: Boolean(options.noSessionCookies),
     };
     let result;
     let retries = 0;
@@ -219,6 +220,7 @@ export class TlsFingerprintTransport {
       const riskControl = isRiskControlResult(result);
       if (
         riskControl
+        && options.solveRiskControl !== false
         && this.cloudflareSolver
         && !cloudflareSolveAttempted
         && isSupportedCloudflareChallenge(result)

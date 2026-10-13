@@ -43,6 +43,11 @@ try {
   assert.equal(defaultHeaders["sec-ch-ua-platform"], '"macOS"');
   assert.deepEqual(JSON.parse(await getResponse.text()), { method: "GET", body: "" });
   assert.deepEqual(await getResponse.json(), { method: "GET", body: "" });
+  const isolatedResponse = await transport.request("GET", `http://127.0.0.1:${address.port}/identity`, { noSessionCookies: true });
+  assert.equal((await isolatedResponse.json()).headers.cookie, undefined, "OAuth probes must not send login cookies");
+  assert.deepEqual(isolatedResponse.headers.transportCookies, []);
+  const cookieResponse = await transport.request("GET", `http://127.0.0.1:${address.port}/identity`);
+  assert.match((await cookieResponse.json()).headers.cookie, /transport_a=1/, "isolated requests must preserve existing login cookies");
   assert.equal(getResponse.headers.rawSetCookie.length, 2);
   assert.deepEqual(
     getResponse.headers.transportCookies
@@ -231,6 +236,13 @@ try {
   assert.equal(solvedChallengeResponse.status, 200);
   assert.equal(solveOperations, 1, "a supported challenge should invoke the solver once");
   assert.equal(solvedChallengeRequests, 2, "successful solving should replay the original request once");
+  solvedChallengeRequests = 0;
+  const probeChallengeResponse = await solvedChallenge.request("GET", "https://chatgpt.com/backend-api/wham/usage", {
+    retryRiskControl: false, solveRiskControl: false,
+  });
+  assert.equal(probeChallengeResponse.status, 403);
+  assert.equal(solveOperations, 1, "quota probes must not start a challenge solver");
+  assert.equal(solvedChallengeRequests, 1);
 
   const challenge400 = new TlsFingerprintTransport({
     enabled: true,

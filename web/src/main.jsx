@@ -963,7 +963,7 @@ function App() {
         )}
 
         <div className="table-frame">
-          <table>
+          <table className="authorization-table">
             <thead>
               <tr>
                 <th className="select-heading">
@@ -977,6 +977,9 @@ function App() {
                 </th>
                 <th>账号</th>
                 <th>状态</th>
+                <th>额度剩余</th>
+                <th>Plus 到期时间</th>
+                <th>剩余重置次数</th>
                 <th>当前操作</th>
                 <th>开始时间</th>
                 <th>最近操作时间</th>
@@ -1007,7 +1010,7 @@ function App() {
                   />
                   {expandedJobId === job.id && (
                     <tr className="log-row">
-                      <td colSpan="7"><JobLogs token={token} jobId={job.id} /></td>
+                      <td colSpan="10"><JobLogs token={token} jobId={job.id} /></td>
                     </tr>
                   )}
                 </React.Fragment>
@@ -1503,7 +1506,7 @@ function App() {
 function EmptyState({ filtered = false }) {
   return (
     <tr>
-      <td colSpan="7">
+      <td colSpan="10">
         <div className="empty-state">
           <div><Mail size={24} /></div>
           <h3>{filtered ? "没有匹配账号" : "暂无授权任务"}</h3>
@@ -1512,6 +1515,57 @@ function EmptyState({ filtered = false }) {
       </td>
     </tr>
   );
+}
+
+function InsightError({ item }) {
+  return <span className="insight-error" title={item?.message || "接口未提供该字段"}>{item?.message || "未知"}</span>;
+}
+
+function formatInsightDate(value) {
+  if (!value || !Number.isFinite(Date.parse(value))) return "未知";
+  return new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false,
+  }).format(new Date(value));
+}
+
+function quotaWindowLabel(window) {
+  const seconds = window.windowSeconds;
+  if (!seconds) return window.key === "primary" ? "主窗口" : "次窗口";
+  if (seconds % 86400 === 0) return `${seconds / 86400} 天`;
+  if (seconds % 3600 === 0) return `${seconds / 3600} 小时`;
+  return `${Math.round(seconds / 60)} 分钟`;
+}
+
+function QuotaInfo({ insights }) {
+  if (!insights) return <span className="insight-note">未检测</span>;
+  const quota = insights.quota;
+  if (quota?.status !== "ok") return <InsightError item={quota} />;
+  return <div className="quota-info">
+    <span className={`quota-plan ${quota.limitReached || quota.allowed === false ? "exhausted" : ""}`}>
+      {quota.planType || "额度"}{quota.limitReached || quota.allowed === false ? " · 暂不可用" : ""}
+    </span>
+    {quota.windows?.map((window) => <div className="quota-window" key={window.key}>
+      <div className="quota-window-label"><span>{quotaWindowLabel(window)}</span><strong>剩余 {Number(window.remainingPercent.toFixed(1))}%</strong></div>
+      <div className="quota-track" role="progressbar" aria-label={`${quotaWindowLabel(window)}剩余额度`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={window.remainingPercent}>
+        <span className={window.remainingPercent <= 10 ? "low" : ""} style={{ width: `${window.remainingPercent}%` }} />
+      </div>
+      {window.resetAt && <span className="insight-note">重置 {formatInsightDate(window.resetAt)}</span>}
+    </div>)}
+    {!quota.windows?.length && <span className="insight-note">接口未提供窗口额度</span>}
+    {quota.credits?.unlimited ? <span className="insight-note">点数不限量</span>
+      : quota.credits?.balance != null && <span className="insight-note">点数余额 {quota.credits.balance}</span>}
+  </div>;
+}
+
+function SubscriptionInfo({ insights }) {
+  if (!insights) return <span className="insight-note">未检测</span>;
+  const subscription = insights.subscription;
+  if (subscription?.status !== "ok") return <InsightError item={subscription} />;
+  if (subscription.planType !== "plus") return <span className="insight-note">{subscription.planType === "free" ? "未订阅 Plus" : `${subscription.planType || "未知"} 套餐`}</span>;
+  return <div className="subscription-info">
+    <time dateTime={subscription.expiresAt}>{formatInsightDate(subscription.expiresAt)}</time>
+    <span className="insight-note">{Date.parse(subscription.expiresAt) <= Date.now() ? "已到期" : subscription.willRenew === true ? "自动续订" : subscription.willRenew === false ? "到期不续订" : "Plus"}</span>
+  </div>;
 }
 
 function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl }) {
@@ -1575,6 +1629,15 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
     } finally {
       setSubmitting(false);
     }
+  }
+
+  async function checkInsights() {
+    setSubmitting(true);
+    try {
+      await apiFetch(token, `/api/jobs/${job.id}/account-insights`, { method: "POST", body: "{}" });
+      onError("");
+    } catch (requestError) { onError(requestError.message); }
+    finally { setSubmitting(false); }
   }
 
   async function forceRelogin() {
@@ -1682,6 +1745,24 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
         </div>
       </td>
       <td><StatusBadge status={job.status} /></td>
+      <td className="insight-cell">
+        <QuotaInfo insights={job.accountInsights} />
+        <button type="button" className="text-action insight-check" onClick={checkInsights}
+          disabled={!job.canCheckAccountInsights || submitting}
+          title="使用现有授权和账号代理查询，不重新登录">
+          {job.accountInsightsChecking ? <LoaderCircle className="spin" size={13} /> : <RefreshCw size={13} />}
+          {job.accountInsightsChecking ? "检测中" : "检测额度"}
+        </button>
+        {job.accountInsights?.checkedAt && <span className="insight-note" title={formatInsightDate(job.accountInsights.checkedAt)}>检测于 {formatDateTime(job.accountInsights.checkedAt)}</span>}
+        {job.accountInsightsError && <span className="insight-error">{job.accountInsightsError}</span>}
+      </td>
+      <td className="insight-cell"><SubscriptionInfo insights={job.accountInsights} /></td>
+      <td className="insight-cell">
+        {!job.accountInsights ? <span className="insight-note">未检测</span>
+          : job.accountInsights.resetCredits?.status === "ok"
+            ? <strong className="insight-count">{job.accountInsights.resetCredits.availableCount} <small>次</small></strong>
+            : <InsightError item={job.accountInsights.resetCredits} />}
+      </td>
       <td className="step-cell">
         <div className="prompt-line">{job.prompt}</div>
         {job.lastError && <div className="row-error">{extractResponseMessage(job.lastError)}</div>}
@@ -1873,6 +1954,7 @@ function StatusBadge({ status }) {
     phone_otp: ["待手机码", <Smartphone size={14} />],
     finalizing: ["生成中", <LoaderCircle className="spin" size={14} />],
     refreshing: ["刷新授权", <RefreshCw className="spin" size={14} />],
+    checking_account: ["检测额度", <LoaderCircle className="spin" size={14} />],
     completed: ["已完成", <Check size={14} />],
     failed: ["失败", <CircleAlert size={14} />],
     canceled: ["已取消", <Ban size={14} />],
@@ -2054,6 +2136,7 @@ function operationLabel(type) {
     add_password: "添加密码",
     account_update: "更新账号资料",
     proxy_update: "更新代理 IP",
+    check_account_insights: "检测额度和订阅",
   })[type] || "账号操作";
 }
 

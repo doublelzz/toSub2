@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
+import { checkAccountInsights } from "./account-insights.mjs";
 import {
   browserIdentityForTlsProfile,
   DEFAULT_TLS_PROFILE,
@@ -285,6 +286,9 @@ async function run() {
     printHelp();
     return;
   }
+  if (args.checkAccountInsights && (args.rotateTotp || args.logoutAll || args.setupTotp || args.addPassword || args.refreshSub2api)) {
+    throw new Error("Account detection cannot be combined with another account operation");
+  }
   if (args.rotateTotp && (args.setupTotp || args.addPassword || args.refreshSub2api)) {
     throw new Error("MFA_OPTIONS_INVALID: MFA rotation cannot be combined with another account operation");
   }
@@ -312,6 +316,11 @@ async function run() {
     sameProxyRiskRetryDelayMs: process.env.CHATGPT_SAME_PROXY_RISK_RETRY_DELAY_MS,
   });
   try {
+    if (args.checkAccountInsights) {
+      await transport.configure(proxyTemplate, { force: true });
+      await detectAccountInsights(path.resolve(args.checkAccountInsights), { chatgptBase, transport, expectedEmail: args.email });
+      return;
+    }
     if (args.refreshSub2api) {
       if (proxyTemplate) await transport.prepareProxy(proxyTemplate, `${authBase}/`);
       else await transport.configure(null, { force: true });
@@ -326,6 +335,7 @@ async function run() {
       });
       console.log(`[ok] Saved sub2api import: ${targetPath}`);
       console.log(`[ok] Refreshed OAuth account: ${refreshed.email || "<unknown>"}`);
+      await detectAccountInsights(targetPath, { chatgptBase, transport, expectedEmail: refreshed.email });
       return;
     }
     await transport.prepareProxy(proxyTemplate, `${chatgptBase}/`);
@@ -670,6 +680,7 @@ async function run() {
       await writeJsonAtomic(sub2apiOutPath, sub2apiExport.data);
       await removeProtocolCheckpoint(checkpointPath);
       console.log(`[ok] Saved sub2api import: ${sub2apiOutPath}`);
+      await detectAccountInsights(sub2apiOutPath, { chatgptBase, transport, expectedEmail: sub2apiExport.account.credentials.email });
       console.log(`[ok] Account: ${sub2apiExport.account.name}`);
       console.log(`[ok] Email: ${sub2apiExport.account.credentials.email || "<unknown>"}`);
       console.log(`[ok] chatgpt_account_id: ${mask(sub2apiExport.account.credentials.chatgpt_account_id)}`);
@@ -685,6 +696,22 @@ async function run() {
     }
   } finally {
     await transport.close();
+  }
+}
+
+async function detectAccountInsights(exportPath, { chatgptBase, transport, expectedEmail }) {
+  console.log("[account-insights] 正在检测额度、Plus 到期时间和剩余重置次数。");
+  try {
+    const snapshot = await checkAccountInsights(exportPath, {
+      chatgptBase, expectedEmail, fetcher: (url, options) => transport.fetch(url, options),
+    });
+    for (const [field, label] of [["quota", "额度"], ["subscription", "订阅"], ["resetCredits", "剩余重置次数"]]) {
+      const item = snapshot[field];
+      console.log(`[account-insights] ${label}：${item.status === "ok" ? "检测完成" : item.message}`);
+    }
+    console.log(`[account-insights-saved] ${snapshot.status}`);
+  } catch {
+    console.log("[account-insights-failed] 检测结果保存失败，授权文件仍然可用。");
   }
 }
 
@@ -2562,6 +2589,12 @@ function parseArgs(argv) {
     else if (item === "--no-sub2api-export") args.noSub2apiExport = true;
     else if (item.startsWith("--refresh-sub2api=")) args.refreshSub2api = item.slice("--refresh-sub2api=".length);
     else if (item === "--refresh-sub2api") args.refreshSub2api = argv[++i];
+    else if (item.startsWith("--check-account-insights=")) args.checkAccountInsights = item.slice("--check-account-insights=".length);
+    else if (item === "--check-account-insights") {
+      const source = argv[++i];
+      if (!source || source.startsWith("--")) throw new Error("--check-account-insights requires an OAuth file path");
+      args.checkAccountInsights = source;
+    }
     else if (item.startsWith("--checkpoint=")) args.checkpoint = item.slice("--checkpoint=".length);
     else if (item === "--checkpoint") args.checkpoint = argv[++i];
     else if (item.startsWith("--resume-checkpoint=")) args.resumeCheckpoint = item.slice("--resume-checkpoint=".length);
@@ -2700,6 +2733,7 @@ Options:
   --output-mode <mode>            both, session, or sub2api. Default: both
   --no-sub2api-export             Do not exchange OAuth code or write sub2api import JSON.
   --refresh-sub2api <file>        Refresh an existing sub2api OAuth file without email login.
+  --check-account-insights <file> Query quota, Plus expiry and remaining resets using existing OAuth.
   --checkpoint <file>             Save resumable login state after email verification.
   --resume-checkpoint <file>      Resume a saved login state before requesting a new email code.
   --sub2api-name <name>           Account name in sub2api. Default: oauth---<email>
