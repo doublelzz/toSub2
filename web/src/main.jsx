@@ -35,7 +35,7 @@ import "./styles.css";
 import "./workspace.css";
 import MfaWorkspace from "./MfaWorkspace.jsx";
 import SmsPriceSelector from "./SmsPriceSelector.jsx";
-import { findSmsNumberOption, preferredSmsNumberOption } from "./sms-number-options.mjs";
+import { filterSmsOptionsByGrade, findSmsNumberOption, preferredSmsNumberOption } from "./sms-number-options.mjs";
 import { Drawer, MoreActions, TaskFilters, TaskOverview, ThemeControl, useCalendarDay, useDialogFocus } from "./WorkspaceUi.jsx";
 import { AUTH_STATUSES, DEFAULT_FILTERS, hasFilters, queryFilters } from "./task-filters.mjs";
 
@@ -440,9 +440,14 @@ function App() {
       });
       const options = Array.isArray(data.options) ? data.options : [];
       setSmsNumberOptionsState({ providerId: resolved.id, apiKey: resolved.config.apiKey, service: resolved.config.service, options });
+      const eligible = resolved.id === "smsbower" ? filterSmsOptionsByGrade(options, resolved.config.gradeFilter) : options;
       const current = resolved.config.maxPrice
-        ? findSmsNumberOption(options, resolved.config) || preferredSmsNumberOption(options, resolved.id)
-        : preferredSmsNumberOption(options, resolved.id);
+        ? findSmsNumberOption(eligible, resolved.config) || preferredSmsNumberOption(eligible, resolved.id)
+        : preferredSmsNumberOption(eligible, resolved.id);
+      if (!current && options.length && resolved.id === "smsbower") {
+        changeSmsGrade(resolved.config.gradeFilter || "all", options);
+        return;
+      }
       if (!current) throw new Error("当前没有可购买的国家号码");
       updateSmsProviderConfig(resolved.id, {
         country: current.country,
@@ -456,6 +461,19 @@ function App() {
     } finally {
       setSmsOptionsLoading(false);
     }
+  }
+
+  function changeSmsGrade(gradeFilter, options = smsNumberOptions) {
+    const eligible = filterSmsOptionsByGrade(options, gradeFilter);
+    const current = findSmsNumberOption(eligible, draftSmsProvider.config) || preferredSmsNumberOption(eligible, "smsbower");
+    updateSmsProviderConfig("smsbower", {
+      gradeFilter,
+      country: current?.country || "",
+      maxPrice: current ? String(current.price) : "",
+      providerIds: current?.providerIds || "",
+      countryLabel: current ? formatSmsCountryName(current) : "",
+    });
+    setSmsSettingsError(current ? "" : "当前档位暂无可用报价，请切换其他档位。");
   }
 
   function updateSmsProviderConfig(providerId, values) {
@@ -1010,6 +1028,7 @@ function App() {
                 <div className="provider-config-grid">
                   {draftSmsProvider.definition.fields.filter((field) => field.type !== "hidden").map((field) => field.type === "price-select" ? (
                     <SmsPriceSelector key={`${draftSmsProvider.id}-${field.key}`} provider={draftSmsProvider} options={smsNumberOptions} loading={smsOptionsLoading}
+                      onGradeChange={changeSmsGrade}
                       onRefresh={() => loadSmsNumberOptions()} countryName={formatSmsCountryName} onSelect={(selected) => updateSmsProviderConfig(draftSmsProvider.id, {
                         country: selected.country, maxPrice: String(selected.price), providerIds: selected.providerIds || "", countryLabel: formatSmsCountryName(selected),
                       })} />

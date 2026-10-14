@@ -217,7 +217,6 @@ input[type="checkbox"] { accent-color: var(--green); width: 15px; height: 15px; 
 .sms-country-search:focus-within { border-color: var(--green); box-shadow: 0 0 0 3px var(--focus-shadow); }
 .sms-country-search input::placeholder { color: var(--muted); }
 .sms-quality-filter select, .sms-tier-select select { min-height: 38px; max-width: 100%; padding: 0 10px; border: 1px solid var(--line); border-radius: 7px; color: var(--ink); background: var(--surface-subtle); font-size: 13px; }
-.sms-quality-kind { display: flex; align-items: center; color: var(--muted); font-size: 12px; white-space: nowrap; }
 .sms-country-columns, .sms-country-row { display: grid; grid-template-columns: minmax(0, 1fr) 104px 60px; align-items: center; gap: 8px; }
 .sms-country-columns { padding: 8px 10px; color: var(--muted); font-size: 11px; border-bottom: 1px solid var(--line); }
 .sms-country-columns span:last-child, .sms-country-price { text-align: right; }

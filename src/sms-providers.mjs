@@ -18,14 +18,15 @@ export const SMS_PROVIDER_DEFINITIONS = [
   {
     id: "smsbower",
     name: "SMSBower",
-    description: "查询 OpenAI Gold 实时价格和库存后选择国家",
+    description: "查询 OpenAI 全部报价，可按 Gold 或其他供应商筛选",
     optionsEndpoint: "/api/sms-providers/smsbower/options",
     fields: [
       { key: "apiKey", label: "API Key", type: "password", placeholder: "输入 SMSBower API Key" },
       { key: "service", label: "服务代码", type: "hidden", defaultValue: "dr" },
       { key: "country", label: "国家与价格", type: "price-select", defaultValue: "1001", summaryKey: "countryLabel" },
       { key: "maxPrice", label: "最高价格", type: "hidden", required: false },
-      { key: "providerIds", label: "Gold 供应商", type: "hidden", required: false },
+      { key: "providerIds", label: "供应商", type: "hidden", required: false },
+      { key: "gradeFilter", label: "档位筛选", type: "hidden", defaultValue: "all", required: false },
       { key: "countryLabel", label: "国家名称", type: "hidden", required: false },
       { key: "maxRotationAttempts", label: "最大取号次数（含首次）", type: "number", defaultValue: "3", min: 1, max: 20, step: 1, required: false },
       { key: "rotationIntervalSeconds", label: "自动换号间隔（秒）", type: "number", defaultValue: "5", min: 0, max: 600, step: 1, required: false },
@@ -102,7 +103,7 @@ export function createSmsProvider(providerIdValue, configValue = {}, options = {
       throw new Error("请重新查询 SMSBower 国家价格");
     }
     if (providerIds && !/^\d{1,12}(?:,\d{1,12}){0,99}$/.test(providerIds)) {
-      throw new Error("请重新查询 SMSBower Gold 价格");
+      throw new Error("请重新查询 SMSBower 供应商价格");
     }
     const client = createSmsBowerClient({ apiKey, apiBase: options.smsBowerApiBase, fetchImpl: options.fetchImpl });
     return {
@@ -111,7 +112,7 @@ export function createSmsProvider(providerIdValue, configValue = {}, options = {
       apiKey,
       serviceLabel: config.countryLabel || `${service} / ${country}`,
       getNumber: async () => {
-        if (!maxPrice || !providerIds) throw new Error("请先查询并选择 SMSBower Gold 价格");
+        if (!maxPrice || !providerIds) throw new Error("请先查询并选择 SMSBower 供应商价格");
         return client.getNumber(service, country, maxPrice, providerIds);
       },
       listNumberOptions: () => client.getPriceOptions(service),

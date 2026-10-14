@@ -68,13 +68,20 @@ export function createSmsBowerClient(options = {}) {
     },
 
     async getPriceOptions(service) {
-      const [pricesText, countriesText] = await Promise.all([
-        request("getTopCountriesByService", { service }),
+      const [pricesText, countriesText, goldText] = await Promise.all([
+        request("getPricesV3", { service }),
         request("getCountries"),
+        request("getTopCountriesByService", { service }).catch(() => null),
       ]);
-      return normalizeGoldPriceOptions(
+      let goldPrices = {};
+      if (goldText) {
+        try { goldPrices = parseJsonResponse(goldText, "Gold 分类返回格式不正确"); } catch {}
+      }
+      return normalizePriceOptions(
         parseJsonResponse(pricesText, "价格接口返回格式不正确"),
         parseJsonResponse(countriesText, "国家接口返回格式不正确"),
+        service,
+        goldPrices,
       );
     },
 
@@ -132,7 +139,7 @@ function parseJsonResponse(value, fallback) {
   }
 }
 
-function normalizeGoldPriceOptions(pricesValue, countries) {
+function normalizePriceOptions(pricesValue, countries, service, goldValue) {
   const prices = unwrapDataObject(pricesValue);
   if (!prices || typeof prices !== "object" || Array.isArray(prices)) {
     throw new SmsBowerError("价格接口返回格式不正确", { terminal: true });
@@ -161,8 +168,23 @@ function normalizeGoldPriceOptions(pricesValue, countries) {
     if (countryCode === "16") countryIndex.set("england", country);
   });
 
+  const goldProviders = new Set();
+  const goldPrices = unwrapDataObject(goldValue);
+  if (goldPrices && typeof goldPrices === "object" && !Array.isArray(goldPrices)) {
+    Object.entries(goldPrices).forEach(([countryKey, partners]) => {
+      if (!partners || typeof partners !== "object" || Array.isArray(partners)) return;
+      const info = countryIndex.get(normalizeCountryAlias(countryKey));
+      const country = String(info?.activate_org_code ?? info?.id ?? countryKey);
+      Object.entries(partners).forEach(([key, details]) => {
+        const providerId = String(details?.provider_id ?? key);
+        if (/^\d{1,5}$/.test(country) && /^\d{1,12}$/.test(providerId)) goldProviders.add(`${country}|${providerId}`);
+      });
+    });
+  }
+
   const options = new Map();
-  Object.entries(prices).forEach(([countryKey, partners]) => {
+  Object.entries(prices).forEach(([countryKey, services]) => {
+    const partners = services?.[service];
     if (!partners || typeof partners !== "object" || Array.isArray(partners)) return;
     const countryInfo = countryIndex.get(normalizeCountryAlias(countryKey)) || {};
     const country = String(countryInfo.activate_org_code ?? countryInfo.id ?? countryKey);
@@ -174,7 +196,8 @@ function normalizeGoldPriceOptions(pricesValue, countries) {
       if (!/^\d{1,12}$/.test(providerId)) return;
       if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(count) || count <= 0) return;
 
-      const optionKey = `${country}|${price}`;
+      const grade = goldProviders.has(`${country}|${providerId}`) ? "gold" : "unknown";
+      const optionKey = `${country}|${price}|${grade}`;
       const existing = options.get(optionKey);
       if (existing) {
         if (existing.providerIds.split(",").includes(providerId)) return;
@@ -192,6 +215,7 @@ function normalizeGoldPriceOptions(pricesValue, countries) {
         price,
         count: Math.floor(count),
         providerIds: providerId,
+        grade,
       });
     });
   });
@@ -201,7 +225,7 @@ function normalizeGoldPriceOptions(pricesValue, countries) {
     || right.count - left.count
     || left.title.localeCompare(right.title)
   ));
-  if (!result.length) throw new SmsBowerError("OpenAI 当前没有可购买的 Gold 号码", { terminal: true });
+  if (!result.length) throw new SmsBowerError("当前服务没有可购买的号码", { terminal: true });
   return result;
 }
 

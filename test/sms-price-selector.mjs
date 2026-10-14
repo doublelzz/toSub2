@@ -3,11 +3,11 @@ import fs from "node:fs/promises";
 import React, { act, useState } from "react";
 import { JSDOM } from "jsdom";
 import { transformWithEsbuild } from "vite";
-import { filterSmsCountries, findSmsNumberOption, formatSmsSuccessRate, groupSmsCountries, preferredSmsNumberOption } from "../web/src/sms-number-options.mjs";
+import { filterSmsCountries, filterSmsOptionsByGrade, findSmsNumberOption, formatSmsSuccessRate, groupSmsCountries, preferredSmsNumberOption } from "../web/src/sms-number-options.mjs";
 
 const options = [
-  { country: "0", title: "俄罗斯", price: 0.12, count: 10, successRate: 90 },
-  { country: "7", title: "马来西亚", price: 0.2, count: 4, successRate: 96, providerIds: "gold-2" },
+  { country: "0", title: "俄罗斯", price: 0.12, count: 10, successRate: 90, grade: "gold" },
+  { country: "7", title: "马来西亚", price: 0.2, count: 4, successRate: 96, providerIds: "gold-2", grade: "gold" },
   { country: "7", title: "马来西亚", price: 0.18, count: 8, successRate: 96, providerIds: "gold-1" },
   { country: "16", title: "英国", price: 0.42, count: 12, successRate: 70 },
   { country: "17", title: "荷兰", price: 0.21, count: 9, successRate: 69.9 },
@@ -28,6 +28,8 @@ assert.equal(formatSmsSuccessRate(0), "0%");
 assert.equal(formatSmsSuccessRate(null), "暂无数据");
 assert.equal(findSmsNumberOption(options, { country: 0, maxPrice: "0.12" }).country, "0");
 assert.equal(findSmsNumberOption(options, { country: "7", maxPrice: "0.2", providerIds: "gold-2" }).providerIds, "gold-2");
+assert.equal(filterSmsOptionsByGrade(options, "gold").length, 2);
+assert.equal(filterSmsOptionsByGrade(options, "unknown").length, 7);
 
 // Render the actual JSX so pagination and selection are tested through user events.
 const componentUrl = new URL("../web/src/SmsPriceSelector.jsx", import.meta.url);
@@ -58,6 +60,12 @@ function Harness({ id = "herosms", loading = false, offers = options, apiKey = "
     onSelect: (option) => {
       selections.push(option);
       setConfig((current) => ({ ...current, country: option.country, maxPrice: String(option.price), providerIds: option.providerIds || "" }));
+    },
+    onGradeChange: (gradeFilter) => {
+      const eligible = filterSmsOptionsByGrade(offers, gradeFilter);
+      const current = findSmsNumberOption(eligible, config) || preferredSmsNumberOption(eligible, id);
+      if (current) selections.push(current);
+      setConfig((previous) => ({ ...previous, gradeFilter, country: current?.country || "", maxPrice: current ? String(current.price) : "", providerIds: current?.providerIds || "" }));
     },
   });
 }
@@ -110,9 +118,23 @@ try {
   assert.equal(refreshes, 1);
 
   await act(() => root.render(React.createElement(Harness, { key: "gold", id: "smsbower" })));
-  assert.equal(quality(), null, "SMSBower must retain its Gold category instead of a fabricated success rate");
-  assert.match(container.textContent, /Gold 供应商/);
+  assert.equal(quality().getAttribute("aria-label"), "SMSBower 档位筛选");
+  assert.equal(quality().value, "all", "SMSBower should show all prices by default");
   assert.match(rows()[0].textContent, /法国/);
+  change(quality(), "gold");
+  assert.equal(rows().length, 2);
+  assert.equal(tier().options.length, 1, "A country must only show prices within the selected grade");
+  assert.equal(tier().value, "7|0.2|gold-2");
+  change(quality(), "unknown");
+  assert.equal(tier().value, "7|0.18|gold-1");
+  assert.equal(selections.at(-1).providerIds, "gold-1", "Switching grade must replace the selected supplier along with its price");
+  assert.ok([...tier().options].every((option) => option.textContent.includes("未标级")));
+  await act(() => root.render(React.createElement(Harness, { key: "empty-grade", id: "smsbower", offers: options.filter((option) => option.grade !== "gold") })));
+  change(quality(), "gold");
+  assert.equal(rows().length, 0);
+  assert.equal(tier(), null);
+  change(quality(), "all");
+  assert.ok(rows().length > 0, "Empty grade results must leave the filter available to recover");
   await act(() => root.render(React.createElement(Harness, { key: "loading", loading: true })));
   assert.equal(container.querySelector('section').getAttribute("aria-busy"), "true");
   assert.ok([...container.querySelectorAll("button,input,select")].every((element) => element.disabled));

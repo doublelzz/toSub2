@@ -15,6 +15,15 @@ export function findSmsNumberOption(options, config = {}) {
     || null;
 }
 
+export function filterSmsOptionsByGrade(options, grade = "all") {
+  if (!["gold", "unknown"].includes(grade)) return options;
+  return options.filter((option) => (option.grade === "gold" ? "gold" : "unknown") === grade);
+}
+
+export function formatSmsGrade(grade) {
+  return grade === "gold" ? "Gold" : "未标级";
+}
+
 export function groupSmsCountries(options, countryName = (option) => option.title || `国家 ${option.country}`) {
   const countries = new Map();
   for (const option of options) {
@@ -34,6 +43,7 @@ export function groupSmsCountries(options, countryName = (option) => option.titl
   for (const country of countries.values()) {
     country.tiers.sort((a, b) => Number(a.price) - Number(b.price) || Number(b.count) - Number(a.count));
     country.minPrice = Number(country.tiers[0].price);
+    country.grades = [...new Set(country.tiers.map((option) => option.grade === "gold" ? "gold" : "unknown"))];
   }
   return [...countries.values()];
 }

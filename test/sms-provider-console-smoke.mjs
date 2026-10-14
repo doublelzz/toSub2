@@ -67,6 +67,10 @@ const smsServer = http.createServer((req, res) => {
     japan: { 3301: { price: 0.42, count: 12 } },
     malaysia: { 3401: { price: 0.18, count: 8 } },
   });
+  if (action === "getPricesV3") body = JSON.stringify({
+    1001: { dr: { 3301: { price: 0.42, count: 12 }, 3302: { price: 0.1, count: 20 } } },
+    7: { dr: { 3401: { price: 0.18, count: 8 }, 3402: { price: 0.08, count: 40 } } },
+  });
   if (action === "getCountries") body = JSON.stringify({ countries: [
     { id: 350, activate_org_code: "1001", slug: "japan", eng: "Japan", chn: "日本" },
     { id: 71, activate_org_code: "7", slug: "malaysia", eng: "Malaysia", chn: "马来西亚" },
@@ -121,7 +125,10 @@ try {
   const optionsText = await optionsResponse.text();
   assert.equal(optionsResponse.status, 200, optionsText);
   const optionData = JSON.parse(optionsText);
-  assert.deepEqual(optionData.options.map((option) => option.country), ["7", "1001"]);
+  assert.deepEqual(optionData.options.map((option) => option.country), ["7", "1001", "7", "1001"]);
+  assert.deepEqual(optionData.options.map((option) => option.grade), ["unknown", "unknown", "gold", "gold"]);
+  assert.equal(optionData.options[0].providerIds, "3402");
+  assert.equal(optionData.options[0].price, 0.08);
   const createdResponse = await fetch(`${baseUrl}/api/jobs`, {
     method: "POST",
     headers,

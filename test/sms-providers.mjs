@@ -31,6 +31,19 @@ const fetchImpl = async (url) => {
     malaysia: { 3401: { price: 0.18, count: 8 } },
     unavailable: { 3501: { price: 0.08, count: 0 } },
   });
+  else if (action === "getPricesV3") body = JSON.stringify({
+    12: { dr: {
+      2430: { price: 0.004, count: 200000 }, 2440: { price: 0.004, count: 166063 },
+      2450: { price: 0.002, count: 50 }, 2451: { price: 0.004, count: 40 },
+    } },
+    7: { dr: { 3401: { price: 0.18, count: 8 }, 3402: { price: 0.08, count: 40 } }, go: { 9900: { price: 0.001, count: 10 } } },
+    1001: { dr: {
+      3301: { price: 0.42, count: 7 }, 3302: { price: 0.42, count: 5 },
+      3303: { price: 0.5, count: 3 }, 3304: { price: 0.12, count: 25 },
+    } },
+    0: { dr: { 3501: { price: 0.08, count: 0 } } },
+    26: { dr: { 2430: { price: 0.08, count: 2 } } },
+  });
   else if (action === "getCountries") body = JSON.stringify({ data: [
     { id: 352, activate_org_code: "12", slug: "united-states-virtual", rus: "США (виртуальные)", eng: "United States (virtual)", chn: "美国（虚拟号码）" },
     { id: 1001, rus: "Япония", eng: "Japan", chn: "日本" },
@@ -61,13 +74,27 @@ assert.equal(requests[0].searchParams.get("country"), "1001");
 assert.equal(requests[0].searchParams.get("maxPrice"), "0.42");
 assert.equal(requests[0].searchParams.get("providerIds"), "3301,3302");
 assert.deepEqual(await client.getPriceOptions("dr"), [
-  { country: "12", title: "美国（虚拟号码）", iso: "", prefix: "", price: 0.004, count: 366063, providerIds: "2430,2440" },
-  { country: "7", title: "马来西亚", iso: "", prefix: "", price: 0.18, count: 8, providerIds: "3401" },
-  { country: "1001", title: "日本", iso: "", prefix: "", price: 0.42, count: 12, providerIds: "3301,3302" },
-  { country: "1001", title: "日本", iso: "", prefix: "", price: 0.5, count: 3, providerIds: "3303" },
+  { country: "12", title: "美国（虚拟号码）", iso: "", prefix: "", price: 0.002, count: 50, providerIds: "2450", grade: "unknown" },
+  { country: "12", title: "美国（虚拟号码）", iso: "", prefix: "", price: 0.004, count: 366063, providerIds: "2430,2440", grade: "gold" },
+  { country: "12", title: "美国（虚拟号码）", iso: "", prefix: "", price: 0.004, count: 40, providerIds: "2451", grade: "unknown" },
+  { country: "7", title: "马来西亚", iso: "", prefix: "", price: 0.08, count: 40, providerIds: "3402", grade: "unknown" },
+  { country: "26", title: "国家 26", iso: "", prefix: "", price: 0.08, count: 2, providerIds: "2430", grade: "unknown" },
+  { country: "1001", title: "日本", iso: "", prefix: "", price: 0.12, count: 25, providerIds: "3304", grade: "unknown" },
+  { country: "7", title: "马来西亚", iso: "", prefix: "", price: 0.18, count: 8, providerIds: "3401", grade: "gold" },
+  { country: "1001", title: "日本", iso: "", prefix: "", price: 0.42, count: 12, providerIds: "3301,3302", grade: "gold" },
+  { country: "1001", title: "日本", iso: "", prefix: "", price: 0.5, count: 3, providerIds: "3303", grade: "gold" },
 ]);
 assert.ok(requests.some((request) => request.searchParams.get("action") === "getTopCountriesByService"));
+assert.ok(requests.some((request) => request.searchParams.get("action") === "getPricesV3"));
 assert.ok(!requests.some((request) => request.searchParams.get("action") === "getPrices"));
+for (const classificationResponse of [new Response("BAD_ACTION"), new Response("unavailable", { status: 503 })]) {
+  const fallback = createSmsBowerClient({ apiKey: "test-api-key", fetchImpl: (url) => (
+    new URL(url).searchParams.get("action") === "getTopCountriesByService" ? classificationResponse.clone() : fetchImpl(url)
+  ) });
+  const prices = await fallback.getPriceOptions("dr");
+  assert.equal(prices[0].price, 0.002, "Gold classification failure must keep the cheapest full-list offer available");
+  assert.ok(prices.every((option) => option.grade === "unknown"), "Failed classification must never invent a provider rank");
+}
 
 const badClient = createSmsBowerClient({
   apiKey: "test-api-key",
@@ -99,7 +126,7 @@ assert.equal((await provider.listNumberOptions())[0].country, "12");
 assert.throws(() => createSmsProvider("smsbower", { apiKey: "short", service: "dr", country: "1001" }), /API Key/);
 assert.throws(
   () => createSmsProvider("smsbower", { apiKey: "test-api-key", service: "dr", country: "1001", providerIds: "3301,bad" }),
-  /Gold 价格/,
+  /供应商价格/,
 );
 await assert.rejects(
   () => createSmsProvider("smsbower", {
@@ -108,8 +135,14 @@ await assert.rejects(
     country: "1001",
     maxPrice: "0.42",
   }, { fetchImpl }).getNumber(),
-  /先查询并选择 SMSBower Gold 价格/,
+  /先查询并选择 SMSBower 供应商价格/,
 );
+const budgetProvider = createSmsProvider("smsbower", {
+  apiKey: "test-api-key", service: "dr", country: "7", maxPrice: "0.08", providerIds: "3402", gradeFilter: "unknown",
+}, { fetchImpl });
+await budgetProvider.getNumber();
+assert.equal(requests.at(-1).searchParams.get("maxPrice"), "0.08");
+assert.equal(requests.at(-1).searchParams.get("providerIds"), "3402", "Budget purchases must use the selected cheaper supplier");
 assert.deepEqual(parseCustomSmsEntries([
   "+8613711111111----https://sms.example/first",
   "+8613822222222----https://sms.example/second",

@@ -1,19 +1,20 @@
 import React, { useMemo, useState } from "react";
 import { Check, ChevronLeft, ChevronRight, LoaderCircle, RefreshCw, Search } from "lucide-react";
-import { filterSmsCountries, findSmsNumberOption, formatSmsSuccessRate, groupSmsCountries, smsPriceOptionKey } from "./sms-number-options.mjs";
+import { filterSmsCountries, filterSmsOptionsByGrade, findSmsNumberOption, formatSmsGrade, formatSmsSuccessRate, groupSmsCountries, smsPriceOptionKey } from "./sms-number-options.mjs";
 
 const COUNTRIES_PER_PAGE = 5;
 
-export default function SmsPriceSelector({ provider, options, loading, onRefresh, onSelect, countryName }) {
+export default function SmsPriceSelector({ provider, options, loading, onRefresh, onSelect, onGradeChange, countryName }) {
   const [search, setSearch] = useState("");
   const [quality, setQuality] = useState("all");
   const [page, setPage] = useState(0);
   const hasQuality = provider.id === "herosms";
-  const countries = useMemo(() => groupSmsCountries(options, countryName), [options, countryName]);
+  const offers = useMemo(() => hasQuality ? options : filterSmsOptionsByGrade(options, provider.config.gradeFilter), [options, hasQuality, provider.config.gradeFilter]);
+  const countries = useMemo(() => groupSmsCountries(offers, countryName), [offers, countryName]);
   const filtered = useMemo(() => filterSmsCountries(countries, { search, quality, sort: hasQuality ? "quality" : "price" }), [countries, search, quality, hasQuality]);
   const currentPage = Math.min(page, Math.max(0, Math.ceil(filtered.length / COUNTRIES_PER_PAGE) - 1));
   const visible = filtered.slice(currentPage * COUNTRIES_PER_PAGE, (currentPage + 1) * COUNTRIES_PER_PAGE);
-  const selected = findSmsNumberOption(options, provider.config);
+  const selected = findSmsNumberOption(offers, provider.config);
   const selectedCountry = countries.find((country) => country.country === selected?.country);
 
   return <section className="sms-price-selector wide-settings-field" aria-label={`${provider.name} 国家与质量选择`} aria-busy={loading}>
@@ -38,14 +39,20 @@ export default function SmsPriceSelector({ provider, options, loading, onRefresh
             <option value="low">低：&lt;70%</option>
             <option value="unknown">暂无数据</option>
           </select>
-        </label> : <span className="sms-quality-kind">Gold 供应商</span>}
+        </label> : <label className="sms-quality-filter">
+          <select aria-label={`${provider.name} 档位筛选`} value={provider.config.gradeFilter || "all"} onChange={(event) => { onGradeChange(event.target.value); setPage(0); }} disabled={loading}>
+            <option value="all">全部档位</option>
+            <option value="gold">Gold</option>
+            <option value="unknown">其他（未标级）</option>
+          </select>
+        </label>}
       </div>
       <div className="sms-country-list" role="group" aria-label={`${provider.name} 国家列表`}>
         <div className="sms-country-columns" aria-hidden="true"><span>国家</span><span>{hasQuality ? "平台成功率" : "类型"}</span><span>起价</span></div>
         {visible.map((country) => <button type="button" className={`sms-country-row ${selected?.country === country.country ? "selected" : ""}`} key={country.country}
           aria-pressed={selected?.country === country.country} disabled={loading} onClick={() => onSelect(selected?.country === country.country ? selected : country.tiers[0])}>
           <span className="sms-country-title">{selected?.country === country.country && <Check size={13} aria-hidden="true" />}{country.title}</span>
-          <span className="sms-country-quality">{hasQuality ? formatSmsSuccessRate(country.successRate) : "Gold"}</span>
+          <span className="sms-country-quality">{hasQuality ? formatSmsSuccessRate(country.successRate) : country.grades.map(formatSmsGrade).join(" / ")}</span>
           <span className="sms-country-price">{country.minPrice}</span>
         </button>)}
         {!visible.length && <p className="sms-selector-empty" role="status">没有符合条件的国家，试试其他名称或质量条件。</p>}
@@ -60,9 +67,10 @@ export default function SmsPriceSelector({ provider, options, loading, onRefresh
         <select aria-label={`${provider.name} 价格档位`} value={smsPriceOptionKey(selected)} disabled={loading} onChange={(event) => {
           const option = selectedCountry.tiers.find((tier) => smsPriceOptionKey(tier) === event.target.value);
           if (option) onSelect(option);
-        }}>{selectedCountry.tiers.map((tier) => <option key={smsPriceOptionKey(tier)} value={smsPriceOptionKey(tier)}>价格 {tier.price} · 库存 {tier.count}</option>)}</select>
+        }}>{selectedCountry.tiers.map((tier) => <option key={smsPriceOptionKey(tier)} value={smsPriceOptionKey(tier)}>{!hasQuality && `${formatSmsGrade(tier.grade)} · `}价格 {tier.price} · 库存 {tier.count}</option>)}</select>
       </label>}
       {hasQuality && <p className="sms-quality-note">质量按国家统计：平台近 24 小时成功率，成功激活样本至少 50 次。同一国家的价格档位共享该指标。</p>}
+      {!hasQuality && <p className="sms-quality-note">报价按低价优先展示。平台仅标记部分 Gold，其余报价未标级，无法区分 Silver / Bronze。</p>}
     </>}
   </section>;
 }
