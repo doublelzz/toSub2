@@ -953,37 +953,6 @@ tbody tr:last-child td { border-bottom: 0; }
 }
 .sms-settings-dialog .settings-textarea:focus,
 .mail-request-settings-dialog .settings-textarea:focus { border-color: var(--green); box-shadow: 0 0 0 3px var(--focus-shadow); }
-.settings-field > .price-select-row {
-  height: auto;
-  padding: 0;
-  align-items: stretch;
-  gap: 8px;
-  background: transparent;
-  border: 0;
-}
-.settings-field > .price-select-row:focus-within { box-shadow: none; }
-.price-select-box {
-  min-width: 0;
-  height: 38px;
-  padding: 0 10px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  color: var(--muted);
-  background: var(--surface);
-  border: 1px solid var(--line);
-  border-radius: 5px;
-}
-.price-select-box:focus-within { border-color: var(--green); box-shadow: 0 0 0 3px var(--focus-shadow); }
-.price-select-box select {
-  width: 100%;
-  min-width: 0;
-  border: 0;
-  outline: 0;
-  color: var(--ink);
-  background: transparent;
-  font-size: 12px;
-}
 .price-refresh-button {
   min-width: 106px;
   height: 38px;
@@ -1056,7 +1025,6 @@ tbody tr:last-child td { border-bottom: 0; }
   .provider-config-grid { grid-template-columns: 1fr; }
   .settings-field:first-child { grid-column: auto; }
   .wide-settings-field { grid-column: auto; }
-  .settings-field > .price-select-row { flex-direction: column; }
   .price-refresh-button { width: 100%; }
   .provider-tabs { overflow-x: auto; }
   .empty-state { width: calc(100vw - 34px); }

@@ -28,8 +28,9 @@ const smsServer = http.createServer((req, res) => {
     return;
   }
   const isOffers = url.pathname === "/api/v1/activations/offers/sms";
-  const action = isOffers ? "offers" : url.searchParams.get("action");
-  const isHero = isOffers || url.pathname === "/hero/handler_api.php";
+  const isQuality = url.pathname === "/api/v1/stats/deliverability";
+  const action = isOffers ? "offers" : isQuality ? "quality" : url.searchParams.get("action");
+  const isHero = isOffers || isQuality || url.pathname === "/hero/handler_api.php";
   smsActions.push({
     provider: isHero ? "herosms" : "smsbower",
     action,
@@ -56,6 +57,11 @@ const smsServer = http.createServer((req, res) => {
       7: { map: { "0.1800": 8 } },
       16: { map: { "0.4200": 12 } },
     } } });
+  }
+  if (isQuality) {
+    assert.equal(req.headers.authorization, "ApiKey test-hero-key");
+    assert.deepEqual(url.searchParams.getAll("services[]"), ["dr"]);
+    body = JSON.stringify({ data: { dr: [{ country: 7, successRate: 94 }, { country: 16, successRate: 72 }] } });
   }
   if (action === "getTopCountriesByService") body = JSON.stringify({
     japan: { 3301: { price: 0.42, count: 12 } },
@@ -249,6 +255,7 @@ try {
   const heroOptions = await heroOptionsResponse.json();
   assert.equal(heroOptions.providerId, "herosms");
   assert.deepEqual(heroOptions.options.map(({ country }) => country), ["7", "16"]);
+  assert.deepEqual(heroOptions.options.map(({ successRate }) => successRate), [94, 72]);
   const heroResponse = await fetch(`${baseUrl}/api/jobs`, {
     method: "POST", headers, body: JSON.stringify({ email: "hero-sms@example.com" }),
   });

@@ -208,6 +208,43 @@ input[type="checkbox"] { accent-color: var(--green); width: 15px; height: 15px; 
 .dialog-header h2 { font-size: 21px; font-weight: 600; }
 .dialog-footer { background: var(--surface); gap: 8px; flex-wrap: wrap; }
 .provider-config-grid { gap: 14px; }
+.sms-price-selector { min-width: 0; }
+.sms-selector-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; color: var(--muted); font-size: 12px; }
+.sms-selector-heading .price-refresh-button { width: auto; flex-shrink: 0; }
+.sms-selector-filters { display: flex; gap: 8px; margin-bottom: 10px; }
+.sms-country-search { min-width: 0; flex: 1; display: flex; align-items: center; gap: 8px; padding: 0 10px; color: var(--muted); background: var(--surface-subtle); border: 1px solid var(--line); border-radius: 7px; }
+.sms-country-search input { min-width: 0; width: 100%; height: 38px; border: 0; outline: 0; color: var(--ink); background: transparent; font-size: 13px; }
+.sms-country-search:focus-within { border-color: var(--green); box-shadow: 0 0 0 3px var(--focus-shadow); }
+.sms-country-search input::placeholder { color: var(--muted); }
+.sms-quality-filter select, .sms-tier-select select { min-height: 38px; max-width: 100%; padding: 0 10px; border: 1px solid var(--line); border-radius: 7px; color: var(--ink); background: var(--surface-subtle); font-size: 13px; }
+.sms-quality-kind { display: flex; align-items: center; color: var(--muted); font-size: 12px; white-space: nowrap; }
+.sms-country-columns, .sms-country-row { display: grid; grid-template-columns: minmax(0, 1fr) 104px 60px; align-items: center; gap: 8px; }
+.sms-country-columns { padding: 8px 10px; color: var(--muted); font-size: 11px; border-bottom: 1px solid var(--line); }
+.sms-country-columns span:last-child, .sms-country-price { text-align: right; }
+.sms-country-row { width: 100%; min-height: 42px; padding: 8px 10px; text-align: left; font-size: 13px; color: var(--ink); background: transparent; border: 0; border-bottom: 1px solid var(--line); cursor: pointer; font-variant-numeric: tabular-nums; }
+.sms-country-row:hover:not(:disabled) { background: var(--surface-subtle); }
+.sms-country-row.selected { background: var(--green-soft); color: var(--green-strong); }
+.sms-country-title { min-width: 0; display: flex; align-items: center; gap: 5px; overflow-wrap: anywhere; }
+.sms-country-title svg { flex-shrink: 0; }
+.sms-country-quality { font-size: 12px; }
+.sms-country-pagination { min-height: 36px; display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 12px; }
+.sms-country-pagination > div { display: flex; gap: 4px; }
+.sms-country-pagination button { display: inline-flex; align-items: center; justify-content: center; min-width: 32px; min-height: 32px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); color: var(--ink); cursor: pointer; }
+.sms-country-pagination button:hover:not(:disabled) { background: var(--surface-subtle); }
+.sms-country-row:disabled, .sms-country-pagination button:disabled { opacity: .48; cursor: not-allowed; }
+.sms-tier-select { display: grid; gap: 7px; margin-top: 8px; font-size: 12px; color: var(--muted); }
+.sms-tier-select select { width: 100%; }
+.sms-quality-note, .sms-selector-empty { margin: 10px 0 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.sms-selector-empty { padding: 10px 0; }
+@media (max-width: 360px) {
+  .sms-selector-filters { flex-direction: column; }
+  .sms-quality-filter select { width: 100%; }
+}
+@media (pointer: coarse) {
+  .sms-selector-heading .price-refresh-button, .sms-country-row, .sms-country-pagination button, .sms-quality-filter select, .sms-tier-select select, .sms-country-search input { min-height: 44px; }
+  .sms-country-pagination button { min-width: 44px; }
+  .sms-country-search input, .sms-quality-filter select, .sms-tier-select select { font-size: 16px; }
+}
 .settings-field { min-width: 0; }
 .settings-field > input, .settings-field > select, .settings-field > textarea, .settings-field > div, .provider-field, .email-field, .compact-input, .batch-dialog textarea { background: var(--surface-subtle); border-color: var(--line); border-radius: 7px; }
 .settings-field input, .settings-field select, .settings-field textarea { color: var(--ink); }

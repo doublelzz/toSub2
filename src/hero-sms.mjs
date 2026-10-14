@@ -20,15 +20,17 @@ export function createHeroSmsClient(options = {}) {
   if (!/^https?:$/.test(apiBase.protocol)) throw new Error("Hero SMS API 地址必须使用 HTTP 或 HTTPS");
 
   async function request(action, params = {}) {
-    const isOffers = action === "offers";
-    const url = isOffers ? new URL("/api/v1/activations/offers/sms", apiBase) : new URL(apiBase);
+    const restPath = { offers: "/api/v1/activations/offers/sms", quality: "/api/v1/stats/deliverability" }[action];
+    const url = restPath ? new URL(restPath, apiBase) : new URL(apiBase);
     const headers = { accept: "text/plain,application/json" };
-    if (isOffers) headers.authorization = `ApiKey ${apiKey}`;
+    if (restPath) headers.authorization = `ApiKey ${apiKey}`;
     else {
       url.searchParams.set("api_key", apiKey);
       url.searchParams.set("action", action);
     }
-    Object.entries(params).forEach(([key, value]) => url.searchParams.set(key, String(value)));
+    Object.entries(params).forEach(([key, value]) => {
+      for (const item of Array.isArray(value) ? value : [value]) url.searchParams.append(key, String(item));
+    });
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
     try {
@@ -86,11 +88,37 @@ export function createHeroSmsClient(options = {}) {
         request("offers", { services: service }),
         request("getCountries"),
       ]);
-      return normalizePriceOptions(
+      const options = normalizePriceOptions(
         parseJsonResponse(pricesText, "价格接口返回格式不正确", apiKey),
         parseJsonResponse(countriesText, "国家接口返回格式不正确", apiKey),
         service,
       );
+      const countryIds = [...new Set(options.map((option) => option.country))];
+      const groups = [];
+      for (let index = 0; index < countryIds.length; index += 25) groups.push(countryIds.slice(index, index + 25));
+      const qualityByCountry = new Map();
+      for (let index = 0; index < groups.length; index += 3) {
+        await Promise.all(groups.slice(index, index + 3).map(async (group) => {
+          try {
+            const text = await request("quality", {
+              "services[]": [service], "countries[]": group, interval: 24, successCount: "medium", size: 25,
+            });
+            const data = parseJsonResponse(text, "质量接口返回格式不正确", apiKey);
+            if (!Array.isArray(data?.data?.[service])) return;
+            for (const row of data.data[service]) {
+              const country = String(row?.country ?? "");
+              const rate = row?.successRate;
+              if (!group.includes(country) || typeof rate !== "number" || !Number.isFinite(rate) || rate < 0 || rate > 100) continue;
+              qualityByCountry.set(country, { successRate: rate, qualityUpdatedAt: data.meta?.updatedAt || null });
+            }
+          } catch {
+            // Price selection remains available when optional quality statistics are unavailable.
+          }
+        }));
+      }
+      return options.map((option) => qualityByCountry.has(option.country)
+        ? { ...option, ...qualityByCountry.get(option.country) }
+        : option);
     },
 
     async getSms(activationId) {

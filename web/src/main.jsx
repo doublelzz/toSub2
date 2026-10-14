@@ -34,6 +34,8 @@ import {
 import "./styles.css";
 import "./workspace.css";
 import MfaWorkspace from "./MfaWorkspace.jsx";
+import SmsPriceSelector from "./SmsPriceSelector.jsx";
+import { findSmsNumberOption, preferredSmsNumberOption } from "./sms-number-options.mjs";
 import { Drawer, MoreActions, TaskFilters, TaskOverview, ThemeControl, useCalendarDay, useDialogFocus } from "./WorkspaceUi.jsx";
 import { AUTH_STATUSES, DEFAULT_FILTERS, hasFilters, queryFilters } from "./task-filters.mjs";
 
@@ -251,10 +253,6 @@ function App() {
     && smsNumberOptionsState.service === draftSmsProvider.config.service
     ? smsNumberOptionsState.options
     : [];
-  const selectedSmsNumberOption = useMemo(
-    () => findSmsNumberOption(smsNumberOptions, draftSmsProvider.config),
-    [smsNumberOptions, draftSmsProvider.config],
-  );
   const selectedJobs = useMemo(
     () => jobSelectionIndex.filter((job) => selectedJobIds.has(job.id)),
     [jobSelectionIndex, selectedJobIds],
@@ -443,8 +441,8 @@ function App() {
       const options = Array.isArray(data.options) ? data.options : [];
       setSmsNumberOptionsState({ providerId: resolved.id, apiKey: resolved.config.apiKey, service: resolved.config.service, options });
       const current = resolved.config.maxPrice
-        ? findSmsNumberOption(options, resolved.config) || options[0]
-        : options[0];
+        ? findSmsNumberOption(options, resolved.config) || preferredSmsNumberOption(options, resolved.id)
+        : preferredSmsNumberOption(options, resolved.id);
       if (!current) throw new Error("当前没有可购买的国家号码");
       updateSmsProviderConfig(resolved.id, {
         country: current.country,
@@ -1010,51 +1008,15 @@ function App() {
                   )}
                 </div>
                 <div className="provider-config-grid">
-                  {draftSmsProvider.definition.fields.filter((field) => field.type !== "hidden").map((field) => (
-                    <label key={field.key} className={`settings-field ${["price-select", "textarea"].includes(field.type) ? "wide-settings-field" : ""}`}>
+                  {draftSmsProvider.definition.fields.filter((field) => field.type !== "hidden").map((field) => field.type === "price-select" ? (
+                    <SmsPriceSelector key={`${draftSmsProvider.id}-${field.key}`} provider={draftSmsProvider} options={smsNumberOptions} loading={smsOptionsLoading}
+                      onRefresh={() => loadSmsNumberOptions()} countryName={formatSmsCountryName} onSelect={(selected) => updateSmsProviderConfig(draftSmsProvider.id, {
+                        country: selected.country, maxPrice: String(selected.price), providerIds: selected.providerIds || "", countryLabel: formatSmsCountryName(selected),
+                      })} />
+                  ) : (
+                    <label key={field.key} className={`settings-field ${field.type === "textarea" ? "wide-settings-field" : ""}`}>
                       <span>{field.label}</span>
-                      {field.type === "price-select" ? (
-                        <div className="price-select-row">
-                          <div className="price-select-box">
-                            <Settings2 size={15} />
-                            <select
-                              value={selectedSmsNumberOption
-                                ? smsPriceOptionKey(selectedSmsNumberOption)
-                                : draftSmsProvider.config.country || ""}
-                              onChange={(event) => {
-                                const selected = smsNumberOptions.find((option) => smsPriceOptionKey(option) === event.target.value);
-                                if (!selected) return;
-                                updateSmsProviderConfig(draftSmsProvider.id, {
-                                  country: selected.country,
-                                  maxPrice: String(selected.price),
-                                  providerIds: selected.providerIds || "",
-                                  countryLabel: formatSmsCountryName(selected),
-                                });
-                              }}
-                              disabled={!smsNumberOptions.length || smsOptionsLoading}
-                              aria-label={`${draftSmsProvider.name} 国家与价格`}
-                            >
-                              {!smsNumberOptions.length && (
-                                <option value={draftSmsProvider.config.country || ""}>
-                                  {smsOptionsLoading ? "正在查询实时价格..." : "请先查询实时价格"}
-                                </option>
-                              )}
-                              {smsNumberOptions.map((option) => (
-                                <option key={smsPriceOptionKey(option)} value={smsPriceOptionKey(option)}>{formatSmsPriceOption(option)}</option>
-                              ))}
-                            </select>
-                          </div>
-                          <button
-                            type="button"
-                            className="price-refresh-button"
-                            onClick={() => loadSmsNumberOptions()}
-                            disabled={smsOptionsLoading || !draftSmsProvider.config.apiKey}
-                          >
-                            {smsOptionsLoading ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}
-                            {smsOptionsLoading ? "查询中" : "查询价格"}
-                          </button>
-                        </div>
-                      ) : field.type === "textarea" ? (
+                      {field.type === "textarea" ? (
                         <textarea
                           className="settings-textarea"
                           value={draftSmsProvider.config[field.key] || ""}
@@ -2395,28 +2357,6 @@ function formatSmsCountryName(option) {
     } catch {}
   }
   return option.title || `国家 ${option.country}`;
-}
-
-function formatSmsPriceOption(option) {
-  const name = formatSmsCountryName(option);
-  return `${name} | 价格 ${option.price} | 库存 ${option.count}`;
-}
-
-function smsPriceOptionKey(option) {
-  return `${option.country}|${option.price}|${option.providerIds || ""}`;
-}
-
-function findSmsNumberOption(options, config = {}) {
-  const country = String(config.country || "");
-  const price = Number(config.maxPrice);
-  const providerIds = String(config.providerIds || "");
-  return options.find((option) => (
-    option.country === country
-    && Number(option.price) === price
-    && (!providerIds || option.providerIds === providerIds)
-  )) || options.find((option) => option.country === country && Number(option.price) === price)
-    || options.find((option) => option.country === country)
-    || null;
 }
 
 function writeLocalJson(key, value) {

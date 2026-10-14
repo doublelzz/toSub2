@@ -193,9 +193,11 @@ JBSWY3DPEHPK3PXP::name+tag@example.dev::账号密码
 目前支持：
 
 - LubanSMS：填写 API Key 和供应商编号。
-- SMSBower：填写 API Key 后手动点击“查询价格”，再从下拉框选择国家和价格档位。列表只查询 Gold 类型，并把同一国家、同一价格下多个 Gold 供应商的库存合并显示；列表按价格从低到高显示中文国家名称、价格和库存，不显示国家缩写和国际区号。
+- SMSBower：填写 API Key 后手动点击“查询价格”。列表只查询 Gold 类型，按国家合并并按起价排序；支持国家名称或 ID 搜索，每页显示 5 个国家。选中国家后单独选择价格档位及库存，同一国家、同一价格的 Gold 供应商库存合并显示。
 - Hero SMS：填写 API Key 后点击“查询价格”，选择 OpenAI（服务代码 `dr`）的国家和价格档位。价格与库存使用官方 `/api/v1/activations/offers/sms` 接口，展示各档位库存；取号使用 `maxPrice` 和 `fixedPrice=true` 锁定所选价格，支持等待短信、完成和取消订单。订单接口为 `https://hero-sms.com/stubs/handler_api.php`，文档见 [Hero SMS API](https://hero-sms.com/cn/api)；开发测试可通过 `HERO_SMS_API_BASE` 覆盖订单接口地址，价格查询沿用该地址的站点根路径。
 - 自定义接码：每行填写 `+国际手机号----接码API`，一次最多 500 条。重复手机号以最后一行为准，并发任务按顺序获取未分配号码。
+
+Hero SMS 的选择列表按国家合并，默认按平台成功率从高到低排序，支持国家搜索、分页和质量筛选：高（≥90%）、中（≥70% 且 <90%）、低（<70%）及暂无数据。成功率来自官方 `/api/v1/stats/deliverability` 的近 24 小时统计，查询成功激活次数至少 50 次的国家；指标属于整个国家，同一国家的所有价格档位共享它。接口失败、样本不足或无有效统计时显示“暂无数据”，仍可选择价格。
 
 ```text
 +8613711111111----https://example.com/messages/13711111111

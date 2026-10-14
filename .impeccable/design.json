@@ -189,6 +189,14 @@
       "css": ".ds-search{display:flex;align-items:center;gap:8px;min-width:180px;flex:1;height:38px;padding:0 11px;color:var(--muted, #5f6c80);background:var(--surface, #ffffff);border:1px solid var(--line, #e1e6ef);border-radius:8px;}.ds-search input{min-width:0;width:100%;color:var(--ink, #202a3b);background:transparent;border:0;padding:7px 0;font-family:\"IBM Plex Sans\",\"Noto Sans SC\",\"Segoe UI\",\"Microsoft YaHei\",sans-serif;font-size:13px;caret-color:var(--green, #365edb);}.ds-search input::placeholder{color:var(--muted, #5f6c80);opacity:1;}.ds-search input:focus-visible{outline:2px solid var(--green, #365edb);outline-offset:3px;}@media(pointer:coarse){.ds-search{height:44px;}.ds-search input{font-size:16px;}}"
     },
     {
+      "name": "接码国家与质量选择",
+      "kind": "custom",
+      "refersTo": "input-search",
+      "description": "接码配置按国家合并报价，每页 5 个国家；搜索名称或 ID，选中国家后选择档位和库存。Hero SMS 按平台近 24 小时成功率筛选高、中、低及暂无数据，缺失统计保持未知；SMSBower 保留 Gold 类型。320px 窄屏搜索和质量条件分行，粗指针控件至少 44px。",
+      "html": "<section class=\"ds-sms-selector\" aria-label=\"国家与质量\"><input type=\"search\" aria-label=\"搜索国家\" placeholder=\"搜索国家 / ID\"/><p>查询价格后选择国家，再选择该国的价格档位。</p></section>",
+      "css": ".ds-sms-selector{font-size:13px;color:var(--ink);}.ds-sms-selector input{width:100%;min-height:38px;padding:0 10px;border:1px solid var(--line);border-radius:7px;color:var(--ink);background:var(--surface-subtle);font:inherit;}.ds-sms-selector input::placeholder,.ds-sms-selector p{color:var(--muted);}.ds-sms-selector input:focus-visible{outline:2px solid var(--green);outline-offset:3px;}@media(pointer:coarse){.ds-sms-selector input{min-height:44px;font-size:16px;}}"
+    },
+    {
       "name": "工作区导航",
       "kind": "nav",
       "refersTo": "navigation-active",

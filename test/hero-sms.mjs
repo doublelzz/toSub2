@@ -11,13 +11,21 @@ const fetchImpl = async (url, options) => {
   assert.equal(options.redirect, "error");
   assert.equal(request.origin, "https://hero-sms.com");
   const isOffers = request.pathname === "/api/v1/activations/offers/sms";
-  assert.equal(request.pathname, isOffers ? "/api/v1/activations/offers/sms" : "/stubs/handler_api.php");
-  if (isOffers) {
+  const isQuality = request.pathname === "/api/v1/stats/deliverability";
+  assert.ok(isOffers || isQuality || request.pathname === "/stubs/handler_api.php");
+  if (isOffers || isQuality) {
     assert.equal(options.headers.authorization, "ApiKey test-hero-key");
     assert.equal(request.searchParams.has("api_key"), false);
-    assert.equal(request.searchParams.get("services"), "dr");
+    if (isOffers) assert.equal(request.searchParams.get("services"), "dr");
+    else {
+      assert.deepEqual(request.searchParams.getAll("services[]"), ["dr"]);
+      assert.deepEqual(request.searchParams.getAll("countries[]").sort(), ["0", "16", "7"]);
+      assert.equal(request.searchParams.get("interval"), "24");
+      assert.equal(request.searchParams.get("successCount"), "medium");
+      assert.equal(request.searchParams.get("size"), "25");
+    }
   } else assert.equal(request.searchParams.get("api_key"), "test-hero-key");
-  const action = isOffers ? "offers" : request.searchParams.get("action");
+  const action = isOffers ? "offers" : isQuality ? "quality" : request.searchParams.get("action");
   const body = {
     getNumber: "ACCESS_NUMBER:123456789:60123456789",
     offers: JSON.stringify({ data: {
@@ -32,6 +40,10 @@ const fetchImpl = async (url, options) => {
       },
       go: { 22: { map: { "0.01": 50 } } },
     } }),
+    quality: JSON.stringify({ data: { dr: [
+      { country: 7, successRate: 93.4 }, { country: 16, successRate: 76 },
+      { country: 0, successRate: null }, { country: 99, successRate: 100 },
+    ] }, meta: { updatedAt: "2026-10-14T01:00:00Z" } }),
     getCountries: JSON.stringify({
       0: { id: 0, chn: "俄罗斯", eng: "Russia" },
       7: { id: 7, chn: "马来西亚", eng: "Malaysia" },
@@ -45,9 +57,9 @@ const fetchImpl = async (url, options) => {
 
 const client = createHeroSmsClient({ apiKey: "test-hero-key", fetchImpl });
 assert.deepEqual(await client.getPriceOptions("dr"), [
-  { country: "7", title: "马来西亚", iso: "", prefix: "", price: 0.18, count: 8 },
-  { country: "7", title: "马来西亚", iso: "", prefix: "", price: 0.2, count: 4 },
-  { country: "16", title: "英国", iso: "", prefix: "", price: 0.42, count: 12 },
+  { country: "7", title: "马来西亚", iso: "", prefix: "", price: 0.18, count: 8, successRate: 93.4, qualityUpdatedAt: "2026-10-14T01:00:00Z" },
+  { country: "7", title: "马来西亚", iso: "", prefix: "", price: 0.2, count: 4, successRate: 93.4, qualityUpdatedAt: "2026-10-14T01:00:00Z" },
+  { country: "16", title: "英国", iso: "", prefix: "", price: 0.42, count: 12, successRate: 76, qualityUpdatedAt: "2026-10-14T01:00:00Z" },
   { country: "0", title: "俄罗斯", iso: "", prefix: "", price: 0.5, count: 5 },
 ]);
 const order = await client.getNumber("dr", "7", "0.18");
@@ -105,6 +117,36 @@ await assert.rejects(() => responseClient(JSON.stringify({ title: "UNPROCESSABLE
 await assert.rejects(() => responseClient("not-json").getPriceOptions("dr"), /价格接口返回格式/);
 await assert.rejects(() => responseClient("null").getPriceOptions("dr"), /格式不正确/);
 assert.deepEqual(await responseClient('{"data":{}}').getPriceOptions("dr"), []);
+for (const qualityResponse of [
+  () => new Response("unavailable", { status: 503 }),
+  () => new Response("not-json"),
+  () => new Response(JSON.stringify({ data: { dr: [
+    { country: 7, successRate: "99" }, { country: 16, successRate: 101 }, { country: 0, successRate: -1 },
+  ] } })),
+]) {
+  const fallback = createHeroSmsClient({ apiKey: "test-hero-key", fetchImpl: (url, options) => (
+    new URL(url).pathname === "/api/v1/stats/deliverability" ? qualityResponse() : fetchImpl(url, options)
+  ) });
+  const prices = await fallback.getPriceOptions("dr");
+  assert.equal(prices.length, 4, "Optional statistics must never hide available prices");
+  assert.ok(prices.every((option) => option.successRate === undefined), "Missing or invalid quality must remain unknown");
+}
+const qualityBatches = [];
+const batchClient = createHeroSmsClient({ apiKey: "test-hero-key", fetchImpl: async (url) => {
+  const request = new URL(url);
+  if (request.pathname === "/api/v1/activations/offers/sms") {
+    return Response.json({ data: { dr: Object.fromEntries(Array.from({ length: 61 }, (_, id) => [id, { map: { "0.2": 10 } }])) } });
+  }
+  if (request.pathname !== "/api/v1/stats/deliverability") return Response.json({});
+  const countries = request.searchParams.getAll("countries[]");
+  assert.ok(countries.length <= 25);
+  qualityBatches.push(countries);
+  return Response.json({ data: { dr: countries.map((country) => ({ country: Number(country), successRate: 0 })) } });
+} });
+const batchPrices = await batchClient.getPriceOptions("dr");
+assert.equal(qualityBatches.length, 3);
+assert.equal(new Set(qualityBatches.flat()).size, 61, "All countries must be queried despite the API's 25-item limit");
+assert.ok(batchPrices.every((option) => option.successRate === 0), "A real 0% must remain distinct from missing statistics");
 await assert.rejects(() => responseClient("{}").getPriceOptions("dr"), /格式不正确/);
 await assert.rejects(() => responseClient("[]").getPriceOptions("dr"), /格式不正确/);
 await assert.rejects(() => responseClient("").getSms("1"), /空响应/);
