@@ -27,12 +27,17 @@ const smsServer = http.createServer((req, res) => {
     res.end(JSON.stringify({ messages }));
     return;
   }
-  const action = url.searchParams.get("action");
+  const isOffers = url.pathname === "/api/v1/activations/offers/sms";
+  const action = isOffers ? "offers" : url.searchParams.get("action");
+  const isHero = isOffers || url.pathname === "/hero/handler_api.php";
   smsActions.push({
+    provider: isHero ? "herosms" : "smsbower",
     action,
     status: url.searchParams.get("status"),
     maxPrice: url.searchParams.get("maxPrice"),
     providerIds: url.searchParams.get("providerIds"),
+    country: url.searchParams.get("country"),
+    fixedPrice: url.searchParams.get("fixedPrice"),
   });
   let body = "BAD_ACTION";
   if (action === "getNumber") {
@@ -43,6 +48,15 @@ const smsServer = http.createServer((req, res) => {
     }
   }
   if (action === "getStatus") body = ++smsChecks < 2 ? "STATUS_WAIT_CODE" : "STATUS_OK:654321";
+  if (isHero && url.searchParams.get("api_key") === "hero-cancel-key" && action === "getStatus") body = "STATUS_WAIT_CODE";
+  if (isOffers) {
+    assert.equal(req.headers.authorization, "ApiKey test-hero-key");
+    assert.equal(url.searchParams.get("services"), "dr");
+    body = JSON.stringify({ data: { dr: {
+      7: { map: { "0.1800": 8 } },
+      16: { map: { "0.4200": 12 } },
+    } } });
+  }
   if (action === "getTopCountriesByService") body = JSON.stringify({
     japan: { 3301: { price: 0.42, count: 12 } },
     malaysia: { 3401: { price: 0.18, count: 8 } },
@@ -51,6 +65,10 @@ const smsServer = http.createServer((req, res) => {
     { id: 350, activate_org_code: "1001", slug: "japan", eng: "Japan", chn: "日本" },
     { id: 71, activate_org_code: "7", slug: "malaysia", eng: "Malaysia", chn: "马来西亚" },
   ] });
+  if (action === "getCountries" && isHero) body = JSON.stringify({
+    7: { id: 7, chn: "马来西亚", eng: "Malaysia" },
+    16: { id: 16, chn: "英国", eng: "England" },
+  });
   if (action === "setStatus") {
     body = { "1": "ACCESS_READY", "6": "ACCESS_ACTIVATION", "8": "ACCESS_CANCEL" }[url.searchParams.get("status")] || "BAD_STATUS";
   }
@@ -70,6 +88,7 @@ const child = spawn(process.execPath, [path.join(projectRoot, "src", "console-se
     ONBOARDING_PROTOCOL_SCRIPT: path.join(projectRoot, "test", "mock-protocol-login.mjs"),
     TOSUB2_TLS_PROFILE: "chrome142",
     SMSBOWER_API_BASE: `http://127.0.0.1:${smsServer.address().port}/handler_api.php`,
+    HERO_SMS_API_BASE: `http://127.0.0.1:${smsServer.address().port}/hero/handler_api.php`,
     SMS_POLL_INTERVAL_MS: "20",
     SMS_POLL_TIMEOUT_MS: "3000",
   },
@@ -86,7 +105,7 @@ const childExit = new Promise((resolve) => child.once("exit", resolve));
 
 try {
   const bootstrap = await waitForJson(`${baseUrl}/api/bootstrap`);
-  assert.deepEqual(bootstrap.features.smsProviders.map((provider) => provider.id), ["luban", "smsbower", "custom"]);
+  assert.deepEqual(bootstrap.features.smsProviders.map((provider) => provider.id), ["luban", "smsbower", "herosms", "custom"]);
   const headers = { "content-type": "application/json", "x-console-token": bootstrap.token };
   const optionsResponse = await fetch(`${baseUrl}/api/sms-providers/smsbower/options`, {
     method: "POST",
@@ -221,6 +240,58 @@ try {
   assert.equal(customCompleted.currentPhone, "+8613711111111");
   assert.equal(customCompleted.smsStatus, "completed");
   assert.ok(customInboxChecks >= 2);
+
+  const heroOptionsResponse = await fetch(`${baseUrl}/api/sms-providers/herosms/options`, {
+    method: "POST", headers,
+    body: JSON.stringify({ config: { apiKey: "test-hero-key" } }),
+  });
+  assert.equal(heroOptionsResponse.status, 200);
+  const heroOptions = await heroOptionsResponse.json();
+  assert.equal(heroOptions.providerId, "herosms");
+  assert.deepEqual(heroOptions.options.map(({ country }) => country), ["7", "16"]);
+  const heroResponse = await fetch(`${baseUrl}/api/jobs`, {
+    method: "POST", headers, body: JSON.stringify({ email: "hero-sms@example.com" }),
+  });
+  assert.equal(heroResponse.status, 201);
+  const hero = await heroResponse.json();
+  await waitForJob(headers, hero.job.id, (job) => job.status === "phone");
+  const heroNumberResponse = await fetch(`${baseUrl}/api/jobs/${hero.job.id}/sms-number`, {
+    method: "POST", headers,
+    body: JSON.stringify({ providerId: "herosms", config: { apiKey: "test-hero-key", country: "7", maxPrice: "0.18", countryLabel: "马来西亚" } }),
+  });
+  assert.equal(heroNumberResponse.status, 200, await heroNumberResponse.text());
+  const heroCompleted = await waitForJob(headers, hero.job.id, (job) => job.status === "completed");
+  assert.equal(heroCompleted.smsProviderId, "herosms");
+  assert.equal(heroCompleted.smsProviderName, "Hero SMS");
+  assert.equal(heroCompleted.smsStatus, "completed");
+  const heroActions = smsActions.filter(({ provider }) => provider === "herosms");
+  assert.ok(heroActions.some((item) => item.action === "getNumber" && item.country === "7" && item.maxPrice === "0.18" && item.fixedPrice === "true" && item.providerIds === null));
+  assert.ok(!heroActions.some((item) => item.action === "setStatus" && item.status === "1"));
+  assert.ok(heroActions.some((item) => item.action === "setStatus" && item.status === "6"));
+  const heroMetadata = await fs.readFile(path.join(outputRoot, hero.job.id, "job-meta.json"), "utf8");
+  assert.equal(heroMetadata.includes("test-hero-key"), false);
+  assert.equal(logs.includes("test-hero-key"), false);
+
+  const cancelResponse = await fetch(`${baseUrl}/api/jobs`, {
+    method: "POST", headers, body: JSON.stringify({ email: "hero-cancel@example.com" }),
+  });
+  const cancelJob = (await cancelResponse.json()).job;
+  await waitForJob(headers, cancelJob.id, (job) => job.status === "phone");
+  const cancelNumberResponse = await fetch(`${baseUrl}/api/jobs/${cancelJob.id}/sms-number`, {
+    method: "POST", headers,
+    body: JSON.stringify({ providerId: "herosms", config: { apiKey: "hero-cancel-key", country: "16", maxPrice: "0.42" } }),
+  });
+  assert.equal(cancelNumberResponse.status, 200);
+  await waitForJob(headers, cancelJob.id, (job) => job.status === "phone_otp");
+  const heroCancelCount = smsActions.filter((item) => item.provider === "herosms" && item.action === "setStatus" && item.status === "8").length;
+  const cancelledResponse = await fetch(`${baseUrl}/api/jobs/${cancelJob.id}/cancel`, { method: "POST", headers, body: "{}" });
+  assert.equal(cancelledResponse.status, 200);
+  await waitForJob(headers, cancelJob.id, (job) => job.status === "canceled");
+  for (let index = 0; index < 50; index += 1) {
+    if (smsActions.filter((item) => item.provider === "herosms" && item.action === "setStatus" && item.status === "8").length > heroCancelCount) break;
+    await delay(20);
+  }
+  assert.equal(smsActions.filter((item) => item.provider === "herosms" && item.action === "setStatus" && item.status === "8").length, heroCancelCount + 1);
   console.log("sms provider console tests passed");
 } catch (error) {
   error.message = `${error.message}\nConsole output:\n${logs}`;

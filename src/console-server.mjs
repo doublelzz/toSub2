@@ -552,6 +552,7 @@ async function handleApi(req, res, requestUrl) {
       smsClient = createSmsProvider(providerOptionsMatch[1], body.config, {
         lubanApiBase: process.env.LUBAN_SMS_API_BASE,
         smsBowerApiBase: process.env.SMSBOWER_API_BASE,
+        heroSmsApiBase: process.env.HERO_SMS_API_BASE,
       });
       if (!smsClient.listNumberOptions) throw httpError(400, "该接码平台不支持价格查询");
       const options = await smsClient.listNumberOptions();
@@ -2126,6 +2127,7 @@ async function acquireSmsNumber(job, providerId, config) {
     smsClient = createSmsProvider(providerId, config, {
       lubanApiBase: process.env.LUBAN_SMS_API_BASE,
       smsBowerApiBase: process.env.SMSBOWER_API_BASE,
+      heroSmsApiBase: process.env.HERO_SMS_API_BASE,
       acquireCustomSmsEntry,
     });
   } catch (error) {
@@ -2333,6 +2335,7 @@ function scheduleSmsNumberRetry(job, reason = "手机号不可用", options = {}
         smsClient = createSmsProvider(job.smsProviderId, job.smsProviderConfig, {
           lubanApiBase: process.env.LUBAN_SMS_API_BASE,
           smsBowerApiBase: process.env.SMSBOWER_API_BASE,
+          heroSmsApiBase: process.env.HERO_SMS_API_BASE,
           acquireCustomSmsEntry,
         });
       } catch (error) {
@@ -2527,7 +2530,7 @@ function restoredSmsState(metadata = {}) {
   const savedRetryIntervalMs = Number(metadata.sms_number_retry_interval_ms);
   return {
     smsProviderId: metadata.sms_provider_id || "luban",
-    smsProviderName: metadata.sms_provider_name || (metadata.sms_provider_id === "smsbower" ? "SMSBower" : "LubanSMS"),
+    smsProviderName: metadata.sms_provider_name || publicSmsProviderDefinitions().find((provider) => provider.id === (metadata.sms_provider_id || "luban"))?.name || "接码平台",
     smsServiceLabel: metadata.sms_service_label || metadata.luban_service_id || null,
     smsOrderId: String(orderId),
     smsNumber: String(number),

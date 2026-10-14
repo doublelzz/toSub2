@@ -205,7 +205,7 @@ try {
     return;
   }
 
-  if (["luban@example.com", "sms-provider@example.com", "custom-sms@example.com", "manual-phone-automation@example.com", "auto-rotate@example.com"].includes(args.email)) {
+  if (["luban@example.com", "sms-provider@example.com", "hero-sms@example.com", "hero-cancel@example.com", "custom-sms@example.com", "manual-phone-automation@example.com", "auto-rotate@example.com"].includes(args.email)) {
     await rl.question("Phone number, E.164 format (p=quit): ");
     console.log("Phone OTP (r=resend, p=change phone, q=quit): ");
     await rl.question("");

@@ -83,7 +83,7 @@ await assert.rejects(
 );
 
 const definitions = publicSmsProviderDefinitions();
-assert.deepEqual(definitions.map((provider) => provider.id), ["luban", "smsbower", "custom"]);
+assert.deepEqual(definitions.map((provider) => provider.id), ["luban", "smsbower", "herosms", "custom"]);
 const provider = createSmsProvider("smsbower", {
   apiKey: "test-api-key",
   service: "dr",

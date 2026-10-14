@@ -1,5 +1,6 @@
 import { createLubanSmsClient } from "./luban-sms.mjs";
 import { createSmsBowerClient } from "./smsbower.mjs";
+import { createHeroSmsClient } from "./hero-sms.mjs";
 import { createCustomSmsClient } from "./custom-sms.mjs";
 
 export const SMS_PROVIDER_DEFINITIONS = [
@@ -25,6 +26,21 @@ export const SMS_PROVIDER_DEFINITIONS = [
       { key: "country", label: "国家与价格", type: "price-select", defaultValue: "1001", summaryKey: "countryLabel" },
       { key: "maxPrice", label: "最高价格", type: "hidden", required: false },
       { key: "providerIds", label: "Gold 供应商", type: "hidden", required: false },
+      { key: "countryLabel", label: "国家名称", type: "hidden", required: false },
+      { key: "maxRotationAttempts", label: "最大取号次数（含首次）", type: "number", defaultValue: "3", min: 1, max: 20, step: 1, required: false },
+      { key: "rotationIntervalSeconds", label: "自动换号间隔（秒）", type: "number", defaultValue: "5", min: 0, max: 600, step: 1, required: false },
+    ],
+  },
+  {
+    id: "herosms",
+    name: "Hero SMS",
+    description: "查询 OpenAI 实时价格和库存后选择国家",
+    optionsEndpoint: "/api/sms-providers/herosms/options",
+    fields: [
+      { key: "apiKey", label: "API Key", type: "password", placeholder: "输入 Hero SMS API Key" },
+      { key: "service", label: "服务代码", type: "hidden", defaultValue: "dr" },
+      { key: "country", label: "国家与价格", type: "price-select", summaryKey: "countryLabel" },
+      { key: "maxPrice", label: "最高价格", type: "hidden" },
       { key: "countryLabel", label: "国家名称", type: "hidden", required: false },
       { key: "maxRotationAttempts", label: "最大取号次数（含首次）", type: "number", defaultValue: "3", min: 1, max: 20, step: 1, required: false },
       { key: "rotationIntervalSeconds", label: "自动换号间隔（秒）", type: "number", defaultValue: "5", min: 0, max: 600, step: 1, required: false },
@@ -101,6 +117,33 @@ export function createSmsProvider(providerIdValue, configValue = {}, options = {
       listNumberOptions: () => client.getPriceOptions(service),
       getSms: (requestId) => client.getSms(requestId),
       markReady: (requestId) => client.markReady(requestId),
+      complete: (requestId) => client.complete(requestId),
+      release: (requestId) => client.release(requestId),
+    };
+  }
+
+  if (providerId === "herosms") {
+    const apiKey = validateApiKey(config.apiKey, "Hero SMS");
+    const service = String(config.service || "dr").trim().toLowerCase();
+    const country = String(config.country ?? "").trim();
+    const maxPrice = String(config.maxPrice ?? "").trim();
+    if (!/^[a-z0-9_]{1,32}$/.test(service)) throw new Error("请输入有效的 Hero SMS 服务代码");
+    if (country && !/^\d{1,5}$/.test(country)) throw new Error("请输入有效的 Hero SMS 国家 ID");
+    if (maxPrice && (!/^\d+(?:\.\d{1,6})?$/.test(maxPrice) || Number(maxPrice) <= 0)) {
+      throw new Error("请重新查询 Hero SMS 国家价格");
+    }
+    const client = createHeroSmsClient({ apiKey, apiBase: options.heroSmsApiBase, fetchImpl: options.fetchImpl });
+    return {
+      id: "herosms",
+      name: "Hero SMS",
+      apiKey,
+      serviceLabel: config.countryLabel || `${service} / ${country}`,
+      getNumber: () => {
+        if (!country || !maxPrice) throw new Error("请先查询并选择 Hero SMS 国家价格");
+        return client.getNumber(service, country, maxPrice);
+      },
+      listNumberOptions: () => client.getPriceOptions(service),
+      getSms: (requestId) => client.getSms(requestId),
       complete: (requestId) => client.complete(requestId),
       release: (requestId) => client.release(requestId),
     };

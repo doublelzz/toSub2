@@ -53,6 +53,10 @@ const SMS_PROVIDER_EXTERNAL_LINKS = {
     href: "https://smsbower.app/cabinet/profile",
     label: "点击获取 API 密钥",
   },
+  herosms: {
+    href: "https://hero-sms.com/cn/api",
+    label: "查看 API 与密钥",
+  },
 };
 const REGION_NAMES = typeof Intl.DisplayNames === "function"
   ? new Intl.DisplayNames(["zh-CN"], { type: "region" })
@@ -102,7 +106,7 @@ function App() {
   const [smsSettingsOpen, setSmsSettingsOpen] = useState(false);
   const [smsSettingsDraft, setSmsSettingsDraft] = useState(readSmsProviderSettings);
   const [smsSettingsError, setSmsSettingsError] = useState("");
-  const [smsNumberOptions, setSmsNumberOptions] = useState([]);
+  const [smsNumberOptionsState, setSmsNumberOptionsState] = useState(null);
   const [smsOptionsLoading, setSmsOptionsLoading] = useState(false);
   const [mailRequestSettings, setMailRequestSettings] = useState(readMailRequestSettings);
   const [mailRequestSettingsDraft, setMailRequestSettingsDraft] = useState(readMailRequestSettings);
@@ -242,6 +246,11 @@ function App() {
     () => resolveSmsProvider(smsProviderDefinitions, smsSettingsDraft),
     [smsProviderDefinitions, smsSettingsDraft],
   );
+  const smsNumberOptions = smsNumberOptionsState?.providerId === draftSmsProvider.id
+    && smsNumberOptionsState.apiKey === draftSmsProvider.config.apiKey
+    && smsNumberOptionsState.service === draftSmsProvider.config.service
+    ? smsNumberOptionsState.options
+    : [];
   const selectedSmsNumberOption = useMemo(
     () => findSmsNumberOption(smsNumberOptions, draftSmsProvider.config),
     [smsNumberOptions, draftSmsProvider.config],
@@ -432,7 +441,7 @@ function App() {
         body: JSON.stringify({ config: resolved.config }),
       });
       const options = Array.isArray(data.options) ? data.options : [];
-      setSmsNumberOptions(options);
+      setSmsNumberOptionsState({ providerId: resolved.id, apiKey: resolved.config.apiKey, service: resolved.config.service, options });
       const current = resolved.config.maxPrice
         ? findSmsNumberOption(options, resolved.config) || options[0]
         : options[0];
@@ -444,7 +453,7 @@ function App() {
         countryLabel: formatSmsCountryName(current),
       });
     } catch (requestError) {
-      setSmsNumberOptions([]);
+      setSmsNumberOptionsState(null);
       setSmsSettingsError(requestError.message);
     } finally {
       setSmsOptionsLoading(false);
@@ -1023,7 +1032,7 @@ function App() {
                                 });
                               }}
                               disabled={!smsNumberOptions.length || smsOptionsLoading}
-                              aria-label="SMSBower 国家与价格"
+                              aria-label={`${draftSmsProvider.name} 国家与价格`}
                             >
                               {!smsNumberOptions.length && (
                                 <option value={draftSmsProvider.config.country || ""}>
