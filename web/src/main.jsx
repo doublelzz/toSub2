@@ -575,6 +575,7 @@ function App() {
     try {
       const emails = parseEmailFilter(filterText);
       setEmailFilter(emails);
+      setFilterText(emails.join("\n"));
       setSelectedJobIds(new Set());
       setExpandedJobId(null);
       setPage(1);
@@ -1397,15 +1398,17 @@ function App() {
                 <X size={18} />
               </button>
             </div>
-            <label className="batch-label" htmlFor="filter-input">每行输入一个完整邮箱地址</label>
+            <label className="batch-label" htmlFor="filter-input">每行输入邮箱，或账号----密码----2fa</label>
             <textarea
               id="filter-input"
               value={filterText}
               onChange={(event) => setFilterText(event.target.value)}
-              placeholder={"name1@icloud.com\nname2@icloud.com"}
+              placeholder={"name1@icloud.com----密码----2fa\nname2@icloud.com"}
               spellCheck="false"
+              aria-describedby="filter-hint"
               autoFocus
             />
+            <div id="filter-hint" className="dialog-hint">自动提取每行的邮箱并去重，支持与纯邮箱混合粘贴。</div>
             {filterError && <div className="dialog-error" role="alert"><CircleAlert size={15} />{filterError}</div>}
             <div className="dialog-footer">
               <button type="button" className="cancel-button" onClick={() => setFilterOpen(false)}>取消</button>
@@ -2136,8 +2139,9 @@ function countBatchLines(value) {
 function parseEmailFilter(value) {
   const lines = String(value || "")
     .split(/\r?\n/)
-    .map((line) => line.trim().toLowerCase())
-    .filter(Boolean);
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => line.split("----", 1)[0].trim().toLowerCase());
   if (!lines.length) throw new Error("请至少输入一个筛选邮箱");
   if (lines.length > 500) throw new Error("一次最多筛选 500 个邮箱");
   lines.forEach((email, index) => {
