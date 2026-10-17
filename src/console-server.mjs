@@ -13,6 +13,7 @@ import { createCredentialStore } from "./credential-store.mjs";
 import { createMfaWorkspace } from "./mfa-workspace.mjs";
 import { matchesTaskQuery, normalizeTaskQuery, summarizeTasks } from "./task-query.mjs";
 import { ACCOUNT_SESSION_FILENAME, loadAccountInsights, publicAccountInsights } from "./account-insights.mjs";
+import { phoneVerificationStatus, recordSmsOrder, publicSmsSummary } from "./sms-orders.mjs";
 import {
   fetchMailboxOtpCandidates,
   filterMailboxOtpCandidatesByRequestTime,
@@ -291,17 +292,19 @@ async function handleApi(req, res, requestUrl) {
     const hasCredentialUpdate = ["password", "mailApiUrl", "mailRequestBody", "totpSecret"].some((key) => Object.hasOwn(body, key));
     const credentials = normalizeLoginCredentials(body);
     const hasProxyUpdate = Object.hasOwn(body, "proxyUrl");
-    const hasPhoneBindingUpdate = Object.hasOwn(body, "phoneBindingEnabled");
-    const phoneBindingEnabled = normalizePhoneBinding(body.phoneBindingEnabled);
+    const hasPhoneBindingUpdate = Object.hasOwn(body, "phoneBindingEnabled") || Object.hasOwn(body, "phoneBindingMode");
+    const phoneOptions = normalizePhoneOptions(body);
+    const { phoneBindingEnabled } = phoneOptions;
     const proxyUrl = hasProxyUpdate ? normalizeProxyUrl(body.proxyUrl) : null;
     const result = await withEmailJobLock(email, async () => {
       const existing = findJobByEmail(email);
       if (existing) {
-        if (hasCredentialUpdate || hasPhoneBindingUpdate) await updateJobCredentials(existing, hasCredentialUpdate ? credentials : { preserveExistingCredentials: true }, { proxyUrl, hasProxyUpdate, ...(hasPhoneBindingUpdate ? { phoneBindingEnabled } : {}) });
+        if (hasCredentialUpdate || hasPhoneBindingUpdate) await updateJobCredentials(existing, hasCredentialUpdate ? credentials : { preserveExistingCredentials: true }, { proxyUrl, hasProxyUpdate, ...(hasPhoneBindingUpdate ? phoneOptions : {}) });
+        if (hasPhoneBindingUpdate) await savePhoneOptions(existing, phoneOptions);
         else if (hasProxyUpdate) await updateJobProxy(existing, proxyUrl);
         return { job: existing, created: false, updated: hasCredentialUpdate || hasProxyUpdate || hasPhoneBindingUpdate };
       }
-      return { job: await startJob(email, credentials, proxyUrl, phoneBindingEnabled), created: true, updated: false };
+      return { job: await startJob(email, credentials, proxyUrl, phoneBindingEnabled, phoneOptions), created: true, updated: false };
     });
     sendJson(res, result.created ? 201 : 200, { ...result, job: publicJob(result.job) });
     return;
@@ -311,14 +314,17 @@ async function handleApi(req, res, requestUrl) {
     const body = await readJson(req);
     const entries = parseBatchEntries(body.text, mailRequestConfig);
     const proxyUrl = normalizeProxyUrl(body.proxyUrl);
-    const phoneBindingEnabled = normalizePhoneBinding(body.phoneBindingEnabled);
+    const phoneOptions = normalizePhoneOptions(body);
+    const { phoneBindingEnabled } = phoneOptions;
     const results = await Promise.all(entries.map((entry) => withEmailJobLock(entry.email, async () => {
       const existing = findJobByEmail(entry.email);
       if (existing) {
-        await updateJobCredentials(existing, entry, { proxyUrl, hasProxyUpdate: true, ...(Object.hasOwn(body, "phoneBindingEnabled") ? { phoneBindingEnabled } : {}) });
+        const hasPolicy = Object.hasOwn(body, "phoneBindingEnabled") || Object.hasOwn(body, "phoneBindingMode");
+        await updateJobCredentials(existing, entry, { proxyUrl, hasProxyUpdate: true, ...(hasPolicy ? phoneOptions : {}) });
+        if (hasPolicy) await savePhoneOptions(existing, phoneOptions);
         return { job: existing, updated: true };
       }
-      return { job: await startJob(entry.email, entry, proxyUrl, phoneBindingEnabled), updated: false };
+      return { job: await startJob(entry.email, entry, proxyUrl, phoneBindingEnabled, phoneOptions), updated: false };
     })));
     sendJson(res, 201, {
       jobs: results.map((item) => publicJob(item.job)),
@@ -564,7 +570,7 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
-  const match = /^\/api\/jobs\/([a-f0-9-]+)(?:\/(input|cancel|retry|regenerate|relogin|setup-2fa|add-password|account-insights|logs|download|sms-number|luban-number))?$/.exec(requestUrl.pathname);
+  const match = /^\/api\/jobs\/([a-f0-9-]+)(?:\/(input|cancel|retry|regenerate|relogin|setup-2fa|add-password|account-insights|logs|download|start-phone|sms-number|luban-number))?$/.exec(requestUrl.pathname);
   if (!match) {
     sendJson(res, 404, { error: "Not found" });
     return;
@@ -577,11 +583,29 @@ async function handleApi(req, res, requestUrl) {
   }
 
   const action = match[2];
+  if (req.method === "POST" && action === "start-phone") {
+    const body = await readJson(req);
+    await withEmailJobLock(job.email, async () => {
+      assertMfaIdle(job.email);
+      if (!canStartPhoneBinding(job)) throw httpError(409, "请等待登录完成；正在接码或手机已验证的任务无需重复取号");
+      const setup = validatedSmsSetup(body.smsProvider);
+      await writeSmsSetup(job, setup);
+      job.phoneBindingEnabled = true;
+      job.phoneBindingRequested = true;
+      job.phoneBindingStartedAt ||= new Date().toISOString();
+      await retryJob(job);
+      recordJobOperation(job, "start_phone");
+      await saveJobMetadata(job);
+    });
+    sendJson(res, 200, { job: publicJob(job) });
+    return;
+  }
   if (req.method === "POST" && action === "account-insights") {
     await withEmailJobLock(job.email, async () => {
       assertMfaIdle(job.email);
       if (!canCheckAccountInsights(job)) throw httpError(409, "请等待授权或登录会话检测完成后再检测额度");
       job.accountInsightsReturnStatus = job.status;
+      job.accountInsightsReturnPrompt = job.prompt;
       job.accountInsightsError = null;
       job.accountInsightsStartedAt = new Date().toISOString();
       job.parserTail = "";
@@ -762,19 +786,63 @@ async function syncMfaCredentials(email, credentials) {
 
 function normalizePhoneBinding(value) {
   if (value !== undefined && typeof value !== "boolean") throw httpError(400, "是否接码必须为开关值");
-  return value !== false;
+  return value === true;
+}
+
+function validatedSmsSetup(value) {
+  if (!value || typeof value !== "object") throw httpError(400, "请先完成接码平台配置");
+  try {
+    const client = createSmsProvider(value.id, value.config, { acquireCustomSmsEntry });
+    if (!client) throw new Error("接码平台配置无效");
+    normalizeSmsNumberRetryConfig(value.config);
+    return { id: client.id, config: value.config };
+  } catch (error) { throw httpError(400, safeSmsProviderError(error, value.config?.apiKey)); }
+}
+
+function normalizePhoneOptions(body) {
+  const hasMode = Object.hasOwn(body, "phoneBindingMode");
+  const hasLegacyFlag = Object.hasOwn(body, "phoneBindingEnabled");
+  const legacyEnabled = hasLegacyFlag ? normalizePhoneBinding(body.phoneBindingEnabled) : true;
+  // API callers that predate the strategy field retain the old automatic flow.
+  const phoneBindingMode = body.phoneBindingMode ?? (hasLegacyFlag ? (legacyEnabled ? "automatic" : "manual") : "automatic");
+  if (!["manual", "automatic"].includes(phoneBindingMode)) throw httpError(400, "接码策略无效");
+  return { phoneBindingMode,
+    phoneBindingEnabled: hasMode ? phoneBindingMode === "automatic" : legacyEnabled,
+    smsSetup: phoneBindingMode === "automatic" && body.smsProvider ? validatedSmsSetup(body.smsProvider) : null };
+}
+
+async function writeSmsSetup(job, setup) {
+  const target = path.join(path.dirname(job.outputPath), "sms-provider.json");
+  await fs.writeFile(target, JSON.stringify(setup), { mode: 0o600 });
+}
+
+async function savePhoneOptions(job, options) {
+  job.phoneBindingMode = options.phoneBindingMode;
+  job.phoneBindingRequested = false;
+  await writeSmsSetup(job, options.smsSetup);
+  await saveJobMetadata(job);
+}
+
+function canStartPhoneBinding(job) {
+  return !job.child && !isActive(job.status) && phoneVerificationStatus(job) !== "verified"
+    && (job.loginCheckpointAvailable || job.accountSessionAvailable || job.status === "phone_skipped");
 }
 
 function accountInsightsPath(job) {
-  return job.status === "phone_skipped" || job.accountInsightsReturnStatus === "phone_skipped"
-    ? path.join(path.dirname(job.outputPath), ACCOUNT_SESSION_FILENAME) : job.outputPath;
+  return job.resultSaved || job.status === "completed" ? job.outputPath : path.join(path.dirname(job.outputPath), ACCOUNT_SESSION_FILENAME);
+}
+
+async function loadJobInsights(job) {
+  return await loadAccountInsights(accountInsightsPath(job), job.email, { allowHistorical: true })
+    || await loadAccountInsights(path.join(path.dirname(job.outputPath), ACCOUNT_SESSION_FILENAME), job.email, { allowHistorical: true })
+    || job.accountInsights || null;
 }
 
 function canCheckAccountInsights(job) {
-  return (job.status === "completed" && Boolean(job.resultSaved)) || job.status === "phone_skipped";
+  return !isActive(job.status) && !job.child && (Boolean(job.resultSaved) || job.accountSessionAvailable || job.status === "phone_skipped");
 }
 
-async function startJob(email, credentials = {}, proxyUrl = null, phoneBindingEnabled = true) {
+async function startJob(email, credentials = {}, proxyUrl = null, phoneBindingEnabled = false, phoneOptions = {}) {
   assertMfaIdle(email);
   const { loginMode, mailApiUrl, mailRequestBody, password, totpSecret } = normalizeLoginCredentials(credentials);
   await saveStoredLoginCredentials(email, { password, totpSecret, proxyUrl });
@@ -808,6 +876,12 @@ async function startJob(email, credentials = {}, proxyUrl = null, phoneBindingEn
     resultSaved: false,
     loginMode,
     phoneBindingEnabled,
+    phoneBindingMode: phoneOptions.phoneBindingMode || "manual",
+    phoneBindingRequested: false,
+    phoneBindingStartedAt: null,
+    phoneVerifiedAt: null,
+    smsOrders: [],
+    accountSessionAvailable: false,
     password,
     totpSecret,
     hasPasswordCredential: Boolean(password),
@@ -869,6 +943,7 @@ async function startJob(email, credentials = {}, proxyUrl = null, phoneBindingEn
   };
   beginAuthorizationAutomationAttempt(job, "initial");
   jobs.set(id, job);
+  await writeSmsSetup(job, phoneOptions.smsSetup || null);
   await saveJobMetadata(job);
   scheduleQueuedJobs();
   return job;
@@ -911,6 +986,9 @@ function scheduleQueuedJobs() {
 
 async function prepareAndLaunchJob(job, mode, queueRunId) {
   try {
+    if (mode === "full" && (job.phoneBindingRequested || job.phoneBindingMode === "automatic")) {
+      try { job.pendingSmsSetup = JSON.parse(await fs.readFile(path.join(path.dirname(job.outputPath), "sms-provider.json"), "utf8")); } catch { job.pendingSmsSetup = null; }
+    }
     if (["full", "totp_setup", "password_add"].includes(mode) && job.mailApiUrl) await loadMailboxBaseline(job);
     if (!isActive(job.status) || job.status === "queued" || job.queueRunId !== queueRunId) return;
     launchJob(job, { mode });
@@ -951,7 +1029,6 @@ function launchJob(job, options = {}) {
   job.mailOtpRequestedAt = null;
   if (["full", "refresh"].includes(mode)) {
     job.phoneBindingSkipped = false;
-    job.accountInsights = null;
     job.accountInsightsError = null;
   }
   const args = mode === "account_insights"
@@ -1044,6 +1121,7 @@ function launchJob(job, options = {}) {
 
 async function handleChildClose(job, { code, signal, mode, runId }) {
   if (job.runId !== runId) return;
+  job.accountInsightsDetecting = false;
   stopMailPolling(job);
   job.child = null;
   if (mode === "account_insights") {
@@ -1068,8 +1146,8 @@ async function handleChildClose(job, { code, signal, mode, runId }) {
   }
   if (code === 0 && job.phoneBindingEnabled === false && job.phoneBindingSkipped) {
     job.status = "phone_skipped";
-    job.prompt = "已跳过接码，账号信息检测已结束；服务端要求手机号，新的 OAuth 授权尚未完成";
-    job.accountInsights = await loadAccountInsights(accountInsightsPath(job), job.email);
+    job.prompt = "待接码；账号信息已保留，点击开始接码继续授权";
+    job.accountInsights = await loadJobInsights(job);
     job.accountInsightsError = job.accountInsights ? null : "账号信息未检测成功，可点击检测额度重试";
     job.loginCheckpointAvailable = await fileExists(job.checkpointPath);
     job.lastError = null;
@@ -1082,7 +1160,7 @@ async function handleChildClose(job, { code, signal, mode, runId }) {
     return;
   }
   if (code === 0 && job.resultSaved && (await fileExists(job.outputPath))) {
-    job.accountInsights = await loadAccountInsights(job.outputPath, job.email);
+    job.accountInsights = await loadJobInsights(job);
     job.accountInsightsError = job.accountInsights ? null : "账号信息未检测成功，可点击检测额度重试";
     if (mode === "full") completeAuthorizationAutomationAttempt(job);
     job.loginCheckpointAvailable = false;
@@ -1132,7 +1210,7 @@ function handleChildCloseFailure(job, mode, runId, error) {
 }
 
 async function finishAccountInsights(job, error = null) {
-  job.accountInsights = await loadAccountInsights(accountInsightsPath(job), job.email);
+  job.accountInsights = await loadJobInsights(job);
   const fresh = job.accountInsights && Date.parse(job.accountInsights.checkedAt) >= Date.parse(job.accountInsightsStartedAt || 0);
   job.accountInsightsError = error || job.accountInsightsError || (!fresh ? "账号信息未检测成功，请稍后重试" : null);
   restoreAccountInsightsStatus(job);
@@ -1147,7 +1225,8 @@ async function finishAccountInsights(job, error = null) {
 
 function restoreAccountInsightsStatus(job) {
   job.status = job.accountInsightsReturnStatus || (job.resultSaved ? "completed" : "phone_skipped");
-  job.prompt = job.status === "phone_skipped" ? "已跳过接码，可查看账号信息；新的 OAuth 授权尚未完成" : "授权完成，可以下载导入文件";
+  job.prompt = job.accountInsightsReturnPrompt || (job.status === "phone_skipped" ? "待接码；账号信息已保留，点击开始接码继续授权" : job.resultSaved ? "授权完成，可以下载导入文件" : "流程已停止，账号信息已保留");
+  job.accountInsightsReturnPrompt = null;
   job.accountInsightsReturnStatus = null;
 }
 
@@ -1161,8 +1240,7 @@ async function retryJob(job, options = {}) {
     job.proxyUrl = normalizeProxyUrl(options.proxyUrl);
     const persisted = await saveStoredLoginCredentials(job.email, job);
   }
-  const resumingCheckpoint = ["resume_available", "phone_skipped"].includes(job.status)
-    || (retryingSecurityCheck && await fileExists(job.checkpointPath));
+  const resumingCheckpoint = await fileExists(job.checkpointPath);
   stopMailPolling(job);
   if (resumingCheckpoint) stopSmsPolling(job);
   else releaseSmsNumber(job, "idle");
@@ -1641,6 +1719,21 @@ function consumeOutput(job, rawText) {
   const scan = `${job.parserTail}${text}`;
   job.parserTail = scan.slice(-2_000);
   if (scan.includes("[phone-skipped]")) job.phoneBindingSkipped = true;
+  if (scan.includes("[account-session-saved]")) {
+    job.accountSessionAvailable = true;
+    void saveJobMetadata(job).catch(() => {});
+  }
+  if (text.includes("[account-insights] 正在检测")) job.accountInsightsDetecting = true;
+  if (scan.includes("[account-insights-saved]") || scan.includes("[account-insights-failed]")) {
+    job.accountInsightsDetecting = false;
+    const runId = job.runId;
+    const sequence = job.insightsLoadSequence = (job.insightsLoadSequence || 0) + 1;
+    void loadJobInsights(job).then(snapshot => {
+      if (job.deleted || job.runId !== runId || job.insightsLoadSequence !== sequence) return;
+      job.accountInsights = snapshot;
+      touch(job);
+    }).catch(() => {});
+  }
   if (job.runMode === "account_insights") {
     if (scan.includes("[account-insights-failed]") || scan.includes("[error]")) job.accountInsightsError = "检测失败，请检查代理或稍后重试";
     touch(job);
@@ -1851,6 +1944,7 @@ function consumeOutput(job, rawText) {
     }
   }
   if (scan.includes("[ok] Phone OTP validated")) {
+    job.phoneVerifiedAt ||= new Date().toISOString();
     completeSmsNumber(job);
   }
   if (scan.includes("[5/5] Select workspace") || scan.includes("[6/6] Convert OAuth callback")) {
@@ -1862,6 +1956,22 @@ function consumeOutput(job, rawText) {
   if (scan.includes("[ok] Saved sub2api import:")) {
     job.resultSaved = true;
     setStage(job, "finalizing", "导入文件已生成，正在收尾");
+  }
+  if (job.status === "phone" && job.pendingSmsSetup && !job.smsNumberAcquisitionPromise) {
+    const setup = job.pendingSmsSetup;
+    const runId = job.runId;
+    job.pendingSmsSetup = null;
+    void withEmailJobLock(job.email, async () => {
+      if (job.runId !== runId || job.status !== "phone") return;
+      job.phoneBindingStartedAt ||= new Date().toISOString();
+      job.phoneBindingRequested = true;
+      await acquireSmsNumber(job, setup.id, setup.config);
+    }).catch(error => {
+      if (job.runId !== runId) return;
+      job.smsError = safeSmsProviderError(error, setup.config?.apiKey);
+      job.smsStatus = "error";
+      touch(job);
+    });
   }
   if (scan.includes("[account-insights] 正在检测")) setStage(job, "finalizing", "正在检测额度、订阅和重置次数");
   if (scan.includes("[ok] Account password added and saved securely")) {
@@ -2135,6 +2245,8 @@ async function acquireSmsNumber(job, providerId, config) {
   }
 
   const retryConfig = normalizeSmsNumberRetryConfig(config);
+  job.phoneBindingStartedAt ||= new Date().toISOString();
+  job.phoneBindingRequested = true;
   releaseSmsNumber(job, "idle");
   job.smsProviderConfig = { ...config };
   job.smsClient = smsClient;
@@ -2214,6 +2326,7 @@ async function runSmsNumberAcquisition(job, token) {
 async function acquireSmsNumberAttempt(job, token) {
   if (job.smsNumberAcquisitionToken !== token || job.status !== "phone" || !job.child) return "stopped";
   const smsClient = job.smsClient;
+  const providerConfig = job.smsProviderConfig;
   if (!smsClient) return "stopped";
   job.smsNumberAttempt += 1;
   const attempt = job.smsNumberAttempt;
@@ -2226,8 +2339,13 @@ async function acquireSmsNumberAttempt(job, token) {
   let order = null;
   try {
     order = await smsClient.getNumber();
+    const history = recordSmsOrder({ ...job, smsOrders: job.smsOrders ||= [], smsProviderId: smsClient.id, smsProviderName: smsClient.name, smsProviderConfig: providerConfig }, order);
+    await saveJobMetadata(job);
     if (job.smsNumberAcquisitionToken !== token || job.status !== "phone" || !job.child) {
-      void smsClient.release(order.requestId).catch(() => {});
+      history.status = "cancel_pending";
+      history.endedAt = new Date().toISOString();
+      await smsClient.release(order.requestId).then(() => { history.status = "cancel_requested"; }, () => { history.status = "cancel_failed"; });
+      await saveJobMetadata(job);
       return "stopped";
     }
     job.smsOrderId = order.requestId;
@@ -2464,6 +2582,11 @@ function releaseSmsNumber(job, nextStatus = "idle", errorMessage = null, options
 function releaseSmsOrder(job, nextStatus = "idle", errorMessage = null) {
   const requestId = job.smsOrderId;
   const smsClient = job.smsClient;
+  const history = job.smsOrders?.find(order => order.orderId === requestId && order.providerId === job.smsProviderId);
+  if (history && !history.verifiedAt) {
+    history.status = "cancel_pending";
+    history.endedAt = new Date().toISOString();
+  }
   stopSmsPolling(job);
   job.smsOrderId = null;
   job.smsNumber = null;
@@ -2471,9 +2594,14 @@ function releaseSmsOrder(job, nextStatus = "idle", errorMessage = null) {
   job.smsStatus = nextStatus;
   job.smsError = errorMessage;
   if (requestId && smsClient) {
-    void smsClient.release(requestId).catch(() => {
+    void smsClient.release(requestId).then(() => {
+      if (history) history.status = "cancel_requested";
+      return saveJobMetadata(job);
+    }).catch(() => {
+      if (history) history.status = "cancel_failed";
       const providerName = job.smsProviderName || smsClient.name || "接码平台";
       appendJobLog(job, `[sms] ${providerName} 号码释放请求失败，请在平台控制台检查订单。\n`);
+      void saveJobMetadata(job).catch(() => {});
     });
   }
 }
@@ -2482,6 +2610,12 @@ function completeSmsNumber(job) {
   const requestId = job.smsOrderId;
   const smsClient = job.smsClient;
   if (!requestId || !smsClient) return;
+  const history = job.smsOrders?.find(order => order.orderId === requestId && order.providerId === job.smsProviderId);
+  if (history) {
+    history.verifiedAt = job.phoneVerifiedAt || new Date().toISOString();
+    history.endedAt = new Date().toISOString();
+    history.status = smsClient.complete ? "complete_pending" : "verified";
+  }
   stopSmsPolling(job);
   job.smsOrderId = null;
   job.smsClient = null;
@@ -2490,9 +2624,14 @@ function completeSmsNumber(job) {
   job.smsError = null;
   appendJobLog(job, `[sms] 手机验证码已通过，正在完成 ${smsClient.name} 订单。\n`);
   if (smsClient.complete) {
-    void smsClient.complete(requestId).catch((error) => {
+    void smsClient.complete(requestId).then(() => {
+      if (history) history.status = "completed";
+      return saveJobMetadata(job);
+    }).catch((error) => {
+      if (history) history.status = "complete_failed";
       appendJobLog(job, `[sms] ${smsClient.name} 完成订单失败：${safeSmsProviderError(error)}\n`);
       touch(job);
+      void saveJobMetadata(job).catch(() => {});
     });
   }
   touch(job);
@@ -2669,7 +2808,7 @@ async function submitJobInput(job, body, options = {}) {
 }
 
 async function cancelJob(job) {
-  if (!isActive(job.status)) return;
+  if (!isActive(job.status) && job.status !== "phone_skipped") return;
   if (job.runMode === "account_insights" || job.queuedMode === "account_insights") {
     job.runId = crypto.randomUUID();
     job.child?.kill("SIGTERM");
@@ -2711,11 +2850,16 @@ async function cancelJob(job) {
     return;
   }
   stopMailPolling(job);
+  job.runId = crypto.randomUUID();
+  job.queueRunId = null;
+  job.pendingSmsSetup = null;
+  job.accountInsightsDetecting = false;
   releaseSmsNumber(job, "idle");
   job.status = "canceled";
-  job.prompt = "流程已取消";
+  job.prompt = "本次流程已取消，已检测的账号信息仍可查看";
   job.child?.kill("SIGTERM");
   job.child = null;
+  job.accountInsights = await loadJobInsights(job);
   touch(job);
   void saveJobMetadata(job).catch(() => {});
   scheduleQueuedJobs();
@@ -3415,6 +3559,10 @@ function publicJob(job) {
     email: job.email,
     status: job.status,
     phoneBindingEnabled: job.phoneBindingEnabled !== false,
+    phoneBindingMode: job.phoneBindingMode || "manual",
+    phoneVerificationStatus: phoneVerificationStatus(job),
+    canStartPhoneBinding: canStartPhoneBinding(job),
+    smsSummary: publicSmsSummary(job),
     prompt: job.status === "queued"
       ? `排队中，前方还有 ${Math.max(0, getQueuePosition(job) - 1)} 条任务`
       : job.prompt,
@@ -3427,7 +3575,7 @@ function publicJob(job) {
     canDownload: Boolean(job.resultSaved),
     accountInsights: publicAccountInsights(job.accountInsights),
     accountInsightsError: job.accountInsightsError || null,
-    accountInsightsChecking: job.status === "checking_account" || (job.status === "queued" && job.queuedMode === "account_insights"),
+    accountInsightsChecking: Boolean(job.accountInsightsDetecting) || job.status === "checking_account" || (job.status === "queued" && job.queuedMode === "account_insights"),
     canCheckAccountInsights: canCheckAccountInsights(job),
     loginMode: job.loginMode || (job.mailApiUrl ? "email_otp" : "manual"),
     hasTotpKey: Boolean(job.totpSecret || job.hasTotpCredential),
@@ -4230,7 +4378,17 @@ function restoredCredentialFlags(metadata = {}, credentials = {}) {
   const hasExplicitPasswordFlag = Object.hasOwn(metadata, "has_password");
   const hasExplicitTotpFlag = Object.hasOwn(metadata, "has_totp_key");
   return {
-    phoneBindingEnabled: metadata.phone_binding_enabled !== false,
+    phoneBindingMode: Object.hasOwn(metadata, "phone_binding_mode")
+      ? (metadata.phone_binding_mode === "automatic" ? "automatic" : "manual")
+      : (metadata.phone_binding_enabled === false ? "manual" : "automatic"),
+    phoneBindingEnabled: Object.hasOwn(metadata, "phone_binding_mode")
+      ? (metadata.phone_binding_mode === "automatic" || metadata.phone_binding_requested === true)
+      : metadata.phone_binding_enabled !== false,
+    phoneBindingRequested: metadata.phone_binding_requested === true,
+    phoneBindingStartedAt: metadata.phone_binding_started_at || null,
+    phoneVerifiedAt: metadata.phone_verified_at || (metadata.sms_status === "completed" ? metadata.updated_at : null),
+    smsOrders: Array.isArray(metadata.sms_orders) ? metadata.sms_orders : [],
+    accountSessionAvailable: metadata.account_session_available === true || metadata.status === "phone_skipped",
     hasPasswordCredential: Boolean(
       credentials.password
       || (hasExplicitPasswordFlag ? metadata.has_password : metadata.login_mode === "password" && metadata.has_stored_credentials),
@@ -4827,6 +4985,12 @@ async function saveJobMetadata(job) {
         last_operation_type: job.lastOperationType || "initial_authorization",
         login_mode: job.loginMode || null,
         phone_binding_enabled: job.phoneBindingEnabled !== false,
+        phone_binding_mode: job.phoneBindingMode || "manual",
+        phone_binding_requested: Boolean(job.phoneBindingRequested),
+        phone_binding_started_at: job.phoneBindingStartedAt || null,
+        phone_verified_at: job.phoneVerifiedAt || null,
+        sms_orders: job.smsOrders || [],
+        account_session_available: Boolean(job.accountSessionAvailable),
         account_insights_return_status: job.accountInsightsReturnStatus || null,
         mail_api_url: job.mailApiUrl || null,
         mail_request_body: job.mailRequestBody || null,

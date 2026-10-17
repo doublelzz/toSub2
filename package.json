@@ -14,7 +14,8 @@
     "check:account-insights": "node --check src/account-insights.mjs && node test/account-insights.mjs && node test/account-insights-console-smoke.mjs",
     "check:sms": "node --check src/hero-sms.mjs && node test/hero-sms.mjs && node test/sms-providers.mjs && node test/sms-provider-console-smoke.mjs && node test/sms-price-selector.mjs",
     "check:ui": "node test/task-query.mjs && node test/task-query-console.mjs",
-    "check:phone-binding": "node test/phone-binding-console.mjs"
+    "check:phone-binding": "node test/phone-binding-console.mjs",
+    "check:sms-orders": "node test/sms-orders.mjs"
   },
   "keywords": [
     "chatgpt",

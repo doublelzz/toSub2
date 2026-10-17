@@ -67,7 +67,7 @@ const REGION_NAMES = typeof Intl.DisplayNames === "function"
 function PhoneBindingOption({ enabled, onChange, disabled }) {
   return <label className="phone-binding-option">
     <input type="checkbox" role="switch" checked={enabled} onChange={(event) => onChange(event.target.checked)} disabled={disabled} aria-label="允许手机号接码" />
-    <span><strong>允许手机号接码</strong><small>{enabled ? "需要验证手机号时，可取号或手动填写手机号，继续授权。" : "不取号、不提交手机号；继续检测额度、Plus 到期和重置次数。若服务端要求手机号，保留登录状态并标记授权未完成。"}</small></span>
+    <span><strong>登录后自动接码</strong><small>{enabled ? "登录后先检测额度，再自动申请手机号继续授权。" : "登录后先检测额度；需要手机号时，在任务列表点击开始接码。"}</small></span>
   </label>;
 }
 
@@ -77,7 +77,7 @@ function App() {
   const [singleOpen, setSingleOpen] = useState(false);
   const [filters, setFilters] = useState(DEFAULT_FILTERS);
   const [phoneTab, setPhoneTab] = useState("all");
-  const [phoneBindingEnabled, setPhoneBindingEnabled] = useState(true);
+  const [phoneBindingEnabled, setPhoneBindingEnabled] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [connectionAttempt, setConnectionAttempt] = useState(0);
   const [density, setDensity] = useState(() => readLocalTextSetting("tosub2.density") === "compact" ? "compact" : "comfortable");
@@ -452,6 +452,7 @@ function App() {
       updateSmsProviderConfig(resolved.id, {
         country: current.country,
         maxPrice: String(current.price),
+        quotedPrice: String(current.price),
         providerIds: current.providerIds || "",
         countryLabel: formatSmsCountryName(current),
       });
@@ -470,6 +471,7 @@ function App() {
       gradeFilter,
       country: current?.country || "",
       maxPrice: current ? String(current.price) : "",
+      quotedPrice: current ? String(current.price) : "",
       providerIds: current?.providerIds || "",
       countryLabel: current ? formatSmsCountryName(current) : "",
     });
@@ -555,9 +557,10 @@ function App() {
     if (!email.trim() || busy) return;
     setBusy(true);
     try {
+      const smsProvider = phoneBindingEnabled && activeSmsProvider.ready ? { id: activeSmsProvider.id, config: activeSmsProvider.config } : undefined;
       await apiFetch(token, "/api/jobs", {
         method: "POST",
-        body: JSON.stringify({ email: email.trim(), proxyUrl: accountProxyUrl.trim(), phoneBindingEnabled }),
+        body: JSON.stringify({ email: email.trim(), proxyUrl: accountProxyUrl.trim(), phoneBindingMode: phoneBindingEnabled ? "automatic" : "manual", phoneBindingEnabled, ...(smsProvider ? { smsProvider } : {}) }),
       });
       setPage(1);
       setPhoneTab(phoneBindingEnabled ? "enabled" : "disabled");
@@ -577,9 +580,10 @@ function App() {
     if (!batchText.trim() || batchBusy) return;
     setBatchBusy(true);
     try {
+      const smsProvider = phoneBindingEnabled && activeSmsProvider.ready ? { id: activeSmsProvider.id, config: activeSmsProvider.config } : undefined;
       await apiFetch(token, "/api/jobs/batch", {
         method: "POST",
-        body: JSON.stringify({ text: batchText, proxyUrl: accountProxyUrl.trim(), phoneBindingEnabled }),
+        body: JSON.stringify({ text: batchText, proxyUrl: accountProxyUrl.trim(), phoneBindingMode: phoneBindingEnabled ? "automatic" : "manual", phoneBindingEnabled, ...(smsProvider ? { smsProvider } : {}) }),
       });
       setPage(1);
       setPhoneTab(phoneBindingEnabled ? "enabled" : "disabled");
@@ -926,7 +930,7 @@ function App() {
           <div className="list-heading"><strong>任务列表</strong><span aria-live="polite">匹配 {pagination.total} 条{emailFilter.length ? ` · 精确邮箱 ${emailFilter.length} 个` : ""}</span><div>{features.cancelAll && <button type="button" className="selection-text-button" onClick={cancelAllRunningJobs} disabled={!(stats.active || stats.queued) || Boolean(batchAction)} title="停止所有运行和排队任务，不受当前筛选影响"><Ban size={14} />停止全部</button>}<button type="button" className="selection-text-button" onClick={clearFilters} disabled={!hasFilters(filters) && !emailFilter.length}>清除筛选</button></div></div>
           <table className="authorization-table"><thead><tr>
             <th className="select-heading"><input type="checkbox" checked={allPageSelected} onChange={toggleAllOnPage} disabled={!features.bulkActions || !pageJobIds.length} aria-label="选择当前页全部任务" /></th>
-            <th>账号</th><th>状态与进度</th><th>额度与订阅</th><th>时间</th><th className="actions-heading">操作</th>
+            <th>账号</th><th>状态与进度</th><th>额度与订阅</th><th>接码与费用</th><th>时间</th><th className="actions-heading">操作</th>
           </tr></thead><tbody>
             {!jobs.length && <EmptyState filtered={hasFilters(filters) || emailFilter.length > 0} loaded={loaded} onCreate={() => setSingleOpen(true)} onClear={clearFilters} />}
             {jobs.map((job) => <JobRow key={job.id}
@@ -1030,7 +1034,7 @@ function App() {
                     <SmsPriceSelector key={`${draftSmsProvider.id}-${field.key}`} provider={draftSmsProvider} options={smsNumberOptions} loading={smsOptionsLoading}
                       onGradeChange={changeSmsGrade}
                       onRefresh={() => loadSmsNumberOptions()} countryName={formatSmsCountryName} onSelect={(selected) => updateSmsProviderConfig(draftSmsProvider.id, {
-                        country: selected.country, maxPrice: String(selected.price), providerIds: selected.providerIds || "", countryLabel: formatSmsCountryName(selected),
+                        country: selected.country, maxPrice: String(selected.price), quotedPrice: String(selected.price), providerIds: selected.providerIds || "", countryLabel: formatSmsCountryName(selected),
                       })} />
                   ) : (
                     <label key={field.key} className={`settings-field ${field.type === "textarea" ? "wide-settings-field" : ""}`}>
@@ -1510,7 +1514,7 @@ function App() {
 }
 
 function EmptyState({ filtered = false, loaded, onCreate, onClear }) {
-  return <tr><td colSpan="6"><div className="empty-state"><div><Mail size={24} /></div><h3>{!loaded ? "正在读取任务" : filtered ? "没有匹配的任务" : "暂无授权任务"}</h3><p>{filtered ? "调整邮箱、状态或日期范围。" : "添加一个账号或批量导入，开始第一条任务。"}</p>{loaded && <button type="button" className="secondary-button" onClick={filtered ? onClear : onCreate}>{filtered ? "清除筛选" : "新建任务"}</button>}</div></td></tr>;
+  return <tr><td colSpan="7"><div className="empty-state"><div><Mail size={24} /></div><h3>{!loaded ? "正在读取任务" : filtered ? "没有匹配的任务" : "暂无授权任务"}</h3><p>{filtered ? "调整邮箱、状态或日期范围。" : "添加一个账号或批量导入，开始第一条任务。"}</p>{loaded && <button type="button" className="secondary-button" onClick={filtered ? onClear : onCreate}>{filtered ? "清除筛选" : "新建任务"}</button>}</div></td></tr>;
 }
 
 function InsightError({ item }) {
@@ -1527,6 +1531,7 @@ function formatInsightDate(value) {
 function quotaWindowLabel(window) {
   const seconds = window.windowSeconds;
   if (!seconds) return window.key === "primary" ? "主窗口" : "次窗口";
+  if (seconds === 604800) return "周额度";
   if (seconds % 86400 === 0) return `${seconds / 86400} 天`;
   if (seconds % 3600 === 0) return `${seconds / 3600} 小时`;
   return `${Math.round(seconds / 60)} 分钟`;
@@ -1536,18 +1541,23 @@ function QuotaInfo({ insights }) {
   if (!insights) return <span className="insight-note">未检测</span>;
   const quota = insights.quota;
   if (quota?.status !== "ok") return <InsightError item={quota} />;
+  const windows = quota.windows || [];
+  const weeklyOnly = windows.some((window) => window.windowSeconds === 604800)
+    && !windows.some((window) => window.windowSeconds === 18000);
+  const visibleWindows = weeklyOnly ? windows.filter((window) => window.windowSeconds === 604800) : windows;
   return <div className="quota-info">
     <span className={`quota-plan ${quota.limitReached || quota.allowed === false ? "exhausted" : ""}`}>
       {quota.planType || "额度"}{quota.limitReached || quota.allowed === false ? " · 暂不可用" : ""}
     </span>
-    {quota.windows?.map((window) => <div className="quota-window" key={window.key}>
+    {(quota.stale || quota.error) && <span className="insight-note">上次成功结果 · 本次检测失败</span>}
+    {visibleWindows.map((window) => <div className="quota-window" key={window.key}>
       <div className="quota-window-label"><span>{quotaWindowLabel(window)}</span><strong>剩余 {Number(window.remainingPercent.toFixed(1))}%</strong></div>
       <div className="quota-track" role="progressbar" aria-label={`${quotaWindowLabel(window)}剩余额度`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={window.remainingPercent}>
         <span className={window.remainingPercent <= 10 ? "low" : ""} style={{ width: `${window.remainingPercent}%` }} />
       </div>
       {window.resetAt && <span className="insight-note">重置 {formatInsightDate(window.resetAt)}</span>}
     </div>)}
-    {!quota.windows?.length && <span className="insight-note">接口未提供窗口额度</span>}
+    {!visibleWindows.length && <span className="insight-note">接口未提供窗口额度</span>}
     {quota.credits?.unlimited ? <span className="insight-note">点数不限量</span>
       : quota.credits?.balance != null && <span className="insight-note">点数余额 {quota.credits.balance}</span>}
   </div>;
@@ -1563,7 +1573,20 @@ function SubscriptionInfo({ insights }) {
   return <div className="subscription-info">
     <time dateTime={subscription.expiresAt}>{formatInsightDate(subscription.expiresAt)}</time>
     <span className="insight-note">{remainingDays !== null && `（剩余${remainingDays}天） · `}{remainingDays === 0 ? "已到期" : subscription.willRenew === true ? "自动续订" : subscription.willRenew === false ? "到期不续订" : "Plus"}</span>
+    {(subscription.stale || subscription.error) && <span className="insight-note">上次成功结果</span>}
   </div>;
+}
+
+function SmsSummary({ summary }) {
+  if (!summary || summary.verificationStatus === "not_started") return <div className="sms-summary"><span className="insight-note">未接码</span></div>;
+  const latest = summary.latest;
+  const status = { verified: "已接码", processing: "接码中", canceled: "已取消", failed: "接码失败", not_required: "无需接码" }[summary.verificationStatus] || "未接码";
+  const money = latest?.amount && latest?.currency ? `${latest.amount} ${latest.currency}` : latest?.quote ? `报价 ${latest.quote}${latest.quoteCurrency ? ` ${latest.quoteCurrency}` : ""}` : latest ? "金额待确认" : "未接码";
+  return <div className="sms-summary"><strong>{status}</strong>{latest?.providerName && <span>{latest.providerName}</span>}<span>{money}</span>{summary.historyCount > 1 && <small>{summary.historyCount} 次记录</small>}{summary.unknownCount > 0 && <small>部分金额未记录</small>}</div>;
+}
+
+function smsOrderStatusText(status) {
+  return ({ acquired: "已取号", submitted: "已提交", complete_pending: "等待完成确认", completed: "已完成", cancel_pending: "等待取消确认", cancel_requested: "已请求取消", cancel_failed: "取消失败", complete_failed: "完成确认失败", error: "失败" })[status] || status || "未知";
 }
 
 function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, detail = false }) {
@@ -1709,6 +1732,19 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
     }
   }
 
+  async function startPhoneBinding() {
+    if (!smsProvider.ready || !job.canStartPhoneBinding) return;
+    setSubmitting(true);
+    try {
+      await apiFetch(token, `/api/jobs/${job.id}/start-phone`, {
+        method: "POST",
+        body: JSON.stringify({ smsProvider: { id: smsProvider.id, config: smsProvider.config } }),
+      });
+      onError("");
+    } catch (requestError) { onError(requestError.message); }
+    finally { setSubmitting(false); }
+  }
+
   async function download() {
     try {
       const response = await fetch(`/api/jobs/${job.id}/download`, {
@@ -1826,7 +1862,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
         <span className="insight-label">剩余重置次数</span>
         <div>{!job.accountInsights ? <span className="insight-note">未检测</span>
           : job.accountInsights.resetCredits?.status === "ok"
-            ? <strong className="insight-count">{job.accountInsights.resetCredits.availableCount} <small>次</small></strong>
+            ? <><strong className="insight-count">{job.accountInsights.resetCredits.availableCount} <small>次</small></strong>{(job.accountInsights.resetCredits.stale || job.accountInsights.resetCredits.error) && <span className="insight-note">上次成功结果</span>}</>
             : <InsightError item={job.accountInsights.resetCredits} />}</div>
         <button type="button" className="text-action insight-check" onClick={checkInsights}
           disabled={!job.canCheckAccountInsights || submitting}
@@ -1837,6 +1873,11 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
       </div>
 </div>;
   const actionContent = <>
+          {job.canStartPhoneBinding && (
+            <button type="button" className="primary-button" onClick={startPhoneBinding} disabled={submitting || !smsProviderAvailable || !smsProvider.ready} title={smsProvider.ready ? "恢复登录状态并开始接码" : "请先完成接码平台配置"}>
+              {submitting ? <LoaderCircle className="spin" size={16} /> : <PhoneIncoming size={16} />}开始接码
+            </button>
+          )}
           {job.canDownload && (
             <button type="button" className="download-button" onClick={download}>
               <Download size={16} />下载
@@ -1880,12 +1921,13 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
               <Ban size={17} />取消任务
             </button>
           )}</>;
-  if (detail) return <div className="job-detail-content"><p className="detail-email">{job.email}</p><section className="detail-section"><h3>状态与当前操作</h3><StatusBadge status={job.status} />{stepContent}</section><section className="detail-section"><h3>额度与订阅</h3>{quotaContent}</section><section className="detail-section"><h3>时间</h3><dl className="detail-dates"><div><dt>创建时间</dt><dd>{formatInsightDate(job.createdAt)}</dd></div><div><dt>最近操作</dt><dd>{formatInsightDate(job.lastOperationAt || job.createdAt)}</dd></div></dl></section><section className="detail-section"><h3>任务操作</h3><div className="detail-actions">{actionContent}</div></section><section className="detail-section"><h3>执行日志</h3><JobLogs token={token} jobId={job.id} /></section></div>;
+  if (detail) return <div className="job-detail-content"><p className="detail-email">{job.email}</p><section className="detail-section"><h3>状态与当前操作</h3><StatusBadge status={job.status} />{stepContent}</section><section className="detail-section"><h3>额度与订阅</h3>{quotaContent}</section><section className="detail-section"><h3>接码与费用</h3><SmsSummary summary={job.smsSummary} />{job.smsSummary?.orders?.length > 0 && <div className="sms-order-history">{job.smsSummary.orders.map(order => <div key={order.id}><span>{order.providerName || "接码平台"}</span><span>{smsOrderStatusText(order.status)}</span><span>{order.amount && order.currency ? `${order.amount} ${order.currency}` : order.quote ? `报价 ${order.quote}` : "金额待确认"}</span></div>)}</div>}</section><section className="detail-section"><h3>时间</h3><dl className="detail-dates"><div><dt>创建时间</dt><dd>{formatInsightDate(job.createdAt)}</dd></div><div><dt>最近操作</dt><dd>{formatInsightDate(job.lastOperationAt || job.createdAt)}</dd></div></dl></section><section className="detail-section"><h3>任务操作</h3><div className="detail-actions">{actionContent}</div></section><section className="detail-section"><h3>执行日志</h3><JobLogs token={token} jobId={job.id} /></section></div>;
   return <tr className={`job-row status-${job.status} ${selected ? "selected-row" : ""}`}>
     <td className="select-cell"><input type="checkbox" checked={selected} onChange={onToggleSelected} disabled={!selectionSupported} aria-label={`选择 ${job.email}`} /></td>
     <td className="account-column"><div className="account-details"><strong title={job.email}>{job.email}</strong><span>{shortId(job.id)}</span></div><LoginMethodBadge job={job} /><div className="mobile-task-meta">{formatDateTime(job.createdAt)}</div></td>
     <td className="status-step-cell"><StatusBadge status={job.status} />{inputConfig ? <div className="task-inline-step">{stepContent}</div> : <><div className="prompt-line">{job.prompt}</div>{job.lastError && <div className="row-error">{extractResponseMessage(job.lastError)}</div>}</>}</td>
     <td className="insight-cell quota-column">{quotaContent}</td>
+    <td className="sms-column"><SmsSummary summary={job.smsSummary} /></td>
     <td className="task-time-cell"><div><span>创建</span><time dateTime={job.createdAt} title={formatInsightDate(job.createdAt)}>{formatDateTime(job.createdAt)}</time></div><div><span>操作</span><time dateTime={job.lastOperationAt || job.createdAt} title={formatInsightDate(job.lastOperationAt || job.createdAt)}>{formatDateTime(job.lastOperationAt || job.createdAt)}</time></div><small>{operationLabel(job.lastOperationType)}</small></td>
     <td className="actions-cell"><div className="row-actions"><button type="button" className="text-action" onClick={onToggleLogs} aria-label={`查看 ${job.email} 的任务详情`}>查看</button>{job.canDownload && <button type="button" className="text-action" onClick={download}><Download size={14} />下载</button>}{job.canRetry && !job.canDownload && <button type="button" className="text-action" onClick={retry} disabled={submitting}>{job.canResume ? "继续" : "重试"}</button>}<MoreActions label="更多">{actionContent}</MoreActions></div></td>
   </tr>;
@@ -1941,7 +1983,7 @@ function StatusBadge({ status }) {
     canceled: ["已取消", <Ban size={14} />],
     reauth_required: ["待重新授权", <RefreshCw size={14} />],
     resume_available: ["可继续", <RotateCcw size={14} />],
-    phone_skipped: ["已跳过接码", <Ban size={14} />],
+    phone_skipped: ["待接码", <PhoneIncoming size={14} />],
   }[status] || [status, null];
   return <span className={`status-badge ${status}`}>{config[1]}{config[0]}</span>;
 }

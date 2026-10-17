@@ -149,6 +149,7 @@ export async function collectAccountInsights(data, { expectedEmail, fetcher = fe
     return { ...snapshot, status: "error", quota: failure(error.message), subscription: failure(error.message), resetCredits: failure(error.message) };
   }
   snapshot.email = identity.email;
+  snapshot.accountId = identity.accountId;
   const [usage, resets, subscription] = await Promise.all([
     requestJson(fetcher, chatgptBase, "/backend-api/wham/usage", identity, timeoutMs),
     requestJson(fetcher, chatgptBase, "/backend-api/wham/rate-limit-reset-credits", identity, timeoutMs),
@@ -188,7 +189,10 @@ export async function checkAccountInsights(exportPath, options = {}) {
   const raw = await fs.readFile(exportPath, "utf8");
   let data;
   try { data = JSON.parse(raw); } catch { data = null; }
-  const snapshot = await collectAccountInsights(data, options);
+  let snapshot = await collectAccountInsights(data, options);
+  const previous = await loadAccountInsights(exportPath, snapshot.email, { allowHistorical: true });
+  snapshot = mergeAccountInsights(previous, snapshot);
+  snapshot.version = 2;
   snapshot.authorizationFingerprint = hash(raw);
   if (hash(await fs.readFile(exportPath, "utf8")) !== snapshot.authorizationFingerprint) throw new Error("Authorization changed during account detection");
   const target = path.join(path.dirname(exportPath), ACCOUNT_INSIGHTS_FILENAME);
@@ -200,21 +204,34 @@ export async function checkAccountInsights(exportPath, options = {}) {
   return snapshot;
 }
 
-export async function loadAccountInsights(exportPath, expectedEmail) {
+export function mergeAccountInsights(previous, next) {
+  if (!previous || previous.email !== next.email || (next.accountId && previous.accountId !== next.accountId)) return next;
+  const merged = { ...next, accountId: next.accountId || previous.accountId };
+  for (const field of ["quota", "subscription", "resetCredits"]) {
+    const old = previous[field];
+    if (next[field]?.status !== "ok" && old?.status === "ok") {
+      merged[field] = { ...old, stale: true, error: next[field].error || "unavailable", checkedAt: old.checkedAt || previous.checkedAt, refreshError: next[field] };
+    } else if (next[field]?.status === "ok") {
+      merged[field] = { ...next[field], checkedAt: next.checkedAt };
+    }
+  }
+  return merged;
+}
+
+export async function loadAccountInsights(exportPath, expectedEmail, { allowHistorical = false } = {}) {
   try {
-    const [raw, stored] = await Promise.all([
-      fs.readFile(exportPath, "utf8"), fs.readFile(path.join(path.dirname(exportPath), ACCOUNT_INSIGHTS_FILENAME), "utf8"),
-    ]);
+    const stored = await fs.readFile(path.join(path.dirname(exportPath), ACCOUNT_INSIGHTS_FILENAME), "utf8");
     const snapshot = JSON.parse(stored);
-    if (!publicAccountInsights(snapshot)) return null;
-    return snapshot.version === 1 && snapshot.authorizationFingerprint === hash(raw) && snapshot.email === normalizeEmail(expectedEmail)
-      ? snapshot : null;
+    if (![1, 2].includes(snapshot.version) || !publicAccountInsights(snapshot) || snapshot.email !== normalizeEmail(expectedEmail)) return null;
+    if (allowHistorical && snapshot.version === 2 && text(snapshot.accountId)) return snapshot;
+    const raw = await fs.readFile(exportPath, "utf8");
+    return snapshot.authorizationFingerprint === hash(raw) ? snapshot : null;
   } catch { return null; }
 }
 
 export function publicAccountInsights(snapshot, now = Date.now()) {
   if (!snapshot || !date(snapshot.checkedAt)) return null;
-  const project = (item) => item?.status === "ok" ? { status: "ok" } : failure(item?.error, count(item?.httpStatus));
+  const project = (item) => item?.status === "ok" ? { status: "ok", ...(item.error ? { error: item.error, message: ERROR_MESSAGES[item.error] || ERROR_MESSAGES.unavailable } : {}), ...(item.stale ? { stale: true, checkedAt: date(item.checkedAt), refreshError: failure(item.refreshError?.error, count(item.refreshError?.httpStatus)) } : {}) } : failure(item?.error, count(item?.httpStatus));
   const quota = project(snapshot.quota);
   if (quota.status === "ok") Object.assign(quota, {
     planType: plan(snapshot.quota.planType), allowed: bool(snapshot.quota.allowed), limitReached: bool(snapshot.quota.limitReached),
@@ -233,7 +250,7 @@ export function publicAccountInsights(snapshot, now = Date.now()) {
   });
   const resetCredits = project(snapshot.resetCredits);
   if (resetCredits.status === "ok") {
-    const expired = (snapshot.resetCredits.expirations || []).filter((item) => date(item) && Date.parse(item) > Date.parse(snapshot.checkedAt) && Date.parse(item) <= now).length;
+    const expired = (snapshot.resetCredits.expirations || []).filter((item) => date(item) && Date.parse(item) > Date.parse(snapshot.resetCredits.checkedAt || snapshot.checkedAt) && Date.parse(item) <= now).length;
     const availableCount = count(snapshot.resetCredits.availableCount);
     if (availableCount === null) Object.assign(resetCredits, failure("unavailable"));
     else resetCredits.availableCount = Math.max(0, availableCount - expired);

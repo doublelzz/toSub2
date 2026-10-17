@@ -624,6 +624,7 @@ async function run() {
       });
       await saveCheckpoint("email_verified", {});
       console.log("[checkpoint] Saved verified email login state.");
+      await detectLoginSession(client, { chatgptBase, transport, expectedEmail: email, sub2apiOutPath });
 
       if (!args.webOnly) {
         console.log("[2/5] Start Codex OAuth flow");
@@ -694,25 +695,30 @@ async function run() {
     }
     } catch (error) {
       if (error.message !== "PHONE_BINDING_DISABLED") throw error;
-      const sourcePath = path.join(path.dirname(sub2apiOutPath), ACCOUNT_SESSION_FILENAME);
-      let source = { type: "chatgpt-session", version: 1, email, accessToken: "" };
-      try {
-        const { data } = await client.getJson("GET", `${chatgptBase}/api/auth/session`, { referer: `${chatgptBase}/` });
-        const candidate = { ...source, email: data?.user?.email, accessToken: data?.accessToken };
-        sessionIdentity(candidate, email);
-        source = candidate;
-      } catch {
-        console.log("[account-insights] 登录会话信息暂不可用，检测结果将显示具体错误。");
-      }
-      await writePrivateJson(sourcePath, source);
-      await detectAccountInsights(sourcePath, { chatgptBase, transport, expectedEmail: email });
-      console.log("[phone-skipped] 接码已关闭，未申请或提交手机号；登录检查点已保留，OAuth 授权尚未完成。");
+      console.log("[phone-skipped] 等待手动开始接码；登录检查点与额度检测结果已保留，OAuth 授权尚未完成。");
     } finally {
       rl.close();
     }
   } finally {
     await transport.close();
   }
+}
+
+async function detectLoginSession(client, { chatgptBase, transport, expectedEmail, sub2apiOutPath }) {
+  const sourcePath = path.join(path.dirname(sub2apiOutPath), ACCOUNT_SESSION_FILENAME);
+  let source = { type: "chatgpt-session", version: 1, email: expectedEmail, accessToken: "" };
+  try {
+    const { data } = await client.getJson("GET", `${chatgptBase}/api/auth/session`, { referer: `${chatgptBase}/` });
+    source = { ...source, email: data?.user?.email, accessToken: data?.accessToken };
+    sessionIdentity(source, expectedEmail);
+    await writePrivateJson(sourcePath, source);
+    console.log("[account-session-saved] 已保存身份匹配的登录会话。");
+  } catch {
+    console.log("[account-insights] 登录会话暂不可用，稍后可重新登录检测。");
+    // Do not replace an earlier usable credential with an invalid session.
+    try { await fs.access(sourcePath); } catch { await writePrivateJson(sourcePath, { type: "chatgpt-session", version: 1, email: expectedEmail, accessToken: "" }); }
+  }
+  await detectAccountInsights(sourcePath, { chatgptBase, transport, expectedEmail });
 }
 
 async function detectAccountInsights(exportPath, { chatgptBase, transport, expectedEmail }) {

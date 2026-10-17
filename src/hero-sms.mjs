@@ -1,3 +1,4 @@
+import { parseNumberOrder } from "./sms-orders.mjs";
 const DEFAULT_API_BASE = "https://hero-sms.com/stubs/handler_api.php";
 const DEFAULT_TIMEOUT_MS = 12_000;
 
@@ -73,14 +74,15 @@ export function createHeroSmsClient(options = {}) {
 
   return {
     async getNumber(service, country, maxPrice) {
-      const text = await request("getNumber", { service, country, maxPrice, fixedPrice: "true" });
-      const match = /^ACCESS_NUMBER:([^:]+):(\+?\d+)$/.exec(text);
-      if (!match) throw responseError(text, "获取手机号失败", apiKey);
-      const number = match[2].startsWith("+") ? match[2] : `+${match[2]}`;
+      const params = { service, country, maxPrice, fixedPrice: "true" };
+      const text = await request("getNumber", params);
+      const order = parseNumberOrder(text);
+      if (!order) throw responseError(text, "获取手机号失败", apiKey);
+      const number = order.number;
       if (!/^\+[1-9]\d{6,14}$/.test(number)) {
         throw new HeroSmsError("Hero SMS 返回的手机号不是有效的国际格式", { terminal: true });
       }
-      return { number, requestId: match[1] };
+      return { ...order, number };
     },
 
     async getPriceOptions(service) {

@@ -1,3 +1,4 @@
+import { parseNumberOrder } from "./sms-orders.mjs";
 const DEFAULT_API_BASE = "https://smsbower.page/stubs/handler_api.php";
 const DEFAULT_TIMEOUT_MS = 12_000;
 
@@ -59,12 +60,9 @@ export function createSmsBowerClient(options = {}) {
       if (maxPrice !== "") params.maxPrice = maxPrice;
       if (providerIds !== "") params.providerIds = providerIds;
       const text = await request("getNumber", params);
-      const match = /^ACCESS_NUMBER:([^:]+):(\+?\d+)$/.exec(text);
-      if (!match) throw responseError(text, "获取手机号失败");
-      return {
-        number: normalizePhoneNumber(match[2]),
-        requestId: match[1],
-      };
+      const order = parseNumberOrder(text);
+      if (!order) throw responseError(text, "获取手机号失败");
+      return { ...order, number: normalizePhoneNumber(order.number) };
     },
 
     async getPriceOptions(service) {
