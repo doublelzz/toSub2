@@ -1724,8 +1724,10 @@ function consumeOutput(job, rawText) {
     job.accountSessionAvailable = true;
     void saveJobMetadata(job).catch(() => {});
   }
-  if (text.includes("[account-insights] 正在检测")) job.accountInsightsDetecting = true;
-  if (scan.includes("[account-insights-saved]") || scan.includes("[account-insights-failed]")) {
+  const insightsStartIndex = scan.lastIndexOf("[account-insights] 正在检测");
+  const insightsEndIndex = Math.max(scan.lastIndexOf("[account-insights-saved]"), scan.lastIndexOf("[account-insights-failed]"));
+  if (insightsStartIndex > insightsEndIndex) job.accountInsightsDetecting = true;
+  if (insightsEndIndex > insightsStartIndex) {
     job.accountInsightsDetecting = false;
     const runId = job.runId;
     const sequence = job.insightsLoadSequence = (job.insightsLoadSequence || 0) + 1;
@@ -1961,9 +1963,9 @@ function consumeOutput(job, rawText) {
   if (job.status === "phone" && job.pendingSmsSetup && !job.smsNumberAcquisitionPromise) {
     const setup = job.pendingSmsSetup;
     const runId = job.runId;
-    job.pendingSmsSetup = null;
     void withEmailJobLock(job.email, async () => {
-      if (job.runId !== runId || job.status !== "phone") return;
+      if (job.runId !== runId || job.status !== "phone" || job.pendingSmsSetup !== setup || job.smsNumberAcquisitionPromise) return;
+      job.pendingSmsSetup = null;
       job.phoneBindingStartedAt ||= new Date().toISOString();
       job.phoneBindingRequested = true;
       await acquireSmsNumber(job, setup.id, setup.config);
@@ -1974,7 +1976,7 @@ function consumeOutput(job, rawText) {
       touch(job);
     });
   }
-  if (scan.includes("[account-insights] 正在检测")) setStage(job, "finalizing", "正在检测额度、订阅和重置次数");
+  if (job.accountInsightsDetecting) setStage(job, "finalizing", "正在检测额度、订阅和重置次数");
   if (scan.includes("[ok] Account password added and saved securely")) {
     setStage(job, "finalizing", "密码已添加，正在安全保存新密码");
   }

@@ -205,6 +205,36 @@ try {
     return;
   }
 
+  if (["insights-phone-coalesced@example.com", "insights-phone-split@example.com", "insights-phone-failed@example.com", "insights-phone-resume@example.com"].includes(args.email)) {
+    if (args.skipPhoneBinding) {
+      const checkpointPath = args.checkpoint || args.resumeCheckpoint;
+      await fs.writeFile(checkpointPath, JSON.stringify({ version: 1, stage: "email_verified", email: args.email, cookies: [] }));
+      console.log("[checkpoint] Saved verified email login state.");
+      console.log("[phone-skipped] Waiting for an explicit phone binding request.");
+      return;
+    }
+    const detecting = "[account-insights] 正在检测额度、Plus 到期时间和剩余重置次数。\n";
+    const finished = args.email === "insights-phone-failed@example.com"
+      ? "[account-insights-failed] 检测结果保存失败，授权文件仍然可用。\n"
+      : "[account-insights] 额度：检测完成\n[account-insights-saved] ok\n";
+    if (args.email === "insights-phone-split@example.com") {
+      process.stdout.write(detecting.slice(0, 10));
+      await new Promise(resolve => setTimeout(resolve, 30));
+      process.stdout.write(detecting.slice(10));
+      await new Promise(resolve => setTimeout(resolve, 30));
+      process.stdout.write(finished.slice(0, -5));
+      await new Promise(resolve => setTimeout(resolve, 30));
+      process.stdout.write(finished.slice(-5));
+    } else {
+      process.stdout.write(`${detecting}${finished}`);
+    }
+    await rl.question("Phone number, E.164 format (p=quit): ");
+    await rl.question("Phone OTP (r=resend, p=change phone, q=quit): ");
+    console.log("[ok] Phone OTP validated");
+    await writeCompleted(args.sub2apiOut, args.email);
+    return;
+  }
+
   if (["luban@example.com", "sms-provider@example.com", "hero-sms@example.com", "hero-cancel@example.com", "custom-sms@example.com", "manual-phone-automation@example.com", "auto-rotate@example.com"].includes(args.email)) {
     await rl.question("Phone number, E.164 format (p=quit): ");
     console.log("Phone OTP (r=resend, p=change phone, q=quit): ");
@@ -296,6 +326,7 @@ function parseArgs(argv) {
     else if (argv[index] === "--refresh-sub2api") parsed.refreshSub2api = argv[++index];
     else if (argv[index] === "--checkpoint") parsed.checkpoint = argv[++index];
     else if (argv[index] === "--resume-checkpoint") parsed.resumeCheckpoint = argv[++index];
+    else if (argv[index] === "--skip-phone-binding") parsed.skipPhoneBinding = true;
     else if (argv[index] === "--setup-totp") parsed.setupTotp = true;
     else if (argv[index] === "--totp-result") parsed.totpResult = argv[++index];
     else if (argv[index] === "--add-password") parsed.addPassword = true;

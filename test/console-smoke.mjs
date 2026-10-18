@@ -262,6 +262,29 @@ try {
   const refreshed = await refreshedResponse.json();
   assert.match(refreshed.accounts?.[0]?.credentials?.access_token || "", /^refreshed-access-/);
 
+  for (const variant of ["coalesced", "split", "failed"]) {
+    const response = await fetch(`${baseUrl}/api/jobs`, {
+      method: "POST", headers,
+      body: JSON.stringify({ email: `insights-phone-${variant}@example.com`, phoneBindingEnabled: true }),
+    });
+    assert.equal(response.status, 201);
+    const { job: createdPhone } = await response.json();
+    const waitingPhone = await waitForJob(headers, createdPhone.id, (value) => value.status === "phone");
+    assert.equal(waitingPhone.accountInsightsChecking, false);
+    for (const [action, value, nextStage] of [["phone", "+60123456789", "phone_otp"], ["phone_otp", "654321", "completed"]]) {
+      const inputResponse = await fetch(`${baseUrl}/api/jobs/${createdPhone.id}/input`, {
+        method: "POST", headers, body: JSON.stringify({ action, value }),
+      });
+      assert.equal(inputResponse.status, 200, await inputResponse.text());
+      const next = await waitForJob(headers, createdPhone.id, (value) => value.status === nextStage);
+      assert.equal(next.accountInsightsChecking, false, "completed detection cannot hide a later input prompt");
+    }
+    const deletePhone = await fetch(`${baseUrl}/api/jobs/delete-batch`, {
+      method: "POST", headers, body: JSON.stringify({ ids: [createdPhone.id] }),
+    });
+    assert.equal(deletePhone.status, 200, await deletePhone.text());
+  }
+
   const profileResponse = await fetch(`${baseUrl}/api/jobs`, {
     method: "POST",
     headers,

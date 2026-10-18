@@ -129,6 +129,45 @@ try {
   assert.deepEqual(optionData.options.map((option) => option.grade), ["unknown", "unknown", "gold", "gold"]);
   assert.equal(optionData.options[0].providerIds, "3402");
   assert.equal(optionData.options[0].price, 0.08);
+
+  for (const variant of ["coalesced", "split", "failed", "resume"]) {
+    const numbersBefore = smsActions.filter(item => item.action === "getNumber").length;
+    const pollsBefore = smsActions.filter(item => item.action === "getStatus").length;
+    const completionsBefore = smsActions.filter(item => item.action === "setStatus" && item.status === "6").length;
+    const smsProvider = { id: "smsbower", config: {
+      apiKey: "test-api-key", service: "dr", country: "1001", maxPrice: "0.42", providerIds: "3301", maxRotationAttempts: "1",
+    } };
+    const response = await fetch(`${baseUrl}/api/jobs`, {
+      method: "POST", headers,
+      body: JSON.stringify({
+        email: `insights-phone-${variant}@example.com`, phoneBindingMode: variant === "resume" ? "manual" : "automatic", smsProvider,
+      }),
+    });
+    assert.equal(response.status, 201, await response.clone().text());
+    const { job: automatic } = await response.json();
+    if (variant === "resume") {
+      await waitForJob(headers, automatic.id, job => job.status === "phone_skipped");
+      assert.equal(smsActions.filter(item => item.action === "getNumber").length, numbersBefore);
+      const start = await fetch(`${baseUrl}/api/jobs/${automatic.id}/start-phone`, {
+        method: "POST", headers, body: JSON.stringify({ smsProvider }),
+      });
+      assert.equal(start.status, 200, await start.text());
+    }
+    const completedAutomatic = await waitForJob(headers, automatic.id, job => job.status === "completed");
+    assert.equal(completedAutomatic.smsStatus, "completed", `${variant}: SMS must finish without manual input`);
+    assert.equal(completedAutomatic.phoneVerificationStatus, "verified");
+    assert.equal(smsActions.filter(item => item.action === "getNumber").length, numbersBefore + 1,
+      `${variant}: detecting the phone prompt must acquire exactly one number automatically`);
+    assert.ok(smsActions.filter(item => item.action === "getStatus").length > pollsBefore);
+    for (let index = 0; index < 50; index++) {
+      if (smsActions.filter(item => item.action === "setStatus" && item.status === "6").length > completionsBefore) break;
+      await delay(20);
+    }
+    assert.equal(smsActions.filter(item => item.action === "setStatus" && item.status === "6").length, completionsBefore + 1);
+    const jobLogs = await fetch(`${baseUrl}/api/jobs/${automatic.id}/logs`, { headers }).then(response => response.json());
+    assert.match(jobLogs.logs, /\[sms\].*SMSBower.*1\/1/);
+  }
+
   const createdResponse = await fetch(`${baseUrl}/api/jobs`, {
     method: "POST",
     headers,
