@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
@@ -60,8 +61,14 @@ try {
   const firstExport = JSON.parse(await fs.readFile(outputPath, "utf8"));
   assert.equal(firstExport.type, "sub2api-data");
   assert.equal(firstExport.accounts?.[0]?.credentials?.email, "add-phone-page@example.com");
+  const firstCredentials = firstExport.accounts[0].credentials;
+  assert.ok(Math.abs(Date.parse(firstCredentials.expires_at) - Date.now() - 3600_000) < 30_000);
+  assert.equal(firstCredentials.plan_type, "plus");
+  assert.equal(firstCredentials.subscription_expires_at, "2099-01-01T00:00:00.000Z");
+  assert.equal(firstExport.accounts[0].expires_at, undefined);
   const initialInsights = JSON.parse(await fs.readFile(path.join(tempRoot, "account-insights.json"), "utf8"));
   assert.equal(initialInsights.status, "ok");
+  assert.equal(initialInsights.authorizationFingerprint, crypto.createHash("sha256").update(await fs.readFile(outputPath)).digest("hex"));
   assert.equal(initialInsights.quota.windows[0].remainingPercent, 75);
   assert.equal(initialInsights.resetCredits.availableCount, 1);
 
@@ -190,6 +197,9 @@ try {
   assert.match(wrongEmailOtpLogin.output, /\[email-otp-rejected\].*邮箱验证码错误/);
   assert.equal(await fileExists(wrongEmailOtpOutputPath), true);
 
+  const beforeRefresh = JSON.parse(await fs.readFile(outputPath, "utf8"));
+  beforeRefresh.accounts[0].credentials.expires_at = "2000-01-01T00:00:00Z";
+  await fs.writeFile(outputPath, JSON.stringify(beforeRefresh));
   const refresh = await runNode([
     path.join(projectRoot, "src", "protocol-login.mjs"),
     "--refresh-sub2api",
@@ -207,8 +217,12 @@ try {
   const refreshedExport = JSON.parse(await fs.readFile(outputPath, "utf8"));
   assert.equal(refreshedExport.type, "sub2api-data");
   assert.equal(refreshedExport.accounts?.[0]?.credentials?.refresh_token, "mock-refresh-token");
+  assert.ok(Math.abs(Date.parse(refreshedExport.accounts[0].credentials.expires_at) - Date.now() - 3600_000) < 30_000,
+    "refresh must replace stale expiry using the latest token response");
+  assert.equal(refreshedExport.accounts[0].credentials.subscription_expires_at, "2099-01-01T00:00:00.000Z");
   const refreshedInsights = JSON.parse(await fs.readFile(path.join(tempRoot, "account-insights.json"), "utf8"));
   assert.equal(refreshedInsights.status, "ok");
+  assert.equal(refreshedInsights.authorizationFingerprint, crypto.createHash("sha256").update(await fs.readFile(outputPath)).digest("hex"));
   assert.notEqual(refreshedInsights.authorizationFingerprint, initialInsights.authorizationFingerprint);
 
   const riskOutputPath = path.join(tempRoot, "risk-sub2api.json");

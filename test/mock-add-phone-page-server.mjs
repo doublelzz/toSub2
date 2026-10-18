@@ -253,6 +253,7 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 200, {
       access_token: "mock-access-token",
       refresh_token: "mock-refresh-token",
+      expires_in: 3600,
       id_token: `e30.${lastLoginHint === "no-phone-needed@example.com" ? Buffer.from(JSON.stringify({ email: lastLoginHint, "https://api.openai.com/auth": { chatgpt_account_id: "mock-personal-account", chatgpt_plan_type: "plus" } })).toString("base64url") : idTokenPayload}.signature`,
     });
   }

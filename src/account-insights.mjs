@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { withSub2ApiExpiry } from "./sub2api-export.mjs";
 
 export const ACCOUNT_INSIGHTS_FILENAME = "account-insights.json";
 export const ACCOUNT_SESSION_FILENAME = "account-session.json";
@@ -185,7 +186,7 @@ export async function collectAccountInsights(data, { expectedEmail, fetcher = fe
   return snapshot;
 }
 
-export async function checkAccountInsights(exportPath, options = {}) {
+export async function checkAccountInsights(exportPath, { updateExport = false, ...options } = {}) {
   const raw = await fs.readFile(exportPath, "utf8");
   let data;
   try { data = JSON.parse(raw); } catch { data = null; }
@@ -193,15 +194,24 @@ export async function checkAccountInsights(exportPath, options = {}) {
   const previous = await loadAccountInsights(exportPath, snapshot.email, { allowHistorical: true });
   snapshot = mergeAccountInsights(previous, snapshot);
   snapshot.version = 2;
-  snapshot.authorizationFingerprint = hash(raw);
-  if (hash(await fs.readFile(exportPath, "utf8")) !== snapshot.authorizationFingerprint) throw new Error("Authorization changed during account detection");
+  if (hash(await fs.readFile(exportPath, "utf8")) !== hash(raw)) throw new Error("Authorization changed during account detection");
+  let exportRaw = raw;
+  if (updateExport && data?.type === "sub2api-data") {
+    exportRaw = `${JSON.stringify(withSub2ApiExpiry(data, snapshot), null, 2)}\n`;
+    if (exportRaw !== raw) await writePrivateFile(exportPath, exportRaw);
+  }
+  snapshot.authorizationFingerprint = hash(exportRaw);
   const target = path.join(path.dirname(exportPath), ACCOUNT_INSIGHTS_FILENAME);
+  await writePrivateFile(target, `${JSON.stringify(snapshot, null, 2)}\n`);
+  return snapshot;
+}
+
+async function writePrivateFile(target, raw) {
   const temporary = `${target}.${crypto.randomUUID()}.tmp`;
   try {
-    await fs.writeFile(temporary, `${JSON.stringify(snapshot, null, 2)}\n`, { mode: 0o600 });
+    await fs.writeFile(temporary, raw, { mode: 0o600 });
     await fs.rename(temporary, target);
   } finally { await fs.rm(temporary, { force: true }); }
-  return snapshot;
 }
 
 export function mergeAccountInsights(previous, next) {

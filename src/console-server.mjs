@@ -13,6 +13,7 @@ import { createCredentialStore } from "./credential-store.mjs";
 import { createMfaWorkspace } from "./mfa-workspace.mjs";
 import { matchesTaskQuery, normalizeTaskQuery, summarizeTasks } from "./task-query.mjs";
 import { ACCOUNT_SESSION_FILENAME, loadAccountInsights, publicAccountInsights } from "./account-insights.mjs";
+import { withSub2ApiExpiry } from "./sub2api-export.mjs";
 import { phoneVerificationStatus, recordSmsOrder, publicSmsSummary } from "./sms-orders.mjs";
 import {
   fetchMailboxOtpCandidates,
@@ -2885,7 +2886,7 @@ async function downloadResult(res, job) {
     return;
   }
   const safeEmail = job.email.replace(/[^a-zA-Z0-9@._+-]/g, "_");
-  const data = await fs.readFile(job.outputPath);
+  const data = Buffer.from(`${JSON.stringify(await readSub2ApiResult(job), null, 2)}\n`);
   res.writeHead(200, {
     "content-type": "application/json; charset=utf-8",
     "content-disposition": `attachment; filename="${safeEmail}-sub2api-import-oauth-${downloadTimestamp()}.json"`,
@@ -2912,10 +2913,7 @@ async function downloadBatchResult(res, ids) {
   const proxies = [];
   for (const job of downloadable) {
     if (!(await fileExists(job.outputPath))) throw httpError(409, `${job.email} 的导入文件不存在`);
-    const data = JSON.parse(await fs.readFile(job.outputPath, "utf8"));
-    if (data.type !== "sub2api-data" || !Array.isArray(data.accounts)) {
-      throw httpError(409, `${job.email} 的导入文件格式不正确`);
-    }
+    const data = await readSub2ApiResult(job);
     accounts.push(...data.accounts);
     if (Array.isArray(data.proxies)) proxies.push(...data.proxies);
   }
@@ -2942,10 +2940,7 @@ async function buildSub2ApiUploadPayload(downloadable) {
   const proxies = [];
   for (const job of downloadable) {
     if (!(await fileExists(job.outputPath))) throw httpError(409, `${job.email} 的导入文件不存在`);
-    const data = JSON.parse(await fs.readFile(job.outputPath, "utf8"));
-    if (data.type !== "sub2api-data" || !Array.isArray(data.accounts)) {
-      throw httpError(409, `${job.email} 的导入文件格式不正确`);
-    }
+    const data = await readSub2ApiResult(job);
     accounts.push(...data.accounts);
     if (Array.isArray(data.proxies)) proxies.push(...data.proxies);
   }
@@ -2956,6 +2951,15 @@ async function buildSub2ApiUploadPayload(downloadable) {
     proxies: uniqueByJson(proxies),
     accounts,
   };
+}
+
+async function readSub2ApiResult(job) {
+  const data = JSON.parse(await fs.readFile(job.outputPath, "utf8"));
+  if (data.type !== "sub2api-data" || !Array.isArray(data.accounts)) {
+    throw httpError(409, `${job.email} 的导入文件格式不正确`);
+  }
+  const snapshot = await loadAccountInsights(job.outputPath, job.email, { allowHistorical: true });
+  return withSub2ApiExpiry(data, snapshot);
 }
 
 function normalizeSub2ApiConfig(value) {

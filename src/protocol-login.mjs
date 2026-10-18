@@ -5,6 +5,7 @@ import path from "node:path";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { ACCOUNT_SESSION_FILENAME, checkAccountInsights, sessionIdentity } from "./account-insights.mjs";
+import { withOAuthTokenExpiry, withSub2ApiExpiry } from "./sub2api-export.mjs";
 import {
   browserIdentityForTlsProfile,
   DEFAULT_TLS_PROFILE,
@@ -335,7 +336,7 @@ async function run() {
       });
       console.log(`[ok] Saved sub2api import: ${targetPath}`);
       console.log(`[ok] Refreshed OAuth account: ${refreshed.email || "<unknown>"}`);
-      await detectAccountInsights(targetPath, { chatgptBase, transport, expectedEmail: refreshed.email });
+      await detectAccountInsights(targetPath, { chatgptBase, transport, expectedEmail: refreshed.email, updateExport: true });
       return;
     }
     await transport.prepareProxy(proxyTemplate, `${chatgptBase}/`);
@@ -682,7 +683,7 @@ async function run() {
       await writeJsonAtomic(sub2apiOutPath, sub2apiExport.data);
       await removeProtocolCheckpoint(checkpointPath);
       console.log(`[ok] Saved sub2api import: ${sub2apiOutPath}`);
-      await detectAccountInsights(sub2apiOutPath, { chatgptBase, transport, expectedEmail: sub2apiExport.account.credentials.email });
+      await detectAccountInsights(sub2apiOutPath, { chatgptBase, transport, expectedEmail: sub2apiExport.account.credentials.email, updateExport: true });
       console.log(`[ok] Account: ${sub2apiExport.account.name}`);
       console.log(`[ok] Email: ${sub2apiExport.account.credentials.email || "<unknown>"}`);
       console.log(`[ok] chatgpt_account_id: ${mask(sub2apiExport.account.credentials.chatgpt_account_id)}`);
@@ -721,11 +722,11 @@ async function detectLoginSession(client, { chatgptBase, transport, expectedEmai
   await detectAccountInsights(sourcePath, { chatgptBase, transport, expectedEmail });
 }
 
-async function detectAccountInsights(exportPath, { chatgptBase, transport, expectedEmail }) {
+async function detectAccountInsights(exportPath, { chatgptBase, transport, expectedEmail, updateExport = false }) {
   console.log("[account-insights] 正在检测额度、Plus 到期时间和剩余重置次数。");
   try {
     const snapshot = await checkAccountInsights(exportPath, {
-      chatgptBase, expectedEmail, fetcher: (url, options) => transport.fetch(url, options),
+      chatgptBase, expectedEmail, updateExport, fetcher: (url, options) => transport.fetch(url, options),
     });
     for (const [field, label] of [["quota", "额度"], ["subscription", "订阅"], ["resetCredits", "剩余重置次数"]]) {
       const item = snapshot[field];
@@ -2075,13 +2076,13 @@ async function buildSub2apiOauthExport({
     name: accountName || buildAccountName(email),
     platform: "openai",
     type: "oauth",
-    credentials: {
+    credentials: withOAuthTokenExpiry({
       access_token: tokenSet.access_token,
       chatgpt_account_id: chatgptAccountId,
       email,
       id_token: tokenSet.id_token,
       refresh_token: tokenSet.refresh_token,
-    },
+    }, tokenSet),
     extra: {
       account_id: chatgptAccountId,
       chatgpt_account_id: chatgptAccountId,
@@ -2101,13 +2102,13 @@ async function buildSub2apiOauthExport({
 
   return {
     account,
-    data: {
+    data: withSub2ApiExpiry({
       type: "sub2api-data",
       version: 1,
       exported_at: new Date().toISOString(),
       proxies: [],
       accounts: [account],
-    },
+    }),
   };
 }
 
@@ -2169,17 +2170,21 @@ async function refreshSub2apiOauthExport({ authBase, sourcePath, targetPath, fal
     throw new Error(`REFRESH_TOKEN_INVALID: 无法读取原 sub2api 文件：${error.message}`);
   }
   const account = data?.accounts?.[0];
-  const credentials = account?.credentials;
-  const refreshToken = credentials?.refresh_token;
+  const previousCredentials = account?.credentials;
+  const refreshToken = previousCredentials?.refresh_token;
   const clientId = account?.extra?.client_id || fallbackClientId;
   if (data?.type !== "sub2api-data" || !account || !refreshToken) {
     throw new Error("REFRESH_TOKEN_INVALID: 原文件缺少 OAuth 账号或 refresh_token");
   }
 
   const tokenSet = await refreshOAuthToken({ authBase, clientId, refreshToken, transport });
-  credentials.access_token = tokenSet.access_token;
-  credentials.refresh_token = tokenSet.refresh_token || refreshToken;
-  if (tokenSet.id_token) credentials.id_token = tokenSet.id_token;
+  const credentials = withOAuthTokenExpiry({
+    ...previousCredentials,
+    access_token: tokenSet.access_token,
+    refresh_token: tokenSet.refresh_token || refreshToken,
+    ...(tokenSet.id_token ? { id_token: tokenSet.id_token } : {}),
+  }, tokenSet);
+  account.credentials = credentials;
 
   if (credentials.id_token) {
     try {
@@ -2208,7 +2213,7 @@ async function refreshSub2apiOauthExport({ authBase, sourcePath, targetPath, fal
   data.version = 1;
   data.exported_at = new Date().toISOString();
   if (!Array.isArray(data.proxies)) data.proxies = [];
-  await writeJsonAtomic(targetPath, data);
+  await writeJsonAtomic(targetPath, withSub2ApiExpiry(data));
   return { email: credentials.email || "" };
 }
 

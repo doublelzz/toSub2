@@ -15,27 +15,39 @@ const email = "insights-fixture@example.com";
 const outputDir = path.join(root, id);
 await fs.mkdir(outputDir);
 const exportPath = path.join(outputDir, "sub2api-import-oauth.json");
-let raw = JSON.stringify({ type: "sub2api-data", accounts: [{ name: email, credentials: {
-  email, access_token: "fixture-access-secret", refresh_token: "fixture-refresh-secret", chatgpt_account_id: "fixture-personal-account",
+const tokenExp = Math.floor(Date.now() / 1000) + 86400;
+const accessToken = `e30.${Buffer.from(JSON.stringify({ exp: tokenExp, ["https://api.openai.com/auth"]: { chatgpt_account_id: "fixture-personal-account" } })).toString("base64url")}.fixture-access-secret`;
+let raw = JSON.stringify({ type: "sub2api-data", accounts: [{ name: email, platform: "openai", type: "oauth", credentials: {
+  email, access_token: accessToken, refresh_token: "fixture-refresh-secret", chatgpt_account_id: "fixture-personal-account",
 } }] });
 await fs.writeFile(exportPath, raw);
 let fail = false;
 let hold = false;
 const requests = [];
+let uploadedAccounts = [];
 const backend = http.createServer(async (req, res) => {
   requests.push({ method: req.method, path: new URL(req.url, "http://localhost").pathname });
+  if (req.method === "POST" && req.url === "/api/v1/admin/accounts/batch") {
+    assert.equal(req.headers["x-api-key"], "fixture-admin-key");
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    uploadedAccounts = JSON.parse(Buffer.concat(chunks).toString("utf8")).accounts;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ success: uploadedAccounts.length, failed: 0 }));
+    return;
+  }
   if (req.method === "POST" && req.url === "/oauth/token") {
     let body = "";
     for await (const chunk of req) body += chunk;
     assert.equal(new URLSearchParams(body).get("grant_type"), "refresh_token");
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
-      access_token: "fixture-access-secret", refresh_token: "fixture-refresh-secret",
+      access_token: accessToken, refresh_token: "fixture-refresh-secret",
       id_token: `e30.${Buffer.from(JSON.stringify({ email, sid: "fixture-personal-account", "https://api.openai.com/auth": { chatgpt_account_id: "fixture-personal-account", chatgpt_plan_type: "plus" } })).toString("base64url")}.signature`,
     }));
     return;
   }
-  assert.equal(req.headers.authorization, "Bearer fixture-access-secret");
+  assert.equal(req.headers.authorization, `Bearer ${accessToken}`);
   assert.equal(req.headers["chatgpt-account-id"], "fixture-personal-account");
   assert.equal(req.headers.cookie, undefined);
   await delay(hold ? 10_000 : 500);
@@ -98,6 +110,25 @@ try {
   assert.equal(completed.accountInsights.resetCredits.availableCount, 0);
   assert.equal(completed.accountInsights.subscription.expiresAt, "2099-01-01T00:00:00.000Z");
   assert.equal(await fs.readFile(exportPath, "utf8"), raw);
+  for (const response of [
+    await fetch(`${base}/api/jobs/${id}/download`, { headers }),
+    await fetch(`${base}/api/jobs/download-batch`, { method: "POST", headers, body: JSON.stringify({ ids: [id] }) }),
+  ]) {
+    assert.equal(response.status, 200);
+    const exported = await response.json();
+    assert.equal(exported.accounts[0].credentials.expires_at, new Date(tokenExp * 1000).toISOString());
+    assert.equal(exported.accounts[0].credentials.subscription_expires_at, "2099-01-01T00:00:00.000Z");
+    assert.equal(exported.accounts[0].credentials.plan_type, "plus");
+    assert.equal(exported.accounts[0].expires_at, undefined);
+  }
+  const upload = await fetch(`${base}/api/sub2api/upload`, {
+    method: "POST", headers,
+    body: JSON.stringify({ ids: [id], config: { baseUrl: backendUrl, adminApiKey: "fixture-admin-key" } }),
+  });
+  assert.equal(upload.status, 200, await upload.text());
+  assert.equal(uploadedAccounts[0].credentials.expires_at, new Date(tokenExp * 1000).toISOString());
+  assert.equal(uploadedAccounts[0].credentials.subscription_expires_at, "2099-01-01T00:00:00.000Z");
+  assert.equal(await fs.readFile(exportPath, "utf8"), raw, "downloads and uploads cannot rewrite historical authorization files");
   assert.doesNotMatch(JSON.stringify(await page()), /fixture-access-secret|fixture-refresh-secret/);
   fail = true;
   assert.equal((await post("account-insights")).status, 200);
@@ -134,7 +165,7 @@ try {
   assert.equal(completed.accountInsights.status, "error", "previous snapshot survives restart");
   assert.equal(await fs.readFile(exportPath, "utf8"), raw);
   assert.equal(requests.filter((item) => item.path === "/oauth/token").length, 1, "only the explicit regenerate operation may refresh OAuth");
-  assert.ok(requests.every((item) => item.path === "/oauth/token" || (item.method === "GET" && !/consume|authorize|oauth|signin|login/.test(item.path))), "manual checks must never log in or consume a reset");
+  assert.ok(requests.every((item) => ["/oauth/token", "/api/v1/admin/accounts/batch"].includes(item.path) || (item.method === "GET" && !/consume|authorize|oauth|signin|login/.test(item.path))), "manual checks must never log in or consume a reset");
   console.log("account insights console smoke passed (concurrency, failure isolation, cancellation, restart, no login)");
 } catch (error) {
   error.message += `\nConsole output:\n${logs}`;
