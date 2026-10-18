@@ -267,6 +267,8 @@ function App() {
   const canForceReloginSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
     && forceReloginSelectedCount > 0;
   const canUploadSelected = selectedJobs.length > 0 && downloadableSelectedCount > 0;
+  const phoneBindingSelectedCount = selectedJobs.filter((job) => job.canStartPhoneBinding).length;
+  const canStartPhoneSelected = selectedJobs.length === selectedJobIds.size && phoneBindingSelectedCount > 0;
   const totpSetupSelectedCount = selectedJobs.filter((job) => job.canSetupTotp).length;
   const canSetupTotpSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
     && totpSetupSelectedCount > 0;
@@ -680,6 +682,29 @@ function App() {
     }
   }
 
+  async function startPhoneSelected() {
+    if (!canStartPhoneSelected || !activeSmsProvider.ready || batchAction) return;
+    setBatchAction("start-phone");
+    try {
+      const data = await apiFetch(token, "/api/jobs/start-phone-batch", {
+        method: "POST",
+        body: JSON.stringify({ ids: [...selectedJobIds], smsProvider: { id: activeSmsProvider.id, config: activeSmsProvider.config } }),
+      });
+      setUploadNotice(`已开始为 ${data.started} 个账号接码${data.skipped ? `，跳过 ${data.skipped} 个` : ""}${data.failed ? `，失败 ${data.failed} 个` : ""}`);
+      setSelectedJobIds(new Set());
+      setError(data.failures?.map((item) => `${item.email}：${item.error}`).join("；") || "");
+      if (data.started) {
+        setPhoneTab("enabled");
+        setPage(1);
+        setExpandedJobId(null);
+      }
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setBatchAction("");
+    }
+  }
+
   async function setupTotpSelected() {
     if (!canSetupTotpSelected || batchAction) return;
     const skipped = selectedJobIds.size - totpSetupSelectedCount;
@@ -867,6 +892,14 @@ function App() {
               </button>
             </div>
             <div className="bulk-actions">
+              {features.batchPhoneBinding && phoneTab !== "enabled" && (
+                <button type="button" className="primary-button bulk-button" onClick={startPhoneSelected}
+                  disabled={!canStartPhoneSelected || !activeSmsProvider.ready || Boolean(batchAction)}
+                  title={activeSmsProvider.ready ? `使用 ${activeSmsProvider.name} 为选中的可接码任务开始接码` : "请先完成接码平台配置"}>
+                  {batchAction === "start-phone" ? <LoaderCircle className="spin" size={16} /> : <PhoneIncoming size={16} />}
+                  批量接码（{phoneBindingSelectedCount}）
+                </button>
+              )}
               {features.cancelAll && (
                 <button
                   type="button"

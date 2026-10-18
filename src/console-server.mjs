@@ -229,6 +229,7 @@ async function handleApi(req, res, requestUrl) {
         phoneContext: true,
         batchDownload: true,
         bulkActions: true,
+        batchPhoneBinding: true,
         pagination: true,
         uniqueEmail: true,
         smsProviders: publicSmsProviderDefinitions(),
@@ -368,6 +369,30 @@ async function handleApi(req, res, requestUrl) {
       else await retryJob(job, body);
     })));
     sendJson(res, 200, { jobs: selected.map(publicJob), started: selected.length });
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/jobs/start-phone-batch") {
+    const body = await readJson(req);
+    const selected = resolveSelectedJobs(body.ids);
+    const setup = validatedSmsSetup(body.smsProvider);
+    const outcomes = await Promise.all(selected.map((job) => withEmailJobLock(job.email, async () => {
+      if (!canStartPhoneBinding(job)) return { skipped: true };
+      try {
+        await startPhoneBinding(job, setup);
+        return { job };
+      } catch (error) {
+        return { failure: { id: job.id, email: job.email, error: safeSmsProviderError(error, setup.config?.apiKey) } };
+      }
+    })));
+    const started = outcomes.filter((item) => item.job).map((item) => item.job);
+    const failures = outcomes.filter((item) => item.failure).map((item) => item.failure);
+    if (!started.length && !failures.length) throw httpError(409, "选中的任务当前都不能开始接码");
+    sendJson(res, 200, {
+      jobs: started.map(publicJob), started: started.length,
+      skipped: outcomes.filter((item) => item.skipped).length,
+      failed: failures.length, failures,
+    });
     return;
   }
 
@@ -587,16 +612,8 @@ async function handleApi(req, res, requestUrl) {
   if (req.method === "POST" && action === "start-phone") {
     const body = await readJson(req);
     await withEmailJobLock(job.email, async () => {
-      assertMfaIdle(job.email);
-      if (!canStartPhoneBinding(job)) throw httpError(409, "请等待登录完成；正在接码或手机已验证的任务无需重复取号");
       const setup = validatedSmsSetup(body.smsProvider);
-      await writeSmsSetup(job, setup);
-      job.phoneBindingEnabled = true;
-      job.phoneBindingRequested = true;
-      job.phoneBindingStartedAt ||= new Date().toISOString();
-      await retryJob(job);
-      recordJobOperation(job, "start_phone");
-      await saveJobMetadata(job);
+      await startPhoneBinding(job, setup);
     });
     sendJson(res, 200, { job: publicJob(job) });
     return;
@@ -825,8 +842,21 @@ async function savePhoneOptions(job, options) {
 }
 
 function canStartPhoneBinding(job) {
-  return !job.child && !isActive(job.status) && phoneVerificationStatus(job) !== "verified"
+  return !job.child && ["failed", "canceled", "reauth_required", "resume_available", "phone_skipped"].includes(job.status)
+    && phoneVerificationStatus(job) !== "verified"
     && (job.loginCheckpointAvailable || job.accountSessionAvailable || job.status === "phone_skipped");
+}
+
+async function startPhoneBinding(job, setup) {
+  assertMfaIdle(job.email);
+  if (!canStartPhoneBinding(job)) throw httpError(409, "请等待登录完成；正在接码或手机已验证的任务无需重复取号");
+  await writeSmsSetup(job, setup);
+  job.phoneBindingEnabled = true;
+  job.phoneBindingRequested = true;
+  job.phoneBindingStartedAt ||= new Date().toISOString();
+  await retryJob(job);
+  recordJobOperation(job, "start_phone");
+  await saveJobMetadata(job);
 }
 
 function accountInsightsPath(job) {
@@ -3631,6 +3661,7 @@ function publicSelectionJob(job) {
     email: job.email,
     status: job.status,
     phoneBindingEnabled: job.phoneBindingEnabled !== false,
+    canStartPhoneBinding: canStartPhoneBinding(job),
     canDownload: Boolean(job.resultSaved),
     canRetry: ["failed", "canceled", "reauth_required", "resume_available", "phone_skipped"].includes(job.status),
     canRegenerate: job.status === "completed" && job.resultSaved,

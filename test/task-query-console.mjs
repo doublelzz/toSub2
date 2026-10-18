@@ -22,7 +22,7 @@ try {
     await fs.mkdir(directory);
     const email = `query-${String(index).padStart(2, "0")}@example.com`;
     await fs.writeFile(path.join(directory, "sub2api-import-oauth.json"), JSON.stringify({ type: "sub2api-data", version: 1, accounts: [{ credentials: { email } }] }));
-    await fs.writeFile(path.join(directory, "job-meta.json"), JSON.stringify({ version: 1, email, status: "completed", result_saved: true, ...(index < 25 ? { phone_binding_enabled: false } : {}), created_at: index < 25 ? "2026-10-13T01:00:00.000Z" : "2026-10-11T01:00:00.000Z", updated_at: "2026-10-13T02:00:00.000Z", last_operation_at: "2026-10-13T02:00:00.000Z" }));
+    await fs.writeFile(path.join(directory, "job-meta.json"), JSON.stringify({ version: 1, email, status: "completed", result_saved: true, ...(index === 0 ? { account_session_available: true } : {}), ...(index < 25 ? { phone_binding_enabled: false } : {}), created_at: index < 25 ? "2026-10-13T01:00:00.000Z" : "2026-10-11T01:00:00.000Z", updated_at: "2026-10-13T02:00:00.000Z", last_operation_at: "2026-10-13T02:00:00.000Z" }));
   }
   child = spawn(process.execPath, ["src/console-server.mjs", "--host", "127.0.0.1", "--port", String(port)], { cwd: projectRoot, env: { ...process.env, ONBOARDING_OUTPUT_ROOT: root }, stdio: ["ignore", "pipe", "pipe"] });
   child.stdout.on("data", (data) => { output += data; });
@@ -40,6 +40,7 @@ try {
   assert.equal(first.pagination.total, 25);
   assert.equal(first.jobs.length, 20);
   assert.equal(first.selection.length, 25);
+  assert.ok(first.selection.every(job => job.canStartPhoneBinding === false), "completed authorization must not become eligible for phone binding through a saved session");
   assert.equal(first.stats.total, 29);
   assert.equal(first.stats.today, 25);
   const disabled = await get({ phoneBinding: "disabled", page: 2 });

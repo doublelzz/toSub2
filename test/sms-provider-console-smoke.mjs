@@ -168,6 +168,66 @@ try {
     assert.match(jobLogs.logs, /\[sms\].*SMSBower.*1\/1/);
   }
 
+  const batchCreatedResponse = await fetch(`${baseUrl}/api/jobs/batch`, {
+    method: "POST", headers,
+    body: JSON.stringify({ text: Array.from({ length: 22 }, (_, index) => `insights-phone-batch-${index}@example.com`).join("\n"), phoneBindingMode: "manual" }),
+  });
+  assert.equal(batchCreatedResponse.status, 201);
+  const batchJobs = (await batchCreatedResponse.json()).jobs;
+  const batchIds = batchJobs.map(job => job.id);
+  let batchPage;
+  for (let index = 0; index < 100; index++) {
+    batchPage = await fetch(`${baseUrl}/api/jobs?search=insights-phone-batch-`, { headers }).then(response => response.json());
+    if (batchPage.selection.length === 22 && batchPage.selection.every(job => job.canStartPhoneBinding)) break;
+    await delay(100);
+  }
+  assert.equal(batchPage.jobs.length, 20);
+  assert.equal(batchPage.selection.length, 22);
+  assert.ok(batchPage.selection.every(job => job.canStartPhoneBinding), "cross-page selection must include phone eligibility");
+  const firstBatchId = batchPage.jobs[0].id;
+  const secondBatchId = batchIds.find(id => !batchPage.jobs.some(job => job.id === id));
+  const batchSmsProvider = { id: "smsbower", config: { apiKey: "test-api-key", service: "dr", country: "1001", maxPrice: "0.42", providerIds: "3301", maxRotationAttempts: "1" } };
+  const numbersBeforeBatch = smsActions.filter(item => item.action === "getNumber").length;
+  const invalidBatchSetup = await fetch(`${baseUrl}/api/jobs/start-phone-batch`, {
+    method: "POST", headers, body: JSON.stringify({ ids: [firstBatchId] }),
+  });
+  assert.equal(invalidBatchSetup.status, 400);
+  const missingBatchJob = await fetch(`${baseUrl}/api/jobs/start-phone-batch`, {
+    method: "POST", headers, body: JSON.stringify({ ids: [firstBatchId, "missing-job"], smsProvider: batchSmsProvider }),
+  });
+  assert.equal(missingBatchJob.status, 404);
+  assert.equal(smsActions.filter(item => item.action === "getNumber").length, numbersBeforeBatch,
+    "invalid selection or platform config must not acquire numbers");
+  const completedFixture = await fetch(`${baseUrl}/api/jobs?search=insights-phone-coalesced`, { headers }).then(response => response.json());
+  const batchRequest = () => fetch(`${baseUrl}/api/jobs/start-phone-batch`, {
+    method: "POST", headers,
+    body: JSON.stringify({ ids: [firstBatchId, secondBatchId, firstBatchId, completedFixture.jobs[0].id], smsProvider: batchSmsProvider }),
+  });
+  const batchResponses = await Promise.all([batchRequest(), batchRequest()]);
+  const batchResults = await Promise.all(batchResponses.map(response => response.json()));
+  assert.equal(batchResults.reduce((count, result) => count + (result.started || 0), 0), 2,
+    "overlapping batch requests must enqueue each selected eligible task once");
+  assert.ok(batchResponses.every(response => [200, 409].includes(response.status)));
+  assert.ok(batchResults.some(result => result.skipped >= 1), "verified accounts must be skipped");
+  for (const selectedId of [firstBatchId, secondBatchId]) {
+    // The second selected task is off the first page of the unfinished list.
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const email = batchJobs.find(job => job.id === selectedId).email;
+      const page = await fetch(`${baseUrl}/api/jobs?search=${encodeURIComponent(email)}`, { headers }).then(response => response.json());
+      const job = page.jobs.find(job => job.id === selectedId);
+      if (job?.status === "completed") break;
+      if (attempt === 99) {
+        const detail = await fetch(`${baseUrl}/api/jobs/${selectedId}/logs`, { headers }).then(response => response.json());
+        assert.fail(`selected batch task did not complete: ${JSON.stringify(job)}\n${detail.logs}`);
+      }
+      await delay(50);
+    }
+  }
+  assert.equal(smsActions.filter(item => item.action === "getNumber").length, numbersBeforeBatch + 2);
+  const remainingBatch = await fetch(`${baseUrl}/api/jobs?phoneBinding=disabled&search=insights-phone-batch-`, { headers }).then(response => response.json());
+  assert.equal(remainingBatch.pagination.total, 20, "unselected unfinished tasks must not start phone binding");
+  assert.ok(remainingBatch.selection.every(job => job.status === "phone_skipped"));
+
   const createdResponse = await fetch(`${baseUrl}/api/jobs`, {
     method: "POST",
     headers,

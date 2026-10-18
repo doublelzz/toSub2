@@ -205,7 +205,8 @@ try {
     return;
   }
 
-  if (["insights-phone-coalesced@example.com", "insights-phone-split@example.com", "insights-phone-failed@example.com", "insights-phone-resume@example.com"].includes(args.email)) {
+  if (["insights-phone-coalesced@example.com", "insights-phone-split@example.com", "insights-phone-failed@example.com", "insights-phone-resume@example.com"].includes(args.email)
+    || /^insights-phone-batch-\d+@example\.com$/.test(args.email)) {
     if (args.skipPhoneBinding) {
       const checkpointPath = args.checkpoint || args.resumeCheckpoint;
       await fs.writeFile(checkpointPath, JSON.stringify({ version: 1, stage: "email_verified", email: args.email, cookies: [] }));
