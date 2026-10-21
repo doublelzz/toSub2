@@ -9,16 +9,19 @@ const idTokenPayload = Buffer.from(JSON.stringify({
   email: "add-phone-page@example.com",
   sid: "mock-account-id",
   sub: "mock-user-id",
-  "https://api.openai.com/auth": { chatgpt_account_id: "mock-personal-account", chatgpt_plan_type: "plus" },
+  "https://api.openai.com/auth": { chatgpt_account_id: "mock-personal-account", chatgpt_user_id: "mock-chatgpt-user", chatgpt_plan_type: "plus", organizations: [{ id: "mock-org", is_default: true }] },
 })).toString("base64url");
 
 let lastLoginHint = "";
 let addPasswordMode = false;
 const phoneRequests = { send: 0, validate: 0 };
+const oauthRequests = [];
+let tokenEmail = "add-phone-page@example.com";
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", base);
   const body = await readBody(req);
+  if (req.method === "GET" && url.pathname === "/__oauth-requests") return sendJson(res, 200, oauthRequests);
   if (url.pathname === "/__phone-requests") return sendJson(res, 200, phoneRequests);
   if (req.method === "GET" && url.pathname === "/api/auth/session") return sendJson(res, 200, {
     user: { email: "add-phone-page@example.com" },
@@ -250,15 +253,21 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 200, { continue_url: callback.toString() });
   }
   if (req.method === "POST" && url.pathname === "/oauth/token") {
+    const form = new URLSearchParams(body);
+    oauthRequests.push({ grantType: form.get("grant_type"), clientId: form.get("client_id") });
+    tokenEmail = form.get("grant_type") === "refresh_token"
+      ? (form.get("refresh_token") === "mock-refresh-token" ? "add-phone-page@example.com" : form.get("refresh_token").slice("mock-refresh-token:".length))
+      : lastLoginHint || "add-phone-page@example.com";
+    const claims = { ...JSON.parse(Buffer.from(idTokenPayload, "base64url").toString("utf8")), email: tokenEmail };
     return sendJson(res, 200, {
       access_token: "mock-access-token",
-      refresh_token: "mock-refresh-token",
+      refresh_token: tokenEmail === "add-phone-page@example.com" ? "mock-refresh-token" : `mock-refresh-token:${tokenEmail}`,
       expires_in: 3600,
-      id_token: `e30.${lastLoginHint === "no-phone-needed@example.com" ? Buffer.from(JSON.stringify({ email: lastLoginHint, "https://api.openai.com/auth": { chatgpt_account_id: "mock-personal-account", chatgpt_plan_type: "plus" } })).toString("base64url") : idTokenPayload}.signature`,
+      id_token: `e30.${Buffer.from(JSON.stringify(claims)).toString("base64url")}.signature`,
     });
   }
   if (req.method === "GET" && url.pathname === "/backend-api/wham/usage") return sendJson(res, 200, {
-    email: lastLoginHint === "no-phone-needed@example.com" ? lastLoginHint : "add-phone-page@example.com", account_id: "mock-personal-account", plan_type: "plus",
+    email: tokenEmail, account_id: "mock-personal-account", plan_type: "plus",
     rate_limit: { allowed: true, primary_window: { used_percent: 25, limit_window_seconds: 18000 }, secondary_window: null },
     rate_limit_reset_credits: { available_count: 2 },
   });

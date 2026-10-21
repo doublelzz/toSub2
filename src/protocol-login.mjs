@@ -5,7 +5,7 @@ import path from "node:path";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { ACCOUNT_SESSION_FILENAME, checkAccountInsights, sessionIdentity } from "./account-insights.mjs";
-import { withOAuthTokenExpiry, withSub2ApiExpiry } from "./sub2api-export.mjs";
+import { normalizeOAuthCredentials, withSub2ApiExpiry, validateSub2ApiData } from "./sub2api-export.mjs";
 import {
   browserIdentityForTlsProfile,
   DEFAULT_TLS_PROFILE,
@@ -674,6 +674,7 @@ async function run() {
         clientId: args.codexClientId || DEFAULT_CODEX_CLIENT_ID,
         redirectUri: args.codexRedirectUri || DEFAULT_CODEX_REDIRECT_URI,
         accountName: args.sub2apiName,
+        expectedEmail: email,
         concurrency: args.concurrency,
         priority: args.priority,
         rateMultiplier: args.rateMultiplier,
@@ -687,7 +688,7 @@ async function run() {
       console.log(`[ok] Account: ${sub2apiExport.account.name}`);
       console.log(`[ok] Email: ${sub2apiExport.account.credentials.email || "<unknown>"}`);
       console.log(`[ok] chatgpt_account_id: ${mask(sub2apiExport.account.credentials.chatgpt_account_id)}`);
-      console.log(`[ok] chatgpt_user_id: ${mask(sub2apiExport.account.extra.chatgpt_user_id)}`);
+      console.log(`[ok] chatgpt_user_id: ${mask(sub2apiExport.account.credentials.chatgpt_user_id)}`);
       console.log("[note] sub2api import JSON contains access_token, refresh_token and id_token. Do not share it.");
     } else if (outputMode === "sub2api") {
       throw new Error("Cannot output only sub2api import without Codex OAuth. Remove --web-only and --no-sub2api-export.");
@@ -723,7 +724,7 @@ async function detectLoginSession(client, { chatgptBase, transport, expectedEmai
 }
 
 async function detectAccountInsights(exportPath, { chatgptBase, transport, expectedEmail, updateExport = false }) {
-  console.log("[account-insights] 正在检测额度、Plus 到期时间和剩余重置次数。");
+  console.log("[account-insights] 正在检测额度、订阅到期时间和剩余重置次数。");
   try {
     const snapshot = await checkAccountInsights(exportPath, {
       chatgptBase, expectedEmail, updateExport, fetcher: (url, options) => transport.fetch(url, options),
@@ -2047,6 +2048,7 @@ async function buildSub2apiOauthExport({
   clientId,
   redirectUri,
   accountName,
+  expectedEmail,
   concurrency,
   priority,
   rateMultiplier,
@@ -2067,48 +2069,37 @@ async function buildSub2apiOauthExport({
     cookie,
   });
 
-  const claims = decodeJwtPayload(tokenSet.id_token);
-  const authClaims = claims["https://api.openai.com/auth"] || {};
-  const email = claims.email || "";
-  const chatgptAccountId = claims.sid || "";
-  const chatgptUserId = authClaims.user_id || claims.sub || "";
+  const credentials = normalizeOAuthCredentials({
+    access_token: tokenSet.access_token,
+    id_token: tokenSet.id_token,
+    refresh_token: tokenSet.refresh_token,
+  }, { tokenSet, clientId, expectedEmail });
+  const email = credentials.email;
   const account = {
     name: accountName || buildAccountName(email),
     platform: "openai",
     type: "oauth",
-    credentials: withOAuthTokenExpiry({
-      access_token: tokenSet.access_token,
-      chatgpt_account_id: chatgptAccountId,
-      email,
-      id_token: tokenSet.id_token,
-      refresh_token: tokenSet.refresh_token,
-    }, tokenSet),
+    credentials,
     extra: {
-      account_id: chatgptAccountId,
-      chatgpt_account_id: chatgptAccountId,
-      chatgpt_user_id: chatgptUserId,
-      client_id: clientId,
-      email,
       openai_long_context_billing_enabled: false,
       openai_oauth_responses_websockets_v2_enabled: false,
       openai_oauth_responses_websockets_v2_mode: "off",
-      privacy_mode: "training_set_failed",
     },
-    concurrency: Number(concurrency || 10),
-    priority: Number(priority || 1),
-    rate_multiplier: Number(rateMultiplier || 1),
+    concurrency: Number(concurrency ?? 10),
+    priority: Number(priority ?? 1),
+    rate_multiplier: Number(rateMultiplier ?? 1),
     auto_pause_on_expired: true,
   };
 
   return {
     account,
-    data: withSub2ApiExpiry({
+    data: validateSub2ApiData(withSub2ApiExpiry({
       type: "sub2api-data",
       version: 1,
       exported_at: new Date().toISOString(),
       proxies: [],
       accounts: [account],
-    }),
+    }), expectedEmail),
   };
 }
 
@@ -2172,48 +2163,28 @@ async function refreshSub2apiOauthExport({ authBase, sourcePath, targetPath, fal
   const account = data?.accounts?.[0];
   const previousCredentials = account?.credentials;
   const refreshToken = previousCredentials?.refresh_token;
-  const clientId = account?.extra?.client_id || fallbackClientId;
+  const clientId = previousCredentials?.client_id || account?.extra?.client_id || fallbackClientId;
   if (data?.type !== "sub2api-data" || !account || !refreshToken) {
     throw new Error("REFRESH_TOKEN_INVALID: 原文件缺少 OAuth 账号或 refresh_token");
   }
 
   const tokenSet = await refreshOAuthToken({ authBase, clientId, refreshToken, transport });
-  const credentials = withOAuthTokenExpiry({
+  const credentials = normalizeOAuthCredentials({
     ...previousCredentials,
     access_token: tokenSet.access_token,
     refresh_token: tokenSet.refresh_token || refreshToken,
     ...(tokenSet.id_token ? { id_token: tokenSet.id_token } : {}),
-  }, tokenSet);
+  }, { tokenSet, clientId, expectedEmail: previousCredentials.email, previousCredentials });
   account.credentials = credentials;
-
-  if (credentials.id_token) {
-    try {
-      const claims = decodeJwtPayload(credentials.id_token);
-      const authClaims = claims["https://api.openai.com/auth"] || {};
-      const accountId = claims.sid || credentials.chatgpt_account_id || "";
-      const userId = authClaims.user_id || claims.sub || account?.extra?.chatgpt_user_id || "";
-      const email = claims.email || credentials.email || account?.extra?.email || "";
-      credentials.chatgpt_account_id = accountId;
-      credentials.email = email;
-      account.extra = {
-        ...(account.extra || {}),
-        account_id: accountId,
-        chatgpt_account_id: accountId,
-        chatgpt_user_id: userId,
-        client_id: clientId,
-        email,
-      };
-      if (email) account.name = buildAccountName(email);
-    } catch {
-      // Keep the existing account metadata if the provider omits or changes the ID token format.
-    }
-  }
+  account.extra = { ...(account.extra || {}) };
+  for (const key of ["account_id", "chatgpt_account_id", "chatgpt_user_id", "client_id", "email"]) delete account.extra[key];
+  if (credentials.email) account.name = buildAccountName(credentials.email);
 
   data.type = "sub2api-data";
   data.version = 1;
   data.exported_at = new Date().toISOString();
   if (!Array.isArray(data.proxies)) data.proxies = [];
-  await writeJsonAtomic(targetPath, withSub2ApiExpiry(data));
+  await writeJsonAtomic(targetPath, validateSub2ApiData(withSub2ApiExpiry(data), credentials.email));
   return { email: credentials.email || "" };
 }
 

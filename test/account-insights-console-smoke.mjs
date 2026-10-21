@@ -17,12 +17,27 @@ await fs.mkdir(outputDir);
 const exportPath = path.join(outputDir, "sub2api-import-oauth.json");
 const tokenExp = Math.floor(Date.now() / 1000) + 86400;
 const accessToken = `e30.${Buffer.from(JSON.stringify({ exp: tokenExp, ["https://api.openai.com/auth"]: { chatgpt_account_id: "fixture-personal-account" } })).toString("base64url")}.fixture-access-secret`;
-let raw = JSON.stringify({ type: "sub2api-data", accounts: [{ name: email, platform: "openai", type: "oauth", credentials: {
+let raw = JSON.stringify({ type: "sub2api-data", version: 1, proxies: [], accounts: [{ name: email, platform: "openai", type: "oauth", concurrency: 10, priority: 1, credentials: {
   email, access_token: accessToken, refresh_token: "fixture-refresh-secret", chatgpt_account_id: "fixture-personal-account",
 } }] });
 await fs.writeFile(exportPath, raw);
+const invalidId = crypto.randomUUID();
+const expiredId = crypto.randomUUID();
+const invalidPath = path.join(root, invalidId, "sub2api-import-oauth.json");
+const expiredPath = path.join(root, expiredId, "sub2api-import-oauth.json");
+const invalid = JSON.parse(raw);
+invalid.accounts[0].credentials.email = "invalid-fixture@example.com";
+invalid.accounts[0].credentials.chatgpt_account_id = "wrong-session-id";
+const expired = JSON.parse(raw);
+expired.accounts[0].credentials.email = "expired-fixture@example.com";
+expired.accounts[0].credentials.access_token = `e30.${Buffer.from(JSON.stringify({ exp: 1, "https://api.openai.com/auth": { chatgpt_account_id: "fixture-personal-account" } })).toString("base64url")}.expired-fixture`;
+for (const [target, data] of [[invalidPath, invalid], [expiredPath, expired]]) {
+  await fs.mkdir(path.dirname(target));
+  await fs.writeFile(target, JSON.stringify(data));
+}
 let fail = false;
 let hold = false;
+let partialUpload = false;
 const requests = [];
 let uploadedAccounts = [];
 const backend = http.createServer(async (req, res) => {
@@ -33,7 +48,9 @@ const backend = http.createServer(async (req, res) => {
     for await (const chunk of req) chunks.push(chunk);
     uploadedAccounts = JSON.parse(Buffer.concat(chunks).toString("utf8")).accounts;
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ success: uploadedAccounts.length, failed: 0 }));
+    res.end(JSON.stringify(partialUpload ? { code: 0, data: { success: 1, failed: 1, results: uploadedAccounts.map((account, index) => ({
+      name: account.name, success: index === 0, ...(index ? { error: "fixture-refresh-secret group rejected" } : {}),
+    })) } } : { success: uploadedAccounts.length, failed: 0 }));
     return;
   }
   if (req.method === "POST" && req.url === "/oauth/token") {
@@ -96,6 +113,21 @@ try {
   const initial = await jobWhen((job) => job.status === "completed");
   assert.equal(initial.accountInsights, null);
   assert.equal(requests.length, 0, "restoring existing outputs must not query or log in");
+  const previewResponse = await fetch(`${base}/api/jobs/export-preview`, { method: "POST", headers, body: JSON.stringify({ ids: [id, invalidId, expiredId] }) });
+  assert.equal(previewResponse.status, 200);
+  const preview = await previewResponse.json();
+  assert.equal(preview.exportable, 2);
+  assert.equal(preview.failed, 1);
+  assert.deepEqual(preview.tokens, { valid: 1, expiredWithRefresh: 1, expiredWithoutRefresh: 0, unknown: 0 });
+  assert.match(preview.rows.find((row) => row.id === invalidId).message, /账号 ID/);
+  assert.doesNotMatch(JSON.stringify(preview), /fixture-access-secret|fixture-refresh-secret|expired-fixture`/);
+  assert.equal(requests.length, 0, "preflight must not refresh tokens or call upstream services");
+  assert.equal((await fetch(`${base}/api/jobs/${invalidId}/download`, { headers })).status, 409);
+  const partialDownload = await fetch(`${base}/api/jobs/download-batch`, { method: "POST", headers, body: JSON.stringify({ ids: [id, invalidId] }) });
+  assert.equal(partialDownload.status, 200);
+  assert.equal(JSON.parse(partialDownload.headers.get("x-export-summary")).failed, 1);
+  assert.equal((await partialDownload.json()).accounts.length, 1);
+  assert.equal(await fs.readFile(invalidPath, "utf8"), JSON.stringify(invalid), "validation cannot repair saved identities");
   const concurrent = await Promise.all([post("account-insights"), post("account-insights")]);
   assert.equal(concurrent.filter((res) => res.status === 200).length, 1);
   assert.equal(concurrent.filter((res) => res.status === 409).length, 1);
@@ -129,6 +161,21 @@ try {
   assert.equal(uploadedAccounts[0].credentials.expires_at, new Date(tokenExp * 1000).toISOString());
   assert.equal(uploadedAccounts[0].credentials.subscription_expires_at, "2099-01-01T00:00:00.000Z");
   assert.equal(await fs.readFile(exportPath, "utf8"), raw, "downloads and uploads cannot rewrite historical authorization files");
+  const mixedUpload = await fetch(`${base}/api/sub2api/upload`, { method: "POST", headers, body: JSON.stringify({ ids: [id, invalidId], config: { baseUrl: backendUrl, adminApiKey: "fixture-admin-key" } }) });
+  const mixedResult = await mixedUpload.json();
+  assert.equal(mixedResult.uploaded, 1);
+  assert.equal(mixedResult.failed, 1);
+  assert.equal(uploadedAccounts.length, 1, "invalid identity must not be sent to Sub2API");
+  assert.equal(uploadedAccounts[0].extra.codex_fingerprint_mode, "off");
+  partialUpload = true;
+  const partialUploadResponse = await fetch(`${base}/api/sub2api/upload`, { method: "POST", headers, body: JSON.stringify({ ids: [id, expiredId], config: { baseUrl: backendUrl, adminApiKey: "fixture-admin-key" } }) });
+  const partialResult = await partialUploadResponse.json();
+  assert.equal(partialResult.uploaded, 1, "wrapped upstream results must determine actual successful count");
+  assert.equal(partialResult.failed, 1);
+  assert.equal(partialResult.result.results[1].jobId, expiredId);
+  assert.match(partialResult.result.results[1].message, /group rejected/);
+  assert.doesNotMatch(JSON.stringify(partialResult), /fixture-refresh-secret/);
+  partialUpload = false;
   assert.doesNotMatch(JSON.stringify(await page()), /fixture-access-secret|fixture-refresh-secret/);
   fail = true;
   assert.equal((await post("account-insights")).status, 200);

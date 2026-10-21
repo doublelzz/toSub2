@@ -130,6 +130,7 @@ const child = spawn(process.execPath, [
   env: {
     ...process.env,
     ONBOARDING_OUTPUT_ROOT: outputRoot,
+    LOCALAPPDATA: path.join(outputRoot, "test-local-appdata"),
     ONBOARDING_PROTOCOL_SCRIPT: path.join(projectRoot, "test", "mock-protocol-login.mjs"),
     TOSUB2_TLS_PROFILE: "chrome142",
     PROXY_CONNECTION_RETRY_BASE_MS: "1",
@@ -688,7 +689,7 @@ try {
     }),
   });
   assert.equal(legacyUploadResponse.status, 200, await legacyUploadResponse.text());
-  assert.equal(uploadedAccounts[0].extra.codex_fingerprint_mode, "session", "旧配置未填写时应使用 Sub2API 的推荐默认值");
+  assert.equal(uploadedAccounts[0].extra.codex_fingerprint_mode, "off", "未填写时应使用 Sub2API 的默认值");
 
   const disabledFingerprintUploadResponse = await fetch(`${baseUrl}/api/sub2api/upload`, {
     method: "POST",

@@ -13,7 +13,7 @@ import { createCredentialStore } from "./credential-store.mjs";
 import { createMfaWorkspace } from "./mfa-workspace.mjs";
 import { matchesTaskQuery, normalizeTaskQuery, summarizeTasks } from "./task-query.mjs";
 import { ACCOUNT_SESSION_FILENAME, loadAccountInsights, publicAccountInsights } from "./account-insights.mjs";
-import { withSub2ApiExpiry } from "./sub2api-export.mjs";
+import { withSub2ApiExpiry, validateSub2ApiData, summarizeSub2ApiTokens, summarizeSub2ApiUpload, mergeSub2ApiCredentials } from "./sub2api-export.mjs";
 import { phoneVerificationStatus, recordSmsOrder, publicSmsSummary } from "./sms-orders.mjs";
 import {
   fetchMailboxOtpCandidates,
@@ -501,13 +501,23 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
+  if (req.method === "POST" && requestUrl.pathname === "/api/jobs/export-preview") {
+    const body = await readJson(req);
+    const selected = resolveSelectedJobs(body.ids);
+    const payload = await buildSub2ApiUploadPayload(selected);
+    sendJson(res, 200, publicExportReport(payload));
+    return;
+  }
+
   if (req.method === "POST" && requestUrl.pathname === "/api/sub2api/upload") {
     const body = await readJson(req);
     const config = normalizeSub2ApiConfig(body.config);
     const selected = resolveSelectedJobs(body.ids);
-    const downloadable = selected.filter((job) => job.resultSaved);
-    if (downloadable.length === 0) throw httpError(409, "选中的任务里没有已完成的导入文件");
-    const payload = await buildSub2ApiUploadPayload(downloadable);
+    const payload = await buildSub2ApiUploadPayload(selected);
+    if (!payload.accounts.length) {
+      sendJson(res, 200, { ...publicExportReport(payload), uploaded: 0, unknown: 0, result: { success: 0, failed: 0, results: [] } });
+      return;
+    }
     const idempotencyKey = `tosub2-upload-${crypto.randomUUID()}`;
 
     const accounts = payload.accounts.map((account) => {
@@ -533,16 +543,19 @@ async function handleApi(req, res, requestUrl) {
         ...(config.priority !== null ? { priority: config.priority } : {}),
       };
     });
-    const result = await requestSub2Api(config, "/api/v1/admin/accounts/batch", {
+    const response = await requestSub2Api(config, "/api/v1/admin/accounts/batch", {
       method: "POST",
       headers: { "Idempotency-Key": idempotencyKey },
       body: JSON.stringify({ accounts }),
     });
+    const result = summarizeSub2ApiUpload(response, accounts, [config.adminApiKey]);
+    result.results = result.results.map((row, index) => ({ ...row, ...payload.sources[index] }));
 
     sendJson(res, 200, {
-      selected: selected.length,
-      uploaded: downloadable.length,
-      skipped: selected.length - downloadable.length,
+      ...publicExportReport(payload),
+      uploaded: result.success,
+      failed: payload.errors.length + result.failed,
+      unknown: result.unknown,
       groupIds: config.groupIds,
       result,
     });
@@ -2918,13 +2931,15 @@ async function downloadResult(res, job) {
     return;
   }
   const safeEmail = job.email.replace(/[^a-zA-Z0-9@._+-]/g, "_");
-  const data = Buffer.from(`${JSON.stringify(await readSub2ApiResult(job), null, 2)}\n`);
+  const exported = await readSub2ApiResult(job);
+  const data = Buffer.from(`${JSON.stringify(exported, null, 2)}\n`);
   res.writeHead(200, {
     "content-type": "application/json; charset=utf-8",
     "content-disposition": `attachment; filename="${safeEmail}-sub2api-import-oauth-${downloadTimestamp()}.json"`,
     "content-length": data.length,
     "cache-control": "no-store",
     "x-content-type-options": "nosniff",
+    "x-export-summary": JSON.stringify({ exported: exported.accounts.length, failed: 0, skipped: 0, ...summarizeSub2ApiTokens(exported.accounts) }),
   });
   res.end(data);
 }
@@ -2938,17 +2953,9 @@ async function downloadBatchResult(res, ids) {
 
   const selected = uniqueIds.map((id) => jobs.get(id));
   if (selected.some((job) => !job)) throw httpError(404, "部分任务不存在，请刷新页面后重试");
-  const downloadable = selected.filter((job) => job.resultSaved);
-  if (downloadable.length === 0) throw httpError(409, "选中的任务里没有已完成的导入文件");
-
-  const accounts = [];
-  const proxies = [];
-  for (const job of downloadable) {
-    if (!(await fileExists(job.outputPath))) throw httpError(409, `${job.email} 的导入文件不存在`);
-    const data = await readSub2ApiResult(job);
-    accounts.push(...data.accounts);
-    if (Array.isArray(data.proxies)) proxies.push(...data.proxies);
-  }
+  const collected = await buildSub2ApiUploadPayload(selected);
+  const { accounts, proxies } = collected;
+  if (!accounts.length) throw httpError(409, "没有通过校验的导入文件，请查看导出检查结果");
 
   const payload = Buffer.from(`${JSON.stringify({
     type: "sub2api-data",
@@ -2963,18 +2970,35 @@ async function downloadBatchResult(res, ids) {
     "content-length": payload.length,
     "cache-control": "no-store",
     "x-content-type-options": "nosniff",
+    "x-export-summary": JSON.stringify({ exported: accounts.length, failed: collected.errors.length, skipped: collected.skipped, ...summarizeSub2ApiTokens(accounts) }),
   });
   res.end(payload);
 }
 
-async function buildSub2ApiUploadPayload(downloadable) {
+async function buildSub2ApiUploadPayload(selected) {
   const accounts = [];
   const proxies = [];
-  for (const job of downloadable) {
-    if (!(await fileExists(job.outputPath))) throw httpError(409, `${job.email} 的导入文件不存在`);
-    const data = await readSub2ApiResult(job);
-    accounts.push(...data.accounts);
-    if (Array.isArray(data.proxies)) proxies.push(...data.proxies);
+  const errors = [];
+  const rows = [];
+  const sources = [];
+  let skipped = 0;
+  for (const job of selected) {
+    if (!job.resultSaved) {
+      skipped++;
+      rows.push({ id: job.id, email: job.email, status: "skipped", message: "任务尚未生成导入文件" });
+      continue;
+    }
+    try {
+      const data = await readSub2ApiResult(job);
+      accounts.push(...data.accounts);
+      sources.push(...data.accounts.map(() => ({ jobId: job.id, email: job.email })));
+      proxies.push(...data.proxies);
+      rows.push({ id: job.id, email: job.email, status: "ready", tokens: summarizeSub2ApiTokens(data.accounts) });
+    } catch (error) {
+      const row = { id: job.id, email: job.email, status: "failed", message: error.status === 409 ? error.message : "导入文件读取失败" };
+      errors.push(row);
+      rows.push(row);
+    }
   }
   return {
     type: "sub2api-data",
@@ -2982,15 +3006,22 @@ async function buildSub2ApiUploadPayload(downloadable) {
     exported_at: new Date().toISOString(),
     proxies: uniqueByJson(proxies),
     accounts,
+    errors, rows, sources, skipped, selected: selected.length,
   };
 }
 
+function publicExportReport(payload) {
+  return { selected: payload.selected, exportable: payload.accounts.length, failed: payload.errors.length,
+    skipped: payload.skipped, rows: payload.rows, tokens: summarizeSub2ApiTokens(payload.accounts) };
+}
+
 async function readSub2ApiResult(job) {
-  const data = JSON.parse(await fs.readFile(job.outputPath, "utf8"));
-  if (data.type !== "sub2api-data" || !Array.isArray(data.accounts)) {
-    throw httpError(409, `${job.email} 的导入文件格式不正确`);
-  }
-  const snapshot = await loadAccountInsights(job.outputPath, job.email, { allowHistorical: true });
+  let data;
+  try { data = JSON.parse(await fs.readFile(job.outputPath, "utf8")); }
+  catch { throw httpError(409, "导入文件不存在或不是有效 JSON"); }
+  try { validateSub2ApiData(data, job.email); }
+  catch (error) { throw httpError(409, error.message); }
+  const snapshot = await loadAccountInsights(job.outputPath, job.email);
   return withSub2ApiExpiry(data, snapshot);
 }
 
@@ -3029,7 +3060,7 @@ function normalizeSub2ApiConfig(value) {
   const loadFactor = parseOptionalSub2ApiInteger(config.loadFactor, "负载因子", 0, 10000);
   const priority = parseOptionalSub2ApiInteger(config.priority, "优先级", 0, 10000);
   const modelWhitelist = parseSub2ApiModelWhitelist(config.modelWhitelist);
-  const codexFingerprintMode = String(config.codexFingerprintMode || "session").trim().toLowerCase();
+  const codexFingerprintMode = String(config.codexFingerprintMode || "off").trim().toLowerCase();
   if (!["off", "device", "session", "full"].includes(codexFingerprintMode)) {
     throw httpError(400, "Codex 指纹收敛模式无效");
   }
@@ -3465,6 +3496,7 @@ async function performSub2ApiAutoRepairSuccess(job) {
   job.autoRepairPendingBackend = operation.backend;
   try {
     const payload = await buildSub2ApiUploadPayload([job]);
+    if (payload.errors.length) throw httpError(409, payload.errors[0].message);
     const localAccount = payload.accounts.find((account) => sub2ApiAccountEmail(account) === job.email.toLowerCase())
       || payload.accounts[0];
     if (!localAccount?.credentials) throw new Error("新授权文件中没有可更新的账号凭据");
@@ -3473,10 +3505,7 @@ async function performSub2ApiAutoRepairSuccess(job) {
     for (const remoteAccount of operation.accounts) {
       const accountId = Number(remoteAccount.id);
       if (!Number.isSafeInteger(accountId) || accountId <= 0) continue;
-      const credentials = {
-        ...(remoteAccount.credentials && typeof remoteAccount.credentials === "object" ? remoteAccount.credentials : {}),
-        ...localAccount.credentials,
-      };
+      const credentials = mergeSub2ApiCredentials(remoteAccount.credentials, localAccount.credentials);
       const extra = {
         ...(remoteAccount.extra && typeof remoteAccount.extra === "object" ? remoteAccount.extra : {}),
         codex_fingerprint_mode: operation.config.codexFingerprintMode,

@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { withSub2ApiExpiry } from "./sub2api-export.mjs";
+import { withSub2ApiExpiry, isFreePlan } from "./sub2api-export.mjs";
 
 export const ACCOUNT_INSIGHTS_FILENAME = "account-insights.json";
 export const ACCOUNT_SESSION_FILENAME = "account-session.json";
@@ -55,7 +55,8 @@ export function authorizationIdentity(data, expectedEmail = "") {
   const accountId = ids[0] || (storedId && storedId !== id.sid ? storedId : "");
   if (!accountId) throw new Error("identity_missing");
   if (number(access.exp) !== null && access.exp * 1000 <= Date.now()) throw new Error("token_expired");
-  return { email, accountId, accessToken: credentials.access_token, planType: plan(id[AUTH_CLAIM]?.chatgpt_plan_type) };
+  const newest = (number(id.iat) || 0) > (number(access.iat) || 0) ? [id, access] : [access, id];
+  return { email, accountId, accessToken: credentials.access_token, planType: newest.map((token) => plan(token[AUTH_CLAIM]?.chatgpt_plan_type)).find(Boolean) || null };
 }
 
 export function sessionIdentity(data, expectedEmail = "") {
@@ -138,8 +139,8 @@ function parseSubscription(data, identity) {
   if (data.account_id && text(data.account_id).toLowerCase() !== identity.accountId.toLowerCase()) return failure("identity_mismatch");
   const planType = plan(data.plan_type) || identity.planType;
   const expiresAt = date(data.active_until);
-  if (!planType || (planType === "plus" && !expiresAt)) return failure("unavailable");
-  return { status: "ok", planType, expiresAt: planType === "plus" ? expiresAt : null, willRenew: bool(data.will_renew) };
+  if (!planType || (!isFreePlan(planType) && !expiresAt)) return failure("unavailable");
+  return { status: "ok", planType, expiresAt: isFreePlan(planType) ? null : expiresAt, willRenew: bool(data.will_renew) };
 }
 
 export async function collectAccountInsights(data, { expectedEmail, fetcher = fetch, chatgptBase = "https://chatgpt.com", timeoutMs = 15_000 } = {}) {
@@ -175,9 +176,9 @@ export async function collectAccountInsights(data, { expectedEmail, fetcher = fe
     const candidate = Object.entries(fallback.data?.accounts || {}).find(([key, item]) => text(item?.account?.account_id || key).toLowerCase() === identity.accountId.toLowerCase())?.[1];
     const planType = plan(candidate?.account?.plan_type);
     const expiresAt = date(candidate?.entitlement?.expires_at);
-    if (!candidate?.account?.is_deactivated && ["free", "plus", "pro", "go"].includes(planType) && (planType !== "plus" || expiresAt)) {
-      snapshot.subscription = { status: "ok", planType, expiresAt: planType === "plus" ? expiresAt : null, willRenew: null };
-    } else if (identity.planType && identity.planType !== "plus" && snapshot.subscription.error === "unavailable") {
+    if (!candidate?.account?.is_deactivated && ["free", "basic", "xbasic", "plus", "pro", "go"].includes(planType) && (isFreePlan(planType) || expiresAt)) {
+      snapshot.subscription = { status: "ok", planType, expiresAt: isFreePlan(planType) ? null : expiresAt, willRenew: null };
+    } else if (isFreePlan(identity.planType) && snapshot.subscription.error === "unavailable") {
       snapshot.subscription = { status: "ok", planType: identity.planType, expiresAt: null, willRenew: null };
     }
   }

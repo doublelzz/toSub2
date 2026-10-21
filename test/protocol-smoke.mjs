@@ -62,6 +62,11 @@ try {
   assert.equal(firstExport.type, "sub2api-data");
   assert.equal(firstExport.accounts?.[0]?.credentials?.email, "add-phone-page@example.com");
   const firstCredentials = firstExport.accounts[0].credentials;
+  assert.equal(firstCredentials.chatgpt_account_id, "mock-personal-account");
+  assert.equal(firstCredentials.chatgpt_user_id, "mock-chatgpt-user");
+  assert.equal(firstCredentials.organization_id, "mock-org");
+  assert.equal(firstCredentials.client_id, "app_EMoamEEZ73f0CkXaXp7hrann");
+  assert.equal(firstExport.accounts[0].extra.privacy_mode, undefined);
   assert.ok(Math.abs(Date.parse(firstCredentials.expires_at) - Date.now() - 3600_000) < 30_000);
   assert.equal(firstCredentials.plan_type, "plus");
   assert.equal(firstCredentials.subscription_expires_at, "2099-01-01T00:00:00.000Z");
@@ -199,6 +204,8 @@ try {
 
   const beforeRefresh = JSON.parse(await fs.readFile(outputPath, "utf8"));
   beforeRefresh.accounts[0].credentials.expires_at = "2000-01-01T00:00:00Z";
+  beforeRefresh.accounts[0].credentials.client_id = "refresh-client-fixture";
+  beforeRefresh.accounts[0].extra.client_id = "wrong-extra-client";
   await fs.writeFile(outputPath, JSON.stringify(beforeRefresh));
   const refresh = await runNode([
     path.join(projectRoot, "src", "protocol-login.mjs"),
@@ -216,6 +223,10 @@ try {
 
   const refreshedExport = JSON.parse(await fs.readFile(outputPath, "utf8"));
   assert.equal(refreshedExport.type, "sub2api-data");
+  assert.equal(refreshedExport.accounts[0].credentials.chatgpt_account_id, "mock-personal-account");
+  assert.equal(refreshedExport.accounts[0].credentials.client_id, "refresh-client-fixture");
+  const oauthRequests = await (await fetch(`${baseUrl}/__oauth-requests`)).json();
+  assert.equal(oauthRequests.at(-1).clientId, "refresh-client-fixture", "refresh must prefer credentials.client_id");
   assert.equal(refreshedExport.accounts?.[0]?.credentials?.refresh_token, "mock-refresh-token");
   assert.ok(Math.abs(Date.parse(refreshedExport.accounts[0].credentials.expires_at) - Date.now() - 3600_000) < 30_000,
     "refresh must replace stale expiry using the latest token response");
@@ -394,7 +405,7 @@ try {
   assert.match(profileCompleted.output, /Account profile completed/);
   assert.match(profileCompleted.output, /Start Codex OAuth flow/);
   const profileExport = JSON.parse(await fs.readFile(profileOutputPath, "utf8"));
-  assert.equal(profileExport.accounts?.[0]?.credentials?.email, "add-phone-page@example.com");
+  assert.equal(profileExport.accounts?.[0]?.credentials?.email, "account-profile@example.com");
   assert.equal(await fileExists(profileCheckpointPath), false);
   console.log("protocol smoke tests passed");
 } catch (error) {

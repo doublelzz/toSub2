@@ -106,6 +106,16 @@ assert.equal(snapshot.subscription.expiresAt, "2099-02-01T00:00:00.000Z");
 replies = defaults();
 replies["/backend-api/subscriptions"].data = { plan_type: "free" };
 assert.equal((await collectAccountInsights(data, { fetcher })).subscription.expiresAt, null);
+for (const planType of ["pro", "go"]) {
+  replies = defaults();
+  replies["/backend-api/subscriptions"].data = { plan_type: planType, active_until: "2099-03-01T00:00:00Z" };
+  assert.equal((await collectAccountInsights(data, { fetcher })).subscription.expiresAt, "2099-03-01T00:00:00.000Z");
+  replies["/backend-api/subscriptions"] = { status: 403 };
+  replies["/backend-api/accounts/check/v4-2023-04-27"] = { data: { accounts: { personal: {
+    account: { account_id: identity.accountId, plan_type: planType }, entitlement: { expires_at: "2099-04-01T00:00:00Z" },
+  } } } };
+  assert.equal((await collectAccountInsights(data, { fetcher })).subscription.expiresAt, "2099-04-01T00:00:00.000Z");
+}
 replies = Object.fromEntries(Object.keys(defaults()).map((key) => [key, { status: 401 }]));
 snapshot = await collectAccountInsights(data, { fetcher });
 assert.equal(snapshot.status, "error");

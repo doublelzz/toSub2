@@ -190,6 +190,7 @@ const server = http.createServer(async (req, res) => {
       email: selectedEmail,
       sid: "mock-account-id",
       sub: "mock-user-id",
+      "https://api.openai.com/auth": { chatgpt_account_id: "mock-personal-account", chatgpt_user_id: "mock-user-id" },
     })).toString("base64url");
     return sendJson(res, 200, {
       access_token: "mock-access-token",

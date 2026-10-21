@@ -206,6 +206,11 @@ button { letter-spacing: 0; }
 .provider-name { padding: 4px 7px; color: var(--blue); background: var(--blue-soft); border-radius: 4px; font-size: 11px; font-weight: 700; }
 .provider-settings-button { height: 34px; margin-left: auto; }
 .sub2api-toolbar .provider-name { max-width: min(360px, 42vw); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.export-report { margin: 12px 0; padding: 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); overflow-wrap: anywhere; }
+.export-report-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.export-report p { margin: 8px 0; font-size: 13px; line-height: 1.6; color: var(--muted); }
+.export-report summary { cursor: pointer; font-size: 13px; }
+.export-report ul { max-height: 240px; overflow: auto; padding-left: 20px; font-size: 13px; line-height: 1.8; }
 .monitor-ready { padding-left: 8px; border-left: 1px solid var(--line); }
 .monitor-check-button { width: 34px; height: 34px; }
 

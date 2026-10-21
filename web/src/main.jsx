@@ -135,6 +135,7 @@ function App() {
     intervalMinutes: 5,
   });
   const [uploadNotice, setUploadNotice] = useState("");
+  const [exportReport, setExportReport] = useState(null);
   const [accountProxyUrl, setAccountProxyUrl] = useState(() => readLocalTextSetting(ACCOUNT_PROXY_STORAGE_KEY));
 
   useDialogFocus(smsSettingsOpen || mailRequestSettingsOpen || sub2apiSettingsOpen || batchOpen || filterOpen, () => {
@@ -399,6 +400,15 @@ function App() {
     });
   }
 
+  async function previewExport(ids) {
+    const report = await apiFetch(token, "/api/jobs/export-preview", {
+      method: "POST", body: JSON.stringify({ ids }),
+    });
+    setExportReport(report);
+    if (!report.exportable) throw new Error("没有通过校验的导入文件，请查看导出检查结果");
+    return report;
+  }
+
   async function uploadSelected(ids) {
     if (!sub2apiSettings.baseUrl || !sub2apiSettings.adminApiKey) {
       openSub2ApiSettings();
@@ -409,15 +419,17 @@ function App() {
     setBatchAction("upload");
     setUploadNotice("");
     try {
+      await previewExport(ids);
       const data = await apiFetch(token, "/api/sub2api/upload", {
         method: "POST",
         body: JSON.stringify({ ids, config: sub2apiSettings }),
       });
-      const result = data.result || {};
-      const created = result.account_created ?? result.success ?? data.uploaded;
-      const failed = result.account_failed ?? result.failed ?? 0;
-      setUploadNotice(`已上传 ${created} 条${failed ? `，失败 ${failed} 条` : ""}${data.skipped ? `，跳过未完成任务 ${data.skipped} 条` : ""}`);
-      setSelectedJobIds(new Set());
+      setExportReport(data);
+      setUploadNotice(`已创建 ${data.uploaded} 条${data.failed ? `，失败 ${data.failed} 条` : ""}${data.unknown ? `，结果未确认 ${data.unknown} 条` : ""}${data.skipped ? `，跳过 ${data.skipped} 条` : ""}`);
+      setSelectedJobIds(new Set([
+        ...(data.rows || []).filter((row) => row.status !== "ready").map((row) => row.id),
+        ...(data.result?.results || []).filter((row) => row.success !== true).map((row) => row.jobId),
+      ].filter(Boolean)));
       setError("");
     } catch (requestError) {
       setError(requestError.message);
@@ -650,6 +662,7 @@ function App() {
     if (!canDownloadSelected || batchAction) return;
     setBatchAction("download");
     try {
+      await previewExport([...selectedJobIds]);
       const response = await fetch("/api/jobs/download-batch", {
         method: "POST",
         headers: { "content-type": "application/json", "x-console-token": token },
@@ -657,6 +670,7 @@ function App() {
       });
       if (!response.ok) throw new Error((await response.json()).error || "批量下载失败");
       await saveDownloadResponse(response, `sub2api-import-oauth-${downloadableSelectedCount}-accounts-${localTimestamp()}.json`);
+      setUploadNotice(downloadSummary(response));
       setError("");
     } catch (requestError) {
       setError(requestError.message);
@@ -872,6 +886,7 @@ function App() {
             <button type="button" onClick={() => setError("")} title="关闭"><X size={16} /></button>
           </div>
         )}
+        {exportReport && <ExportReport report={exportReport} onClose={() => setExportReport(null)} />}
         {uploadNotice && (
           <div className="global-success" role="status">
             <Check size={17} />
@@ -972,6 +987,8 @@ function App() {
                     expanded={expandedJobId === job.id}
                     onToggleLogs={() => setExpandedJobId((current) => current === job.id ? null : job.id)}
                     onError={setError}
+                    onPreviewExport={previewExport}
+                    onDownloadNotice={setUploadNotice}
                     selected={selectedJobIds.has(job.id)}
                     onToggleSelected={() => toggleJobSelection(job.id)}
                     selectionSupported={Boolean(features.bulkActions)}
@@ -994,6 +1011,8 @@ function App() {
                     expanded={expandedJobId === job.id}
                     onToggleLogs={() => setExpandedJobId((current) => current === job.id ? null : job.id)}
                     onError={setError}
+                    onPreviewExport={previewExport}
+                    onDownloadNotice={setUploadNotice}
                     selected={selectedJobIds.has(job.id)}
                     onToggleSelected={() => toggleJobSelection(job.id)}
                     selectionSupported={Boolean(features.bulkActions)}
@@ -1286,9 +1305,9 @@ function App() {
                   value={sub2apiSettingsDraft.codexFingerprintMode}
                   onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, codexFingerprintMode: event.target.value }))}
                 >
-                  <option value="off">关闭（透传）</option>
+                  <option value="off">关闭（默认）</option>
                   <option value="device">仅设备</option>
-                  <option value="session">设备+会话（推荐）</option>
+                  <option value="session">设备+会话</option>
                   <option value="full">完全收敛</option>
                 </select>
               </label>
@@ -1600,12 +1619,13 @@ function SubscriptionInfo({ insights }) {
   if (!insights) return <span className="insight-note">未检测</span>;
   const subscription = insights.subscription;
   if (subscription?.status !== "ok") return <InsightError item={subscription} />;
-  if (subscription.planType !== "plus") return <span className="insight-note">{subscription.planType === "free" ? "未订阅 Plus" : `${subscription.planType || "未知"} 套餐`}</span>;
+  if (["free", "basic", "xbasic"].includes(subscription.planType)) return <span className="insight-note">免费套餐</span>;
   const expiresAt = Date.parse(subscription.expiresAt);
+  if (!Number.isFinite(expiresAt)) return <span className="insight-note">{subscription.planType || "未知"} 套餐 · 到期时间未知</span>;
   const remainingDays = Number.isFinite(expiresAt) ? Math.max(0, Math.ceil((expiresAt - Date.now()) / 86_400_000)) : null;
   return <div className="subscription-info">
     <time dateTime={subscription.expiresAt}>{formatInsightDate(subscription.expiresAt)}</time>
-    <span className="insight-note">{remainingDays !== null && `（剩余${remainingDays}天） · `}{remainingDays === 0 ? "已到期" : subscription.willRenew === true ? "自动续订" : subscription.willRenew === false ? "到期不续订" : "Plus"}</span>
+    <span className="insight-note">{subscription.planType} · {remainingDays !== null && `剩余${remainingDays}天 · `}{remainingDays === 0 ? "已到期" : subscription.willRenew === true ? "自动续订" : subscription.willRenew === false ? "到期不续订" : "续订状态未知"}</span>
     {(subscription.stale || subscription.error) && <span className="insight-note">上次成功结果</span>}
   </div>;
 }
@@ -1622,7 +1642,7 @@ function smsOrderStatusText(status) {
   return ({ acquired: "已取号", submitted: "已提交", complete_pending: "等待完成确认", completed: "已完成", cancel_pending: "等待取消确认", cancel_requested: "已请求取消", cancel_failed: "取消失败", complete_failed: "完成确认失败", error: "失败" })[status] || status || "未知";
 }
 
-function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, detail = false }) {
+function JobRow({ job, token, expanded, onToggleLogs, onError, onPreviewExport, onDownloadNotice, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, detail = false }) {
   const [value, setValue] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
@@ -1780,11 +1800,14 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
 
   async function download() {
     try {
+      await onPreviewExport([job.id]);
       const response = await fetch(`/api/jobs/${job.id}/download`, {
         headers: { "x-console-token": token },
       });
       if (!response.ok) throw new Error((await response.json()).error || "下载失败");
       await saveDownloadResponse(response, `${job.email}-sub2api-import-oauth-${localTimestamp()}.json`);
+      onDownloadNotice(downloadSummary(response));
+      onError("");
     } catch (requestError) {
       onError(requestError.message);
     }
@@ -1890,7 +1913,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
         {job.accountInsights?.checkedAt && <span className="insight-note" title={formatInsightDate(job.accountInsights.checkedAt)}>检测于 {formatDateTime(job.accountInsights.checkedAt)}</span>}
         {job.accountInsightsError && <span className="insight-error">{job.accountInsightsError}</span>}
       </div>
-      <div className="account-insight-section"><span className="insight-label">Plus 到期</span><SubscriptionInfo insights={job.accountInsights} /></div>
+      <div className="account-insight-section"><span className="insight-label">订阅到期</span><SubscriptionInfo insights={job.accountInsights} /></div>
       <div className="account-insight-section">
         <span className="insight-label">剩余重置次数</span>
         <div>{!job.accountInsights ? <span className="insight-note">未检测</span>
@@ -2091,6 +2114,33 @@ function smsStatusText(job) {
     manual_submitted: `${providerName}：已停止自动读取，正在验证手动输入的验证码`,
     completed: `${providerName}：手机验证已通过，订单已完成`,
   }[job.smsStatus] || `${providerName}：处理中`;
+}
+
+function formatTokenSummary(tokens = {}) {
+  return [`未过期 ${tokens.valid || 0} 条`, `已过期 ${tokens.expiredWithRefresh || 0} 条（含刷新凭据，未验证）`,
+    `已过期且无刷新凭据 ${tokens.expiredWithoutRefresh || 0} 条`, `期限未知 ${tokens.unknown || 0} 条`].join("；");
+}
+
+function downloadSummary(response) {
+  let summary;
+  try { summary = JSON.parse(response.headers.get("x-export-summary")); } catch { /* No summary from an older server. */ }
+  return summary ? `已导出 ${summary.exported} 条，失败 ${summary.failed} 条，跳过 ${summary.skipped} 条。导入 Sub2API 后请设置目标分组。`
+    : "文件已下载。导入 Sub2API 后请设置目标分组。";
+}
+
+function ExportReport({ report, onClose }) {
+  const rows = report.result ? [
+    ...(report.rows || []).filter((row) => row.status !== "ready"),
+    ...(report.result.results || []),
+  ] : report.rows || [];
+  return <section className="export-report" aria-label="导出检查结果">
+    <div className="export-report-heading"><strong>导出检查结果</strong><button type="button" className="icon-button" onClick={onClose} aria-label="关闭导出检查结果"><X size={16} /></button></div>
+    <p role="status">{formatTokenSummary(report.tokens)}</p>
+    <p>仅检查本地字段和期限；导出不会自动刷新令牌。文件导入 Sub2API 后请设置目标分组。</p>
+    <details open={report.failed > 0 || report.unknown > 0}><summary>查看逐条结果（{rows.length}）</summary><ul>{rows.map((row, index) => <li key={`${row.id || row.jobId || index}-${index}`}>
+      <strong>{row.email || row.name}</strong>：{row.message || (row.tokens ? formatTokenSummary(row.tokens) : "校验完成")}
+    </li>)}</ul></details>
+  </section>;
 }
 
 async function saveDownloadResponse(response, fallbackName) {
@@ -2355,7 +2405,7 @@ function normalizeSub2ApiSettings(value) {
     modelWhitelist: String(stored.modelWhitelist || ""),
     codexFingerprintMode: ["off", "device", "session", "full"].includes(stored.codexFingerprintMode)
       ? stored.codexFingerprintMode
-      : "session",
+      : "off",
     monitorEnabled: stored.monitorEnabled === true,
   };
 }
