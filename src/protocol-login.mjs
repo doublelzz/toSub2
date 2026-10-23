@@ -6,6 +6,7 @@ import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { ACCOUNT_SESSION_FILENAME, checkAccountInsights, sessionIdentity } from "./account-insights.mjs";
 import { normalizeOAuthCredentials, withSub2ApiExpiry, validateSub2ApiData } from "./sub2api-export.mjs";
+import { readMfaSession, writeMfaSession } from "./mfa-session.mjs";
 import {
   browserIdentityForTlsProfile,
   DEFAULT_TLS_PROFILE,
@@ -343,10 +344,10 @@ async function run() {
     if (args.logoutAll) {
       if (!args.logoutResult || !args.logoutAttempt) throw new Error("MFA_OPTIONS_INVALID: Logout requires a result path and attempt ID");
       await logoutAllChatgptDevices({
-        email: String(args.email || "").trim().toLowerCase(), chatgptBase, authBase, transport,
+        email: String(args.email || "").trim().toLowerCase(), chatgptBase, transport,
         resultPath: path.resolve(args.logoutResult), attemptId: args.logoutAttempt,
+        sessionPath: args.mfaSession ? path.resolve(args.mfaSession) : null,
         verbose: Boolean(args.verbose),
-        password: process.env.CHATGPT_LOGIN_PASSWORD || "", totpSecret: process.env.CHATGPT_TOTP_SECRET || "",
       });
       return;
     }
@@ -357,6 +358,8 @@ async function run() {
         authBase,
         transport,
         resultPath: path.resolve(args.totpResult || DEFAULT_TOTP_ROTATION_RESULT),
+        sessionPath: args.mfaSession ? path.resolve(args.mfaSession) : null,
+        sessionOutputPath: args.mfaSessionOutput ? path.resolve(args.mfaSessionOutput) : null,
         verbose: Boolean(args.verbose),
         password: process.env.CHATGPT_LOGIN_PASSWORD || "",
         totpSecret: process.env.CHATGPT_TOTP_SECRET || "",
@@ -625,7 +628,7 @@ async function run() {
       });
       await saveCheckpoint("email_verified", {});
       console.log("[checkpoint] Saved verified email login state.");
-      await detectLoginSession(client, { chatgptBase, transport, expectedEmail: email, sub2apiOutPath });
+      await detectLoginSession(client, { chatgptBase, transport, expectedEmail: email, sub2apiOutPath, deviceId: web.deviceId });
 
       if (!args.webOnly) {
         console.log("[2/5] Start Codex OAuth flow");
@@ -706,13 +709,13 @@ async function run() {
   }
 }
 
-async function detectLoginSession(client, { chatgptBase, transport, expectedEmail, sub2apiOutPath }) {
+async function detectLoginSession(client, { chatgptBase, transport, expectedEmail, sub2apiOutPath, deviceId }) {
   const sourcePath = path.join(path.dirname(sub2apiOutPath), ACCOUNT_SESSION_FILENAME);
   let source = { type: "chatgpt-session", version: 1, email: expectedEmail, accessToken: "" };
   try {
     const { data } = await client.getJson("GET", `${chatgptBase}/api/auth/session`, { referer: `${chatgptBase}/` });
-    source = { ...source, email: data?.user?.email, accessToken: data?.accessToken };
-    sessionIdentity(source, expectedEmail);
+    source = { ...source, email: data?.user?.email, accessToken: data?.accessToken, expiresAt: data?.expires, deviceId, chatgptBase };
+    source.accountId = sessionIdentity(source, expectedEmail).accountId;
     await writePrivateJson(sourcePath, source);
     console.log("[account-session-saved] 已保存身份匹配的登录会话。");
   } catch {
@@ -905,7 +908,7 @@ function isNewPasswordPage(value) {
   }
 }
 
-async function rotateChatgptTotp({ email, chatgptBase, authBase, transport, resultPath, password, totpSecret, verbose = false }) {
+async function rotateChatgptTotp({ email, chatgptBase, authBase, transport, resultPath, password, totpSecret, sessionPath, sessionOutputPath, verbose = false }) {
   if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     throw new Error("MFA_EMAIL_REQUIRED: A valid account email is required");
   }
@@ -937,6 +940,7 @@ async function rotateChatgptTotp({ email, chatgptBase, authBase, transport, resu
   }
   let client = new ProtocolClient({ transport, verbose, hideUrlQuery: true, jar: CookieJar.fromJSON(state.cookies) });
   let accessToken = "";
+  let sessionData = null;
   let loggedStage = "";
   const save = async (stage, fields = {}) => {
     state = { ...state, ...fields, stage, cookies: client.jar.toJSON(), updated_at: new Date().toISOString() };
@@ -961,6 +965,9 @@ async function rotateChatgptTotp({ email, chatgptBase, authBase, transport, resu
     }
     accessToken = typeof data.accessToken === "string" ? data.accessToken : "";
     if (!accessToken) throw new Error("MFA_SESSION_INVALID: The verified session has no access token");
+    let accountId;
+    try { accountId = decodeJwtPayload(accessToken)["https://api.openai.com/auth"]?.chatgpt_account_id; } catch {}
+    sessionData = { type: "chatgpt-session", version: 1, email, accessToken, accountId: accountId || data.account?.id, expiresAt: data.expires, chatgptBase };
   };
   const request = async (endpoint, payload = null) => {
     const target = `/backend-api/accounts/${endpoint}`;
@@ -975,6 +982,7 @@ async function rotateChatgptTotp({ email, chatgptBase, authBase, transport, resu
       throw new Error("MFA_NETWORK_ERROR: The request did not complete; retry to reconcile the saved operation");
     }
     if (result.res.status !== 200) {
+      if (result.res.status === 401) throw new Error("MFA_SESSION_EXPIRED: The saved account authorization expired; sign in explicitly before retrying");
       if (endpoint === "mfa/user/activate_enrollment"
           && /invalid_session|session_expired|enrollment_expired/i.test(result.text)) {
         throw new Error("MFA_ENROLLMENT_EXPIRED: The inactive enrollment expired; retry to request a new key");
@@ -1006,7 +1014,13 @@ async function rotateChatgptTotp({ email, chatgptBase, authBase, transport, resu
   };
   try {
     await save(state.stage);
-    if (state.cookies?.length) {
+    if (sessionPath) {
+      sessionData = await readMfaSession(sessionPath, email);
+      if (sessionData.chatgptBase && sessionData.chatgptBase !== chatgptBase) throw new Error("MFA_SESSION_INVALID: The saved authorization belongs to a different service");
+      accessToken = sessionData.accessToken;
+      if (sessionData.deviceId) state.device_id = sessionData.deviceId;
+      console.log("[mfa-rotation] Reusing saved account authorization; automatic login is disabled.");
+    } else if (state.cookies?.length) {
       try { await readSession(); }
       catch (error) {
         if (!String(error.message).startsWith("MFA_SESSION_INVALID:")) throw error;
@@ -1014,6 +1028,7 @@ async function rotateChatgptTotp({ email, chatgptBase, authBase, transport, resu
       }
     }
     if (!accessToken) {
+      if (sessionPath) throw new Error("MFA_SESSION_EXPIRED: Saved authorization is unavailable; automatic login is disabled");
       if (!password) throw new Error("MFA_PASSWORD_REQUIRED: A login password is required");
       console.log("[mfa-rotation] Sign in and verify the existing account.");
       const web = await loginChatgptWeb(client, {
@@ -1026,6 +1041,7 @@ async function rotateChatgptTotp({ email, chatgptBase, authBase, transport, resu
     }
     if (!state.device_id) await save(state.stage, { device_id: crypto.randomUUID() });
     let info = await readInfo();
+    if (sessionOutputPath) await writeMfaSession(sessionOutputPath, { ...sessionData, deviceId: state.device_id, chatgptBase }, email);
     if (confirmsNewFactor(info)) {
       await complete();
       return;
@@ -1121,7 +1137,7 @@ function mfaOperationError(error, fallback = "MFA_ROTATION_FAILED") {
   return { message, error_code: message.split(":", 1)[0], error_http_status: httpStatus, error_endpoint: endpoint };
 }
 
-async function logoutAllChatgptDevices({ email, chatgptBase, authBase, transport, resultPath, attemptId, password, totpSecret, verbose = false }) {
+async function logoutAllChatgptDevices({ email, chatgptBase, transport, resultPath, attemptId, sessionPath, verbose = false }) {
   const state = { version: 1, mode: "logout_all", email, attempt_id: attemptId, stage: "pending", logout_succeeded: false };
   let loggedStage = "";
   const save = async (fields = {}) => {
@@ -1135,20 +1151,11 @@ async function logoutAllChatgptDevices({ email, chatgptBase, authBase, transport
   try {
     await save();
     if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error("MFA_EMAIL_REQUIRED: A valid account email is required");
-    if (!password) throw new Error("MFA_PASSWORD_REQUIRED: A login password is required");
+    const session = await readMfaSession(sessionPath, email);
+    if (session.chatgptBase && session.chatgptBase !== chatgptBase) throw new Error("MFA_SESSION_INVALID: The saved authorization belongs to a different service");
     const client = new ProtocolClient({ transport, verbose, hideUrlQuery: true });
-    const web = await loginChatgptWeb(client, { chatgptBase, authBase, email, password, totpSecret, nonInteractive: true, existingOnly: true });
-    const session = await client.request("GET", `${chatgptBase}/api/auth/session`, { referer: `${chatgptBase}/` });
-    if (session.res.status !== 200) throw new Error("MFA_SESSION_INVALID: The account session expired");
-    let data;
-    try { data = JSON.parse(session.text); } catch {}
-    if (String(data?.user?.email || "").trim().toLowerCase() !== email || !data?.accessToken) {
-      throw new Error("MFA_SESSION_INVALID: Could not verify the session belongs to the requested account");
-    }
-    let accountId = data.account?.id;
-    if (!accountId) {
-      try { accountId = decodeJwtPayload(data.accessToken)["https://api.openai.com/auth"]?.chatgpt_account_id; } catch {}
-    }
+    const accountId = session.accountId;
+    const deviceId = session.deviceId || crypto.randomUUID();
     if (typeof accountId !== "string" || !/^[a-zA-Z0-9_-]{1,128}$/.test(accountId)) {
       throw new Error("MFA_LOGOUT_ACCOUNT_REQUIRED: The verified session has no account ID");
     }
@@ -1156,16 +1163,16 @@ async function logoutAllChatgptDevices({ email, chatgptBase, authBase, transport
     await save({ stage: "logout_requested" });
     let result;
     try {
-      // The captured request is a bodyless POST. Use this account's fresh
-      // session and account ID; no credentials are copied from the HAR.
+      // Reuse the verified session from authorization/MFA; never initiate login here.
       result = await client.request("POST", `${chatgptBase}${target}`, {
-        headers: { ...chatgptMfaHeaders({ chatgptBase, accessToken: data.accessToken, deviceId: web.deviceId }, target),
-          "oai-did": web.deviceId, "ChatGPT-Account-Id": accountId },
+        headers: { ...chatgptMfaHeaders({ chatgptBase, accessToken: session.accessToken, deviceId }, target),
+          "oai-did": deviceId, "ChatGPT-Account-Id": accountId },
         origin: chatgptBase, referer: `${chatgptBase}/`,
       });
     } catch {
       throw new Error("MFA_LOGOUT_NETWORK_ERROR: Logout was not confirmed; retry to check the account");
     }
+    if (result.res.status === 401) throw new Error("MFA_SESSION_EXPIRED: The saved account authorization expired; sign in explicitly before retrying");
     if (result.res.status !== 200) throw new Error(`MFA_LOGOUT_HTTP_ERROR: Logout returned HTTP ${result.res.status}`);
     let response;
     try { response = JSON.parse(result.text); } catch {
@@ -2566,6 +2573,10 @@ function parseArgs(argv) {
     else if (item === "--setup-totp") args.setupTotp = true;
     else if (item === "--rotate-totp") args.rotateTotp = true;
     else if (item === "--logout-all") args.logoutAll = true;
+    else if (item.startsWith("--mfa-session=")) args.mfaSession = item.slice("--mfa-session=".length);
+    else if (item === "--mfa-session") args.mfaSession = argv[++i];
+    else if (item.startsWith("--mfa-session-output=")) args.mfaSessionOutput = item.slice("--mfa-session-output=".length);
+    else if (item === "--mfa-session-output") args.mfaSessionOutput = argv[++i];
     else if (item.startsWith("--logout-result=")) args.logoutResult = item.slice("--logout-result=".length);
     else if (item === "--logout-result") args.logoutResult = argv[++i];
     else if (item.startsWith("--logout-attempt=")) args.logoutAttempt = item.slice("--logout-attempt=".length);
@@ -2722,7 +2733,9 @@ Options:
   --web-only                      Only complete ChatGPT web login, skip Codex OAuth.
   --setup-totp                    Sign in and set up TOTP 2FA; skip Codex OAuth.
   --rotate-totp                   Replace existing TOTP or set it up, with resumable private state.
-  --logout-all                    Sign in with current credentials and log out all devices.
+  --logout-all                    Log out all devices using --mfa-session; never signs in.
+  --mfa-session <file>           Reuse a saved account session; fail if missing or expired.
+  --mfa-session-output <file>    Save the verified MFA session for subsequent logout.
   --logout-result <file>          Private logout result; required with --logout-all.
   --logout-attempt <id>           Unique operation ID; required with --logout-all.
   --totp-result <file>            Private 2FA setup result. Default: ${DEFAULT_TOTP_RESULT}

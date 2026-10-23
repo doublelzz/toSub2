@@ -41,6 +41,39 @@ try {
   await assertComplete(firstSetup);
   assert.equal(firstSetup.calls.disable, 0);
 
+  const reused = fixture("reuse-authorization");
+  await saveSession(reused);
+  result = await run(reused, { CHATGPT_LOGIN_PASSWORD: "", CHATGPT_TOTP_SECRET: "" }, false, true);
+  assert.equal(result.code, 0, result.output);
+  await assertComplete(reused);
+  assert.equal(reused.calls.login, 0, "authorization-page MFA must not initiate login");
+  const reusedSource = JSON.parse(await fs.readFile(reused.sessionPath, "utf8"));
+  assert.equal(reusedSource.accessToken, reused.accessToken);
+  result = await run(reused, { CHATGPT_LOGIN_PASSWORD: "", CHATGPT_TOTP_SECRET: "" }, true);
+  assert.equal(result.code, 0, result.output);
+  assert.equal(reused.calls.login, 0, "logout must use the session from MFA");
+  assert.equal(reused.calls.logout, 1);
+
+  for (const [name, sessionOptions, code] of [
+    ["expired-reused-session", { expiresAt: "2000-01-01T00:00:00Z", accessToken: "opaque-expired" }, "MFA_SESSION_EXPIRED"],
+    ["mismatched-reused-session", { email: "someone-else@example.com" }, "MFA_SESSION_INVALID"],
+  ]) {
+    const value = fixture(name);
+    await saveSession(value, sessionOptions);
+    for (const logoutOperation of [false, true]) {
+      result = await run(value, {}, logoutOperation, true);
+      assert.equal(result.code, 1);
+      assert.match(result.output, new RegExp(code));
+      assert.equal(value.calls.login + value.calls.disable + value.calls.logout, 0);
+    }
+  }
+  const rejectedReuse = fixture("rejected-reused-session", { authorizationRejected: true });
+  await saveSession(rejectedReuse);
+  result = await run(rejectedReuse, {}, false, true);
+  assert.equal(result.code, 1);
+  assert.match(result.output, /MFA_SESSION_EXPIRED/);
+  assert.equal(rejectedReuse.calls.login + rejectedReuse.calls.disable, 0);
+
   const disableFailure = fixture("disable-failure", { failDisable: 1 });
   result = await run(disableFailure);
   assert.equal(result.code, 1);
@@ -182,11 +215,12 @@ try {
   assert.equal(saved.logout_succeeded, true);
   assert.equal(saved.stage, "logout_confirmed");
   assert.ok(saved.logout_at);
-  assert.deepEqual(logout.calls, { login: 1, disable: 0, enroll: 0, activate: 0, create: 0, oauth: 0, phone: 0, logout: 1 });
+  assert.deepEqual(logout.calls, { login: 0, disable: 0, enroll: 0, activate: 0, create: 0, oauth: 0, phone: 0, logout: 1 });
   for (const secret of [password, oldSecret, newSecret, sessionValue, accessToken]) assert.equal(JSON.stringify(saved).includes(secret), false);
   result = await run(logout, {}, true);
-  assert.equal(result.code, 1, "the previous MFA key must not authorize logout after rotation");
-  assert.equal(logout.calls.logout, 1);
+  assert.equal(result.code, 1, "the server revokes the saved session after logout");
+  assert.match(result.output, /MFA_SESSION_EXPIRED/);
+  assert.equal(logout.calls.login, 0, "a revoked session must never trigger login with the supplied key");
 
   const logoutMismatch = fixture("logout-identity-mismatch", { sessionMismatch: true });
   result = await run(logoutMismatch, {}, true);
@@ -198,7 +232,7 @@ try {
     ["logout-http-failure", { logoutHttpStatus: 503 }, "MFA_LOGOUT_HTTP_ERROR"],
     ["logout-response-invalid", { logoutInvalidResponse: true }, "MFA_LOGOUT_RESPONSE_INVALID"],
     ["logout-unconfirmed", { logoutUnconfirmed: true }, "MFA_LOGOUT_UNCONFIRMED"],
-    ["logout-security-check", { loginSecurityCheck: true }, "MFA_LOGIN_SECURITY_CHECK"],
+    ["logout-expired", { authorizationRejected: true }, "MFA_SESSION_EXPIRED"],
   ]) {
     const value = fixture(name, options);
     result = await run(value, {}, true);
@@ -233,18 +267,29 @@ function fixture(name, options = {}) {
     email: `${name}@example.com`, active: "old-factor", secret: oldSecret,
     resultPath: path.join(tempRoot, `${name}.json`),
     logoutResultPath: path.join(tempRoot, `${name}.logout.json`),
+    sessionPath: path.join(tempRoot, `${name}.session.json`),
     calls: { login: 0, disable: 0, enroll: 0, activate: 0, create: 0, oauth: 0, phone: 0, logout: 0 },
     ...options,
   };
+  value.accessToken = `e30.${Buffer.from(JSON.stringify({ email: value.email, exp: Math.floor(Date.now() / 1000) + 3600, "https://api.openai.com/auth": { chatgpt_account_id: "fixture-account-id" } })).toString("base64url")}.${accessToken}`;
   fixtures.set(value.email, value);
   return value;
 }
 
-async function run(value, extraEnv = {}, logout = false) {
+async function saveSession(value, overrides = {}) {
+  await fs.writeFile(value.sessionPath, JSON.stringify({ type: "chatgpt-session", version: 1,
+    email: value.sessionMismatch ? "someone-else@example.com" : value.email,
+    accessToken: value.accessToken, accountId: "fixture-account-id", deviceId: "fixture-device", chatgptBase: base, ...overrides }));
+}
+
+async function run(value, extraEnv = {}, logout = false, reuse = false) {
+  if (logout && !await fs.stat(value.sessionPath).catch(() => null)) await saveSession(value);
   value.logoutAttempt = crypto.randomUUID();
   const child = spawn(process.execPath, [path.join(projectRoot, "src/protocol-login.mjs"),
     "--email", value.email,
     ...(logout ? ["--logout-all", "--logout-result", value.logoutResultPath, "--logout-attempt", value.logoutAttempt] : ["--rotate-totp", "--totp-result", value.resultPath]),
+    ...(logout || reuse ? ["--mfa-session", value.sessionPath] : []),
+    ...(!logout ? ["--mfa-session-output", value.sessionPath] : []),
     "--chatgpt-base", base, "--auth-base", base, "--native-http", "--verbose",
   ], {
     cwd: projectRoot, windowsHide: true, stdio: ["pipe", "pipe", "pipe"],
@@ -290,7 +335,8 @@ async function handle(req, res) {
   let payload = {};
   try { payload = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch {}
   const cookieEmail = /(?:^|;\s*)fixture-account=([^;]+)/.exec(req.headers.cookie || "")?.[1];
-  const email = url.searchParams.get("login_hint") || (cookieEmail ? decodeURIComponent(cookieEmail) : "");
+  const bearerAccount = [...fixtures.values()].find((value) => req.headers.authorization === `Bearer ${value.accessToken}`);
+  const email = url.searchParams.get("login_hint") || (cookieEmail ? decodeURIComponent(cookieEmail) : bearerAccount?.email || "");
   const value = fixtures.get(email);
   const send = (status, data) => {
     res.writeHead(status, { "content-type": "application/json" });
@@ -344,9 +390,9 @@ async function handle(req, res) {
   }
   if (url.pathname === "/api/auth/session") {
     if (!(req.headers.cookie || "").includes(sessionValue)) return send(401, leakedError("unauthorized"));
-    return send(200, { user: { email: value.sessionMismatch ? "someone-else@example.com" : email }, account: { id: "fixture-account-id" }, accessToken });
+    return send(200, { user: { email: value.sessionMismatch ? "someone-else@example.com" : email }, account: { id: "fixture-account-id" }, accessToken: value.accessToken });
   }
-  if (!String(req.headers.authorization || "").includes(accessToken)) return send(401, {});
+  if (req.headers.authorization !== `Bearer ${value.accessToken}` || value.authorizationRejected) return send(401, {});
   if (url.pathname === "/backend-api/accounts/logout_all") {
     value.calls.logout++;
     assert.equal(req.method, "POST");
@@ -355,6 +401,7 @@ async function handle(req, res) {
     assert.ok(req.headers["oai-did"]);
     if (value.logoutHttpStatus) return send(value.logoutHttpStatus, leakedError("logout failed"));
     if (value.logoutInvalidResponse) { res.writeHead(200); return res.end("invalid JSON"); }
+    if (!value.logoutUnconfirmed) value.authorizationRejected = true;
     return send(200, value.logoutUnconfirmed ? { success: false } : null);
   }
   if (url.pathname === "/backend-api/accounts/mfa_info") {

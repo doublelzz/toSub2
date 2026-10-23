@@ -10,6 +10,7 @@ import { startCdkServer } from "./cdk-server.mjs";
 import { protocolEnvironment } from "./cdk-security.mjs";
 import { createCredentialStore } from "./credential-store.mjs";
 import { createMfaWorkspace } from "./mfa-workspace.mjs";
+import { invalidateMfaSession, writeMfaSession, reusableMfaSession } from "./mfa-session.mjs";
 import { matchesTaskQuery, normalizeTaskQuery, summarizeTasks } from "./task-query.mjs";
 import { ACCOUNT_SESSION_FILENAME, loadAccountInsights, publicAccountInsights } from "./account-insights.mjs";
 import { withSub2ApiExpiry, validateSub2ApiData, summarizeSub2ApiTokens, summarizeSub2ApiUpload, mergeSub2ApiCredentials } from "./sub2api-export.mjs";
@@ -130,6 +131,27 @@ mfaWorkspace = await createMfaWorkspace({
   isAccountBusy: (email) => emailJobLocks.has(email.toLowerCase())
     || [...jobs.values()].some((job) => job.email.toLowerCase() === email.toLowerCase() && isActive(job.status)),
   onSuccess: syncMfaCredentials,
+  onSyncAuthorization: syncMfaAuthorization,
+  resolveAuthorization: async (email) => {
+    const job = findJobByEmail(email);
+    if (!job) return null;
+    if (isActive(job.status) || job.child || emailJobLocks.has(email.toLowerCase())) throw httpError(409, "账号正在执行其他任务，请稍后重试");
+    const stored = await loadStoredLoginCredentials(email);
+    return { sessionPath: path.join(path.dirname(job.outputPath), ACCOUNT_SESSION_FILENAME), credentials: {
+      password: job.password || stored.password || "", totpSecret: job.totpSecret || stored.totpSecret || "", proxyUrl: job.proxyUrl || stored.proxyUrl || "",
+    } };
+  },
+  onLogout: async (email) => {
+    await withEmailJobLock(email, async () => {
+      for (const job of [...jobs.values()].filter((item) => item.email.toLowerCase() === email.toLowerCase())) {
+        await invalidateMfaSession(path.join(path.dirname(job.outputPath), ACCOUNT_SESSION_FILENAME), email);
+        job.accountSessionAvailable = false;
+        appendJobLog(job, "[mfa] 所有设备已登出，已有登录会话已标记失效。\n");
+        touch(job);
+        await saveJobMetadata(job);
+      }
+    });
+  },
 });
 scheduleQueuedJobs();
 scheduleSub2ApiMonitor();
@@ -536,7 +558,7 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
-  const match = /^\/api\/jobs\/([a-f0-9-]+)(?:\/(input|cancel|retry|regenerate|relogin|setup-2fa|add-password|account-insights|logs|download|start-phone|sms-number|luban-number))?$/.exec(requestUrl.pathname);
+  const match = /^\/api\/jobs\/([a-f0-9-]+)(?:\/(input|cancel|retry|regenerate|relogin|setup-2fa|change-mfa|add-password|account-insights|logs|download|start-phone|sms-number|luban-number))?$/.exec(requestUrl.pathname);
   if (!match) {
     sendJson(res, 404, { error: "Not found" });
     return;
@@ -549,6 +571,13 @@ async function handleApi(req, res, requestUrl) {
   }
 
   const action = match[2];
+  if (req.method === "POST" && action === "change-mfa") {
+    if (shuttingDown) throw httpError(503, "服务正在关闭，请稍后重试");
+    if (!canChangeMfa(job)) throw httpError(409, "请等待账号当前操作结束后再修改 MFA");
+    const result = await mfaWorkspace.startFromAuthorization(job.email);
+    sendJson(res, 200, result);
+    return;
+  }
   if (req.method === "POST" && action === "start-phone") {
     const body = await readJson(req);
     await withEmailJobLock(job.email, async () => {
@@ -695,6 +724,11 @@ async function handleMfaApi(req, res, requestUrl) {
   if (!body || typeof body !== "object" || Array.isArray(body)) throw httpError(400, "请求内容必须是 JSON 对象");
   if (action === "preview") sendJson(res, 200, mfaWorkspace.preview(body.text));
   else if (action === "import") sendJson(res, 200, await mfaWorkspace.importAccounts(body.text));
+  else if (action === "sync-authorization") {
+    const result = await mfaWorkspace.syncToAuthorization({ ids: body.ids });
+    scheduleQueuedJobs();
+    sendJson(res, 200, result);
+  }
   else if (action === "start" || action === "logout-all") {
     sendJson(res, 200, await mfaWorkspace[action === "start" ? "start" : "logoutAll"]({
       ...body,
@@ -724,7 +758,7 @@ async function syncMfaCredentials(email, credentials) {
     const matching = [...jobs.values()].filter((job) => job.email.toLowerCase() === email.toLowerCase());
     if (!matching.length) return;
     const stored = await loadStoredLoginCredentials(email);
-    const next = { ...stored, password: credentials.password, totpSecret: credentials.totpSecret };
+    const next = { ...stored, password: credentials.password || stored.password || "", totpSecret: credentials.totpSecret };
     if (!(await saveStoredLoginCredentials(email, next))) throw httpError(500, "MFA 已修改，账号凭据同步未完成，请重试保存");
     for (const job of matching) {
       job.password = next.password;
@@ -739,6 +773,79 @@ async function syncMfaCredentials(email, credentials) {
       touch(job);
       await saveJobMetadata(job);
     }
+  });
+}
+
+async function syncMfaAuthorization(email, credentials, sourceSession) {
+  return withEmailJobLock(email, async () => {
+    if (shuttingDown) throw httpError(409, "服务正在关闭，请稍后重试");
+    const session = reusableMfaSession(sourceSession, email);
+    const existing = findJobByEmail(email);
+    if (existing && (isActive(existing.status) || existing.child)) throw httpError(409, "授权页账号正在执行任务，请结束后重试同步");
+    const stored = await loadStoredLoginCredentials(email);
+    const next = { password: credentials.password || existing?.password || stored.password || "",
+      totpSecret: credentials.totpSecret || "", proxyUrl: credentials.proxyUrl || existing?.proxyUrl || stored.proxyUrl || "" };
+    const before = existing ? { ...existing } : null;
+    const files = new Map();
+    if (existing) {
+      await existing.metadataWritePromise;
+      for (const filename of [JOB_META_FILENAME, ACCOUNT_SESSION_FILENAME, "sms-provider.json"]) {
+        const target = path.join(path.dirname(existing.outputPath), filename);
+        files.set(target, await fs.readFile(target).catch((error) => { if (error.code === "ENOENT") return null; throw error; }));
+      }
+    }
+    let job = existing;
+    try {
+      if (!job) job = await createJobRecord(email, next, next.proxyUrl || null, false, { phoneBindingMode: "manual" }, {
+        status: "phone_skipped", prompt: "已从 MFA 同步，待手动接码", queuedMode: null, queuedAt: null,
+        lastOperationType: "sync_mfa_authorization",
+      });
+      await writeMfaSession(path.join(path.dirname(job.outputPath), ACCOUNT_SESSION_FILENAME), session, email);
+      if (!(await saveStoredLoginCredentials(email, next))) throw httpError(409, "账号资料保存失败，请重试同步");
+      job.password = next.password;
+      job.totpSecret = next.totpSecret;
+      job.proxyUrl = next.proxyUrl || null;
+      job.loginMode = next.password ? "password" : job.loginMode;
+      job.hasPasswordCredential = Boolean(next.password);
+      job.hasTotpCredential = Boolean(next.totpSecret);
+      job.totpKnownEnabled = Boolean(next.totpSecret);
+      job.phoneBindingEnabled = false;
+      job.phoneBindingMode = "manual";
+      job.phoneBindingRequested = false;
+      job.accountSessionAvailable = true;
+      job.accountInsightsSource = "session";
+      job.accountInsightsReturnStatus = job.resultSaved ? job.status : "phone_skipped";
+      job.accountInsightsReturnPrompt = job.resultSaved ? job.prompt : "已从 MFA 同步，待手动接码";
+      job.accountInsightsError = null;
+      job.accountInsightsStartedAt = new Date().toISOString();
+      job.lastError = null;
+      job.parserTail = "";
+      job.status = "queued";
+      job.queuedMode = "account_insights";
+      job.queuedAt = new Date().toISOString();
+      job.queuedStartPrompt = "正在使用已有 MFA 会话检测额度";
+      job.prompt = "等待检测额度，不自动登录或接码";
+      recordJobOperation(job, "sync_mfa_authorization");
+      await writeSmsSetup(job, null);
+      await saveJobMetadata(job);
+    } catch (error) {
+      await job?.metadataWritePromise?.catch(() => {});
+      if (existing) {
+        for (const key of Object.keys(existing)) if (!Object.hasOwn(before, key)) delete existing[key];
+        Object.assign(existing, before);
+        for (const [target, content] of files) {
+          if (content !== null) await fs.writeFile(target, content, { mode: 0o600 });
+          else await fs.rm(target, { force: true });
+        }
+      } else if (job) {
+        jobs.delete(job.id);
+        await fs.rm(path.dirname(job.outputPath), { recursive: true, force: true });
+      }
+      await saveStoredLoginCredentials(email, stored);
+      throw error;
+    }
+    appendJobLog(job, "[mfa] 已同步账号资料和已有会话到未接码列表，仅自动检测额度。\n");
+    return { jobId: job.id, created: !existing, message: "已同步到未接码列表，已安排额度检测" };
   });
 }
 
@@ -800,7 +907,7 @@ async function startPhoneBinding(job, setup) {
 }
 
 function accountInsightsPath(job) {
-  return job.resultSaved || job.status === "completed" ? job.outputPath : path.join(path.dirname(job.outputPath), ACCOUNT_SESSION_FILENAME);
+  return job.accountInsightsSource !== "session" && (job.resultSaved || job.status === "completed") ? job.outputPath : path.join(path.dirname(job.outputPath), ACCOUNT_SESSION_FILENAME);
 }
 
 async function loadJobInsights(job) {
@@ -815,6 +922,12 @@ function canCheckAccountInsights(job) {
 
 async function startJob(email, credentials = {}, proxyUrl = null, phoneBindingEnabled = false, phoneOptions = {}) {
   assertMfaIdle(email);
+  const job = await createJobRecord(email, credentials, proxyUrl, phoneBindingEnabled, phoneOptions);
+  scheduleQueuedJobs();
+  return job;
+}
+
+async function createJobRecord(email, credentials = {}, proxyUrl = null, phoneBindingEnabled = false, phoneOptions = {}, initialState = {}) {
   const { loginMode, mailApiUrl, mailRequestBody, password, totpSecret } = normalizeLoginCredentials(credentials);
   await saveStoredLoginCredentials(email, { password, totpSecret, proxyUrl });
   const id = crypto.randomUUID();
@@ -911,12 +1024,17 @@ async function startJob(email, credentials = {}, proxyUrl = null, phoneBindingEn
     autoRepairPendingBackend: null,
     autoRepairOperation: null,
     ...newSmsState(),
+    ...initialState,
   };
-  beginAuthorizationAutomationAttempt(job, "initial");
+  if (job.queuedMode === "full") beginAuthorizationAutomationAttempt(job, "initial");
+  try {
+    await writeSmsSetup(job, phoneOptions.smsSetup || null);
+    await saveJobMetadata(job);
+  } catch (error) {
+    await fs.rm(outputDir, { recursive: true, force: true });
+    throw error;
+  }
   jobs.set(id, job);
-  await writeSmsSetup(job, phoneOptions.smsSetup || null);
-  await saveJobMetadata(job);
-  scheduleQueuedJobs();
   return job;
 }
 
@@ -926,7 +1044,7 @@ function scheduleQueuedJobs(coordinator = false) {
   let availableSlots = Math.min(1, MAX_ACTIVE_JOBS - [...jobs.values()].filter(occupiesActiveSlot).length, options.availableSlots());
   if (availableSlots <= 0) return;
   const queuedJobs = [...jobs.values()]
-    .filter((job) => job.status === "queued")
+    .filter((job) => job.status === "queued" && !emailJobLocks.has(job.email.toLowerCase()) && !mfaWorkspace?.isBusy(job.email))
     .sort((a, b) => String(a.queuedAt || a.createdAt).localeCompare(String(b.queuedAt || b.createdAt)));
   let started = 0;
   for (const job of queuedJobs.slice(0, availableSlots)) {
@@ -1005,6 +1123,7 @@ function launchJob(job, options = {}) {
   if (["full", "refresh"].includes(mode)) {
     job.phoneBindingSkipped = false;
     job.accountInsightsError = null;
+    job.accountInsightsSource = null;
   }
   const args = mode === "account_insights"
     ? [PROTOCOL_SCRIPT, "--check-account-insights", accountInsightsPath(job), "--email", job.email]
@@ -3634,6 +3753,8 @@ function publicJob(job) {
     canRegenerate: job.status === "completed" && job.resultSaved,
     canForceRelogin: canForceRelogin(job),
     canSetupTotp: canSetupTotp(job),
+    canChangeMfa: canChangeMfa(job),
+    mfaBusy: mfaWorkspace?.isBusy(job.email) || false,
     canAddPassword: canAddPassword(job),
     restartRequired: job.restartRequired,
     proxyConfigured: Boolean(job.proxyUrl),
@@ -3661,12 +3782,18 @@ function publicSelectionJob(job) {
     canRegenerate: job.status === "completed" && job.resultSaved,
     canForceRelogin: canForceRelogin(job),
     canSetupTotp: canSetupTotp(job),
+    canChangeMfa: canChangeMfa(job),
     canAddPassword: canAddPassword(job),
   };
 }
 
 function canForceRelogin(job) {
   return ["completed", "failed", "canceled", "reauth_required", "resume_available", "phone_skipped"].includes(job.status);
+}
+
+function canChangeMfa(job) {
+  return !isActive(job.status) && !job.child && !mfaWorkspace?.isBusy(job.email)
+    && Boolean(job.resultSaved || job.accountSessionAvailable);
 }
 
 function canSetupTotp(job) {
@@ -3941,7 +4068,7 @@ async function syncCompletedOutputs(force = false) {
         });
         storedCredentials = totpRecovery.credentials;
         const restoredOperation = restoredOutputOperationState(metadata, completedAt, totpRecovery, passwordRecovery);
-        const accountInsights = await loadAccountInsights(accountInsightsPath({ outputPath, status: restoredOperation.status }), email);
+        const accountInsights = await loadAccountInsights(accountInsightsPath({ outputPath, status: restoredOperation.status, accountInsightsSource: metadata.account_insights_source }), email);
         jobs.set(entry.name, {
           id: entry.name,
           email,
@@ -4056,7 +4183,7 @@ async function syncCompletedOutputs(force = false) {
           child: null,
           parserTail: "",
           resultSaved: false,
-          accountInsights: await loadAccountInsights(accountInsightsPath({ outputPath, status: restoredStatus }), email),
+          accountInsights: await loadAccountInsights(accountInsightsPath({ outputPath, status: restoredStatus, accountInsightsSource: metadata.account_insights_source }), email),
           loginMode: metadata.login_mode === "password" || storedCredentials.password ? "password" : (mailApiUrl ? "email_otp" : metadata.login_mode || "manual"),
           password: storedCredentials.password,
           totpSecret: storedCredentials.totpSecret,
@@ -4147,7 +4274,7 @@ async function syncCompletedOutputs(force = false) {
           child: null,
           parserTail: "",
           resultSaved: false,
-          accountInsights: await loadAccountInsights(accountInsightsPath({ outputPath, status: restoredStatus }), metadata.email),
+          accountInsights: await loadAccountInsights(accountInsightsPath({ outputPath, status: restoredStatus, accountInsightsSource: metadata.account_insights_source }), metadata.email),
           loginMode: metadata.login_mode === "password" || storedCredentials.password ? "password" : (mailApiUrl ? "email_otp" : metadata.login_mode || "manual"),
           password: storedCredentials.password,
           totpSecret: storedCredentials.totpSecret,
@@ -4423,6 +4550,7 @@ function restoredCredentialFlags(metadata = {}, credentials = {}) {
     phoneVerifiedAt: metadata.phone_verified_at || (metadata.sms_status === "completed" ? metadata.updated_at : null),
     smsOrders: Array.isArray(metadata.sms_orders) ? metadata.sms_orders : [],
     accountSessionAvailable: metadata.account_session_available === true || metadata.status === "phone_skipped",
+    accountInsightsSource: metadata.account_insights_source === "session" ? "session" : null,
     hasPasswordCredential: Boolean(
       credentials.password
       || (hasExplicitPasswordFlag ? metadata.has_password : metadata.login_mode === "password" && metadata.has_stored_credentials),
@@ -5026,6 +5154,7 @@ async function saveJobMetadata(job) {
         sms_orders: job.smsOrders || [],
         account_session_available: Boolean(job.accountSessionAvailable),
         account_insights_return_status: job.accountInsightsReturnStatus || null,
+        account_insights_source: job.accountInsightsSource || null,
         mail_api_url: job.mailApiUrl || null,
         mail_request_body: job.mailRequestBody || null,
         has_stored_credentials: Boolean(job.password || job.totpSecret),

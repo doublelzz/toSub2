@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Ban, Check, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, CircleAlert, Copy, Download, FileText, History, ListPlus, LoaderCircle, LogOut, RefreshCw, Search, ShieldCheck, X } from "lucide-react";
+import { Ban, Check, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, CircleAlert, Copy, Download, FileText, History, ListPlus, LoaderCircle, LogOut, RefreshCw, Search, ShieldCheck, Send, X } from "lucide-react";
 import { Drawer, MoreActions, TaskFilters, TaskOverview, useCalendarDay, useDialogFocus } from "./WorkspaceUi.jsx";
 import { DEFAULT_FILTERS, matchesDate } from "./task-filters.mjs";
 import { cdkFetch } from "./cdk-api.mjs";
@@ -13,7 +13,7 @@ const STATUS_LABELS = {
 const STAGE_LABELS = {
   ready: "等待开始", queued: "等待处理", rotating: "正在修改 MFA", saving: "保存并同步新密钥",
   completed: "新 MFA 已确认生效", failed: "修改未完成，可重试恢复", interrupted: "任务已中断，可重试恢复", cancel_requested: "完成当前操作后停止",
-  pending: "登录验证", authenticated: "账号身份已确认", disable_requested: "确认旧 MFA 关闭状态",
+  pending: "检查账号授权", authenticated: "账号身份已确认", disable_requested: "确认旧 MFA 关闭状态",
   disabled: "旧 MFA 已关闭，等待设置新密钥", enroll_requested: "申请新 MFA 密钥",
   enrolled: "新密钥已保存，等待激活", activating: "激活并确认新 MFA", confirmed: "新 MFA 已确认生效",
   logout_queued: "等待登出", logging_out: "正在登出所有设备", logged_out: "所有设备已登出",
@@ -21,7 +21,7 @@ const STAGE_LABELS = {
 };
 const LOGOUT_LABELS = { idle: "尚未登出", queued: "等待登出", running: "正在登出", success: "已登出", failed: "登出失败", interrupted: "登出中断" };
 
-export default function MfaWorkspace({ token, defaultProxyUrl, onReconnect }) {
+export default function MfaWorkspace({ token, defaultProxyUrl, focusAccountId, onReconnect, onOpenAuthorization }) {
   const [accounts, setAccounts] = useState([]);
   const [selectedIds, setSelectedIds] = useState(() => new Set());
   const [text, setText] = useState("");
@@ -41,10 +41,12 @@ export default function MfaWorkspace({ token, defaultProxyUrl, onReconnect }) {
   const [error, setError] = useState("");
   const [pollError, setPollError] = useState("");
   const [notice, setNotice] = useState("");
+  const [syncResult, setSyncResult] = useState(null);
   const [loaded, setLoaded] = useState(false);
   const [running, setRunning] = useState(false);
   const [reading, setReading] = useState(false);
   const concurrencyLoaded = useRef(false);
+  const focusedAccount = useRef(null);
   useDialogFocus(importOpen, () => { if (!action) setImportOpen(false); });
 
   const request = useCallback(async (path, options = {}) => {
@@ -145,6 +147,14 @@ export default function MfaWorkspace({ token, defaultProxyUrl, onReconnect }) {
   const unknownCreatedCount = accounts.filter((account) => !account.createdAt).length;
   const detailAccount = accounts.find((account) => account.id === expandedAccountId);
 
+  useEffect(() => {
+    if (!focusAccountId || focusedAccount.current === focusAccountId || !accounts.some((account) => account.id === focusAccountId)) return;
+    focusedAccount.current = focusAccountId;
+    setSelectedIds(new Set([focusAccountId]));
+    setExpandedAccountId(focusAccountId);
+    setNotice("已从账号授权页发起 MFA 修改，使用已有授权；成功后自动同步账号资料。");
+  }, [focusAccountId, accounts]);
+
   function updateFilters(next) {
     setFilters(next);
     setPage(1);
@@ -192,6 +202,9 @@ export default function MfaWorkspace({ token, defaultProxyUrl, onReconnect }) {
       setText("");
       setPreview(null);
       setImportOpen(false);
+      setFilters(DEFAULT_FILTERS);
+      setPage(1);
+      setSelectedIds(new Set());
       setNotice(`已导入 ${data.imported} 个账号，选择账号后即可开始修改。`);
       await refresh();
     });
@@ -217,14 +230,27 @@ export default function MfaWorkspace({ token, defaultProxyUrl, onReconnect }) {
     });
   }
 
+  function syncAuthorization(targets) {
+    if (!targets.length) return;
+    void perform("sync-authorization", async () => {
+      setSyncResult(null);
+      const data = await (await request("sync-authorization", {
+        method: "POST", body: JSON.stringify({ ids: targets.map((account) => account.id) }),
+      })).json();
+      setSyncResult(data);
+      setSelectedIds(new Set(data.results.filter((row) => !row.success).map((row) => row.id)));
+      await refresh();
+    });
+  }
+
   function logoutDevices() {
     if (!logoutable.length || !validConcurrency) return;
-    if (!window.confirm(`为${selectedIds.size ? "所选" : "当前筛选中"} ${logoutable.length} 个 MFA 修改成功的账号登出所有设备？包括本次登录会话。`)) return;
+    if (!window.confirm(`使用已有授权，为${selectedIds.size ? "所选" : "当前筛选中"} ${logoutable.length} 个 MFA 修改成功的账号登出所有设备？包括本次会话。授权过期时会提示，不会重新登录。`)) return;
     void perform("logout-all", async () => {
       const data = await (await request("logout-all", {
         method: "POST", body: JSON.stringify({ ids: logoutable.map((account) => account.id), concurrency: Number(concurrency), proxyUrl: proxyUrl.trim() }),
       })).json();
-      setNotice(`已安排 ${data.started} 个账号登出所有设备，结果会显示在“设备登出”列。`);
+      setNotice(`已安排 ${data.started} 个账号使用已有授权登出；授权过期时提示，不会重新登录，结果显示在“设备登出”列。`);
       await refresh();
     });
   }
@@ -274,6 +300,12 @@ export default function MfaWorkspace({ token, defaultProxyUrl, onReconnect }) {
 
       {(error || pollError) && <div className="global-error" role="alert"><CircleAlert size={17} /><span>{error || pollError}</span><button type="button" className="error-retry" disabled={reading} onClick={retryRead}>{reading ? <LoaderCircle size={15} className="spin" /> : <RefreshCw size={15} />}重新读取</button><button type="button" title="关闭错误提示" onClick={() => { setError(""); setPollError(""); }}><X size={16} /></button></div>}
       {notice && <div className="global-success" role="status"><Check size={17} /><span>{notice}</span><button type="button" title="关闭提示" onClick={() => setNotice("")}><X size={16} /></button></div>}
+      {syncResult && <section className="export-report" aria-label="同步到账号授权结果">
+        <div className="export-report-heading"><strong>同步到账号授权</strong><button type="button" className="icon-button" aria-label="关闭同步结果" onClick={() => setSyncResult(null)}><X size={16} /></button></div>
+        <p role="status">成功 {syncResult.synced} 条，失败 {syncResult.failed} 条。同步成功的账号进入未接码列表，并自动检测额度。</p>
+        {syncResult.results.some((row) => !row.success) && <ul>{syncResult.results.filter((row) => !row.success).map((row) => <li key={row.id}>{row.email}：{row.message}</li>)}</ul>}
+        {syncResult.synced > 0 && onOpenAuthorization && <button type="button" className="secondary-button" onClick={onOpenAuthorization}>查看账号授权 · 未接码</button>}
+      </section>}
 
       <div className="mfa-controls">
         <label className="mfa-control"><span>并发数</span><input type="number" min="1" max="30" step="1" value={concurrency} onChange={(event) => { concurrencyLoaded.current = true; setConcurrency(event.target.value); }} /></label>
@@ -288,6 +320,7 @@ export default function MfaWorkspace({ token, defaultProxyUrl, onReconnect }) {
           <button type="button" className="selection-text-button" disabled={!selectedIds.size} onClick={() => setSelectedIds(new Set())}>清除选择</button>
         </div>
         <div className="bulk-actions">
+          <button type="button" className="secondary-button bulk-button" disabled={!token || !selected.length || Boolean(action)} onClick={() => syncAuthorization(selected)} title="复用已有登录会话，进入未接码并检测额度；失效时提示，不自动登录或接码">{action === "sync-authorization" ? <LoaderCircle className="spin" size={15} /> : <Send size={15} />}同步到账号授权（{selected.length}）</button>
           <button type="button" className="primary-button bulk-button" disabled={!token || running || !startable.length || !validConcurrency || Boolean(action)} onClick={() => startAccounts(startable)} title={running ? "当前批次结束后可开始下一批" : "修改所选账号的 MFA"}>{action === "start" ? <LoaderCircle className="spin" size={15} /> : <ShieldCheck size={15} />}批量修改 {startable.length || ""}</button>
           <button type="button" className="secondary-button bulk-button" disabled={running || !retryable.length || !validConcurrency || Boolean(action)} onClick={() => startAccounts(retryable, true)} title={running ? "当前批次结束后可重试" : selectedIds.size ? "重试所选账号中的失败和中断任务" : "重试筛选结果中的失败和中断任务"}>{action === "retry" ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}重试失败 / 中断 {retryable.length || ""}</button>
           <button type="button" className="secondary-button bulk-button" disabled={!token || running || !logoutable.length || !validConcurrency || Boolean(action)} onClick={logoutDevices} title={selectedIds.size ? "登出所选成功账号的所有设备" : "登出当前筛选中成功账号的所有设备"}>{action === "logout-all" ? <LoaderCircle className="spin" size={15} /> : <LogOut size={15} />}登出所有设备 {logoutable.length || ""}</button>
@@ -300,7 +333,7 @@ export default function MfaWorkspace({ token, defaultProxyUrl, onReconnect }) {
         <div><button type="button" className="secondary-button" disabled={running || !exportable.length || Boolean(action)} onClick={() => exportAccounts("txt")}>{action === "export-txt" ? <LoaderCircle className="spin" size={15} /> : <Download size={15} />}导出 TXT</button><button type="button" className="secondary-button" disabled={running || !exportable.length || Boolean(action)} onClick={() => exportAccounts("json")}>{action === "export-json" ? <LoaderCircle className="spin" size={15} /> : <Download size={15} />}导出 JSON</button></div>
       </div>
 
-      <div className="list-heading mfa-list-heading"><strong>任务列表</strong><span aria-live="polite">匹配 {filtered.length} 条</span><div><button type="button" className="selection-text-button" disabled={!filtered.length} onClick={() => setSelectedIds(new Set(filtered.map((account) => account.id)))}>全选筛选结果</button><MoreActions label="更多操作">
+      <div className="list-heading mfa-list-heading"><strong>任务列表</strong><span aria-live="polite">匹配 {filtered.length} 条 · 最近导入在前</span><div><button type="button" className="selection-text-button" disabled={!filtered.length} onClick={() => setSelectedIds(new Set(filtered.map((account) => account.id)))}>全选筛选结果</button><MoreActions label="更多操作">
           <button type="button" className="secondary-button bulk-button" disabled={running || !retryable.length || !validConcurrency || Boolean(action)} onClick={() => startAccounts(retryable, true)} title={running ? "当前批次结束后可重试" : selectedIds.size ? "重试所选账号中的失败和中断任务" : "重试筛选结果中的失败和中断任务"}>{action === "retry" ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}重试失败 / 中断 {retryable.length || ""}</button>
           <button type="button" className="secondary-button bulk-button" disabled={!token || running || !logoutable.length || !validConcurrency || Boolean(action)} onClick={logoutDevices} title={selectedIds.size ? "登出所选成功账号的所有设备" : "登出当前筛选中成功账号的所有设备"}>{action === "logout-all" ? <LoaderCircle className="spin" size={15} /> : <LogOut size={15} />}登出所有设备 {logoutable.length || ""}</button>
       </MoreActions></div></div>
@@ -322,6 +355,7 @@ export default function MfaWorkspace({ token, defaultProxyUrl, onReconnect }) {
 
       {detailAccount && <Drawer title="MFA 任务详情" onClose={() => setExpandedAccountId(null)} wide>
         <p className="detail-email">{detailAccount.email}</p>
+        <section className="detail-section"><h3>账号授权</h3><p className="prompt-line">复用已有登录会话，同步到未接码列表并自动检测额度。</p><button type="button" className="secondary-button" disabled={!token || Boolean(action) || ACTIVE_STATUSES.has(detailAccount.status) || ACTIVE_STATUSES.has(detailAccount.logoutStatus)} onClick={() => syncAuthorization([detailAccount])}><Send size={16} />同步到账号授权</button></section>
         <section className="detail-section"><h3>修改进度</h3><MfaStatus status={detailAccount.status} /><p className="prompt-line">{STAGE_LABELS[detailAccount.stage] || detailAccount.stage}</p>{detailAccount.error && <p className="row-error">{detailAccount.error}</p>}</section>
         <section className="detail-section"><h3>设备登出</h3><MfaStatus status={detailAccount.logoutStatus || "idle"} logout />{detailAccount.logoutError && <p className="row-error">{detailAccount.logoutError}</p>}{detailAccount.logoutAt && <p className="prompt-line">{formatTime(detailAccount.logoutAt)}</p>}</section>
         <section className="detail-section"><h3>时间</h3><dl className="detail-dates"><div><dt>创建时间</dt><dd>{detailAccount.createdAt ? formatTime(detailAccount.createdAt) : "未知"}</dd></div><div><dt>最近更新</dt><dd>{formatTime(detailAccount.updatedAt)}</dd></div><div><dt>修改成功</dt><dd>{formatTime(detailAccount.changedAt)}</dd></div></dl></section>

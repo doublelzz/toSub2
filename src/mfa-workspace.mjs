@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { readMfaSession, writeMfaSession, invalidateMfaSession } from "./mfa-session.mjs";
 import { protocolEnvironment } from "./cdk-security.mjs";
 
 const BUSY = new Set(["queued", "running"]);
@@ -25,6 +26,8 @@ const ERRORS = {
   MFA_CODE_REJECTED: "当前 2FA 验证失败，请核对密钥和系统时间",
   MFA_SESSION_UNAVAILABLE: "无法核对账号会话，请检查网络后重试",
   MFA_SESSION_INVALID: "账号会话失效或身份不匹配，请重新登录后重试",
+  MFA_SESSION_EXPIRED: "已有账号授权已过期，请在账号授权页重新登录后重试，本次未自动登录",
+  MFA_SESSION_MISSING: "没有可复用的账号授权，请先在账号授权页登录，本次未自动登录",
   MFA_NETWORK_ERROR: "网络请求未完成，请检查网络后重试恢复",
   MFA_HTTP_ERROR: "MFA 服务拒绝请求，请稍后重试检查远端状态",
   MFA_RESPONSE_INVALID: "MFA 服务响应异常，请重试检查远端状态",
@@ -52,7 +55,7 @@ const MAX_HISTORY = 1000;
 const MAX_LOG_CHARS = 80_000;
 const MAX_LOG_LINE_CHARS = 16_000;
 const STAGE_MESSAGES = {
-  pending: "开始登录验证", authenticated: "账号身份已确认",
+  pending: "检查账号授权", authenticated: "账号身份已确认",
   disable_requested: "准备关闭旧 2FA", disabled: "旧 2FA 已关闭",
   enroll_requested: "准备申请新 2FA", enrolled: "新密钥已保存，等待激活",
   activating: "正在激活新 2FA", confirmed: "新 2FA 已确认生效",
@@ -126,9 +129,12 @@ function publicAccount(account) {
     stage: account.stage, error: account.error || "",
     hasPassword: Boolean(account.hasPassword), hasTotpKey: Boolean(account.hasTotpKey),
     createdAt: validDate(account.createdAt), updatedAt: account.updatedAt, changedAt: account.changedAt || "",
+    importedAt: validDate(account.importedAt),
+    importOrder: Number.isSafeInteger(account.importOrder) && account.importOrder > 0 ? account.importOrder : 0,
     logoutStatus: LOGOUT_STATUSES.has(account.logoutStatus) ? account.logoutStatus : "idle",
     logoutError: Object.values(ERRORS).includes(account.logoutError) ? account.logoutError : "",
     logoutAt: validDate(account.logoutAt),
+    sessionOnly: account.sessionOnly === true,
   };
 }
 
@@ -144,7 +150,7 @@ function credentialsOnly(value = {}) {
   };
 }
 
-export async function createMfaWorkspace({ root, protocolScript, credentialStore, isAccountBusy = () => false, onSuccess = async () => {} }) {
+export async function createMfaWorkspace({ root, protocolScript, credentialStore, isAccountBusy = () => false, onSuccess = async () => {}, resolveAuthorization = async () => null, onLogout = async () => {}, onSyncAuthorization = async () => { throw requestError(409, "账号授权同步暂不可用"); } }) {
   const directory = path.join(path.resolve(root), "mfa");
   const metadataPath = path.join(directory, "accounts.json");
   const accounts = new Map();
@@ -199,7 +205,9 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
 
   function list() {
     return {
-      accounts: [...accounts.values()].map(publicAccount), concurrency,
+      accounts: [...accounts.values()].sort((a, b) =>
+        (b.importOrder || Date.parse(b.importedAt || b.createdAt) || 0) - (a.importOrder || Date.parse(a.importedAt || a.createdAt) || 0)
+      ).map(publicAccount), concurrency,
       running: [...accounts.values()].some(processing),
       ...(initializationError ? { error: initializationError } : {}),
     };
@@ -250,8 +258,9 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
     await appendLog(account, `[process] 开始${entry.operation === "logout_all" ? "登出所有设备" : "修改 2FA"}，账号：${account.email}`);
     await appendLog(account, `[proxy] ${credentials.proxyUrl || "直连"}`);
     return new Promise((resolve) => {
+      const reuseOnly = args.includes("--mfa-session") || entry.operation === "logout_all";
       const child = spawn(process.execPath, [protocolScript, ...args, "--verbose"], {
-        env: { ...protocolEnvironment(), CHATGPT_LOGIN_PASSWORD: credentials.password, CHATGPT_TOTP_SECRET: credentials.totpSecret, CHATGPT_PROXY_URL: credentials.proxyUrl },
+        env: { ...protocolEnvironment(), CHATGPT_LOGIN_PASSWORD: reuseOnly ? "" : credentials.password, CHATGPT_TOTP_SECRET: reuseOnly ? "" : credentials.totpSecret, CHATGPT_PROXY_URL: credentials.proxyUrl },
         stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
       });
       entry.child = child;
@@ -343,6 +352,30 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
     return path.join(directory, `${account.id}.logout.json`);
   }
 
+  function sessionPath(account) {
+    return path.join(directory, `${account.id}.session.json`);
+  }
+
+  async function reusableSessionPath(account, required = false) {
+    const ownPath = sessionPath(account);
+    try {
+      await fs.access(ownPath);
+      // An expired session must never trigger a fresh login or silently select another account.
+      await readMfaSession(ownPath, account.email);
+      return ownPath;
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw operationError(error?.mfaCode || "MFA_SESSION_INVALID");
+    }
+    if (required || account.sessionOnly) {
+      const authorization = await resolveAuthorization(account.email);
+      if (!authorization?.sessionPath) throw operationError("MFA_SESSION_MISSING");
+      const session = await readMfaSession(authorization.sessionPath, account.email);
+      await writeMfaSession(ownPath, session, account.email);
+      return ownPath;
+    }
+    return null;
+  }
+
   async function readCheckpoint(account) {
     let raw;
     try { raw = await fs.readFile(checkpointPath(account), "utf8"); }
@@ -355,10 +388,10 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
     } catch { throw operationError("checkpoint"); }
   }
 
-  async function loadCredentials(account) {
+  async function loadCredentials(account, requirePassword = !account.sessionOnly) {
     try {
       const credentials = credentialsOnly(await credentialStore.load(account.email));
-      if (!credentials.password) throw new Error();
+      if (requirePassword && !credentials.password) throw new Error();
       if (credentials.totpSecret) credentials.totpSecret = normalizeSecret(credentials.totpSecret);
       return credentials;
     } catch { throw operationError("credentials"); }
@@ -380,7 +413,7 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
     if (entry?.interrupted) throw operationError("interrupted");
     await serialize(async () => {
       mark(account, "success", "completed");
-      account.hasPassword = true;
+      account.hasPassword = Boolean((activeCredentials.get(account.id) || await loadCredentials(account, false)).password);
       account.hasTotpKey = true;
       account.changedAt = validDate(checkpoint.activated_at) || new Date().toISOString();
       record(account);
@@ -411,9 +444,11 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
       if (checkpoint?.activation_succeeded !== true) {
         if (isAccountBusy(account.email)) throw operationError("busy");
         const credentials = activeCredentials.get(account.id) || await loadCredentials(account);
+        const reusable = await reusableSessionPath(account, account.sessionOnly);
         if (entry.interrupted) throw operationError("interrupted");
         if (checkpoint) await appendLog(account, `[resume] 从检查点继续，阶段：${STAGE_MESSAGES[checkpoint.stage] || checkpoint.stage}`);
-        await runProtocol(account, entry, ["--rotate-totp", "--email", account.email, "--totp-result", checkpointPath(account)], credentials);
+        await runProtocol(account, entry, ["--rotate-totp", "--email", account.email, "--totp-result", checkpointPath(account),
+          "--mfa-session-output", sessionPath(account), ...(reusable ? ["--mfa-session", reusable] : [])], credentials);
         if (entry.interrupted) throw operationError("interrupted");
         checkpoint = await readCheckpoint(account);
         if (checkpoint?.activation_succeeded !== true) {
@@ -435,10 +470,11 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
     try {
       await serialize(persist);
       if (entry.interrupted) throw operationError("interrupted");
-      const credentials = activeCredentials.get(account.id) || await loadCredentials(account);
+      const credentials = activeCredentials.get(account.id) || await loadCredentials(account, false);
+      const reusable = await reusableSessionPath(account, true);
       const attemptId = crypto.randomUUID();
       await runProtocol(account, entry, ["--logout-all", "--email", account.email,
-        "--logout-result", logoutResultPath(account), "--logout-attempt", attemptId], credentials);
+        "--logout-result", logoutResultPath(account), "--logout-attempt", attemptId, "--mfa-session", reusable], credentials);
       if (entry.interrupted) throw operationError("interrupted");
       let result;
       try { result = JSON.parse(await fs.readFile(logoutResultPath(account), "utf8")); } catch {}
@@ -447,6 +483,12 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
       }
       if (result.logout_succeeded !== true || !validDate(result.logout_at)) {
         throw operationError(Object.hasOwn(ERRORS, result.error_code) ? result.error_code : "MFA_LOGOUT_FAILED");
+      }
+      try {
+        await invalidateMfaSession(sessionPath(account), account.email);
+        await onLogout(account.email);
+      } catch {
+        await appendLog(account, "[warning] 远端已确认登出，本地会话失效标记保存未完成；再次使用时仍会校验授权");
       }
       await serialize(async () => {
         markLogout(account, "success");
@@ -527,8 +569,12 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
           const account = byEmail.get(row.email);
           return [row.email, account ? { ...account } : null];
         }));
-        const imported = parsed.map((row) => {
-          const account = byEmail.get(row.email) || { id: crypto.randomUUID(), email: row.email, createdAt: new Date().toISOString(), changedAt: "" };
+        const importedAt = new Date().toISOString();
+        const importOrder = Math.max(Date.now(), ...[...accounts.values()].map((account) => account.importOrder || 0)) + parsed.length;
+        const imported = parsed.map((row, index) => {
+          const account = byEmail.get(row.email) || { id: crypto.randomUUID(), email: row.email, createdAt: importedAt, changedAt: "" };
+          account.importedAt = importedAt;
+          account.importOrder = importOrder - index;
           mark(account, "ready", "ready");
           markLogout(account, "idle");
           account.logoutAt = "";
@@ -578,7 +624,7 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
         if ([...accounts.values()].some(processing)) throw requestError(409, "已有批次正在运行");
         const loaded = [];
         for (const account of selected) {
-          const credentials = await loadCredentials(account);
+          const credentials = await loadCredentials(account, !logout && !account.sessionOnly);
           const checkpoint = await readCheckpoint(account);
           if (logout && checkpoint) throw requestError(409, "账号有待恢复的 MFA 检查点，请先重试完成恢复");
           if (proxyUrl !== undefined) credentials.proxyUrl = proxyUrl;
@@ -606,6 +652,81 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
     } finally { release(); }
     pump();
     return { ...list(), started: selected.length, count: selected.length };
+  }
+
+  async function startFromAuthorization(emailValue) {
+    ensureAvailable();
+    const email = normalizeEmail(emailValue);
+    if (!email) throw requestError(400, "账号邮箱不正确");
+    const release = reserve([email]);
+    let target;
+    try {
+      await serialize(async () => {
+        if ([...accounts.values()].some(processing) || activeTasks.size) throw requestError(409, "请等待当前 MFA 批次结束后重试");
+        const authorization = await resolveAuthorization(email);
+        if (!authorization?.sessionPath) throw operationError("MFA_SESSION_MISSING");
+        let session;
+        try { session = await readMfaSession(authorization.sessionPath, email); }
+        catch (error) { throw operationError(error.mfaCode || "MFA_SESSION_INVALID"); }
+        const existing = [...accounts.values()].find((account) => account.email === email);
+        if (!existing && accounts.size >= MAX_ACCOUNTS) throw requestError(400, `工作区最多保存 ${MAX_ACCOUNTS} 个账号`);
+        target = existing || { id: crypto.randomUUID(), email, createdAt: new Date().toISOString(), changedAt: "" };
+        const credentials = credentialsOnly(authorization.credentials);
+        if (credentials.totpSecret) credentials.totpSecret = normalizeSecret(credentials.totpSecret);
+        const previous = existing ? { ...existing } : null;
+        const previousCredentials = credentialsOnly(await credentialStore.load(email));
+        let previousSession;
+        try { previousSession = await fs.readFile(sessionPath(target)); } catch (error) { if (error.code !== "ENOENT") throw operationError("storage"); }
+        try {
+          await credentialStore.save(email, credentials);
+          await writeMfaSession(sessionPath(target), session, email);
+          target.sessionOnly = true;
+          target.hasPassword = Boolean(credentials.password);
+          target.hasTotpKey = Boolean(credentials.totpSecret);
+          mark(target, "queued", "queued");
+          markLogout(target, "idle");
+          target.logoutAt = "";
+          target.startedAt = target.updatedAt;
+          accounts.set(target.id, target);
+          await persist();
+        } catch (error) {
+          if (previous) Object.assign(target, previous);
+          else accounts.delete(target.id);
+          await credentialStore.save(email, previousCredentials).catch(() => {});
+          if (previousSession) await fs.writeFile(sessionPath(target), previousSession, { mode: 0o600 }).catch(() => {});
+          else await fs.rm(sessionPath(target), { force: true }).catch(() => {});
+          throw operationError(error.mfaCode || "storage");
+        }
+        activeCredentials.set(target.id, credentials);
+        await appendLog(target, "[queued] 从账号授权页发起 MFA 修改，复用已有授权；失效时停止并提示，不自动登录");
+      });
+    } finally { release(); }
+    pump();
+    return { ...list(), accountId: target.id, started: 1, count: 1 };
+  }
+
+  async function syncToAuthorization(options = {}) {
+    ensureAvailable();
+    const selected = selectedAccounts(options.ids);
+    const results = [];
+    for (const account of selected) {
+      let release;
+      try {
+        release = reserve([account.email]);
+        const result = await serialize(async () => {
+          if (await readCheckpoint(account)) throw requestError(409, "账号有待恢复的 MFA 检查点，请先完成恢复再同步");
+          const credentials = await loadCredentials(account, false);
+          const source = await reusableSessionPath(account, true);
+          const session = await readMfaSession(source, account.email);
+          return onSyncAuthorization(account.email, credentials, session);
+        });
+        results.push({ id: account.id, email: account.email, success: true, ...result });
+      } catch (error) {
+        results.push({ id: account.id, email: account.email, success: false,
+          message: ERRORS[error?.mfaCode] || (error?.status === 409 ? error.message : "同步未完成，请稍后重试") });
+      } finally { release?.(); }
+    }
+    return { synced: results.filter((row) => row.success).length, failed: results.filter((row) => !row.success).length, results };
   }
 
   async function cancel(ids) {
@@ -755,5 +876,5 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
     initializationError = "MFA 工作区资料无法读取或保存，请检查本地数据文件";
   }
 
-  return { list, logs, preview: (text) => { const rows = parseImport(text); return { accounts: rows.map(({ email }) => ({ email })), count: rows.length }; }, importAccounts, start, logoutAll: (options) => start(options, "logout_all"), cancel, exportAccounts, history, isBusy, shutdown };
+  return { list, logs, preview: (text) => { const rows = parseImport(text); return { accounts: rows.map(({ email }) => ({ email })), count: rows.length }; }, importAccounts, start, startFromAuthorization, syncToAuthorization, logoutAll: (options) => start(options, "logout_all"), cancel, exportAccounts, history, isBusy, shutdown };
 }

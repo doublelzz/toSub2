@@ -38,7 +38,9 @@ const arg = (name) => process.argv[process.argv.indexOf(name) + 1];
 if (process.argv.includes('--logout-all')) {
   console.log('[mfa-stage] logout_requested');
   console.error('< POST /backend-api/accounts/logout_all 200');
-  if (process.env.CHATGPT_TOTP_SECRET !== '${newSecret}') process.exit(98);
+  if (!process.argv.includes('--mfa-session') || process.env.CHATGPT_TOTP_SECRET || process.env.CHATGPT_LOGIN_PASSWORD) process.exit(98);
+  const session = JSON.parse(await fs.readFile(arg('--mfa-session'), 'utf8'));
+  if (session.email !== arg('--email') || !session.accessToken) process.exit(97);
   await new Promise((resolve) => setTimeout(resolve, 500));
   await fs.writeFile(arg('--logout-result'), JSON.stringify({
     version:1, mode:'logout_all', email:arg('--email'), attempt_id:arg('--logout-attempt'),
@@ -47,6 +49,13 @@ if (process.argv.includes('--logout-all')) {
   process.exit(0);
 }
 if (!process.argv.includes('--rotate-totp')) process.exit(99);
+if (process.argv.includes('--mfa-session')) {
+  if (process.env.CHATGPT_LOGIN_PASSWORD || process.env.CHATGPT_TOTP_SECRET) process.exit(96);
+  const session = JSON.parse(await fs.readFile(arg('--mfa-session'), 'utf8'));
+  if (session.email !== arg('--email') || !session.accessToken) process.exit(95);
+  console.log('[reuse-only] Existing authorization; no login credentials supplied');
+}
+await fs.writeFile(arg('--mfa-session-output'), JSON.stringify({type:'chatgpt-session',version:1,email:arg('--email'),accessToken:'synthetic-saved-session',accountId:'fixture-account',expiresAt:'2099-01-01T00:00:00Z'}));
 console.log('[mfa-stage] authenticated');
 console.error('< GET /api/auth/session 200');
 process.stdout.write('credential fragment: ' + process.env.CHATGPT_LOGIN_PASSWORD.slice(0, 7));
@@ -163,6 +172,35 @@ try {
   assert.equal((await (await request(`accounts/${primaryId}/logs`)).json()).logs, allLogs);
   const restoredExport = await request("export", { ids: [primaryId], format: "txt" });
   assert.equal((await restoredExport.text()).replace(/^\uFEFF/, "").trim(), `${email}----${password}----${newSecret}`);
+  const sessionPath = path.join(jobDir, "account-session.json");
+  const sourceSession = { type: "chatgpt-session", version: 1, email, accountId: "fixture-account", accessToken: "fixture-auth-page-session", expiresAt: "2000-01-01T00:00:00Z" };
+  await fs.writeFile(sessionPath, JSON.stringify(sourceSession));
+  const callMfa = () => fetch(`${base}/api/jobs/${id}/change-mfa`, { method: "POST", headers: headers(), body: "{}" });
+  assert.equal((await fetch(`${base}/api/jobs/${id}/change-mfa`, { method: "POST", body: "{}" })).status, 401);
+  const expiredStart = await callMfa();
+  assert.equal(expiredStart.status, 409);
+  assert.match((await expiredStart.json()).error, /授权已过期/);
+  await fs.writeFile(sessionPath, JSON.stringify({ ...sourceSession, expiresAt: "2099-01-01T00:00:00Z" }));
+  const exportBeforeMfa = await fs.readFile(path.join(jobDir, "sub2api-import-oauth.json"), "utf8");
+  const directStart = await callMfa();
+  assert.equal(directStart.status, 200, await directStart.clone().text());
+  assert.equal((await directStart.json()).accountId, primaryId);
+  assert.equal((await callMfa()).status, 409, "double-clicks must not queue duplicate MFA changes");
+  assert.equal((await fetch(`${base}/api/jobs/${id}/relogin`, { method: "POST", headers: headers(), body: "{}" })).status, 409);
+  await until(async () => (await (await request(`accounts/${primaryId}/logs`)).json()).logs.includes('[reuse-only]'));
+  await until(async () => (await (await request("accounts")).json()).accounts.find((account) => account.id === primaryId)?.status === "success");
+  const jobsAfterMfa = await (await fetch(`${base}/api/jobs`, { headers: headers() })).json();
+  assert.equal(jobsAfterMfa.jobs.find((job) => job.id === id).hasTotpKey, true);
+  assert.equal(jobsAfterMfa.jobs.find((job) => job.id === id).lastOperationType, "change_mfa");
+  assert.equal(await fs.readFile(path.join(jobDir, "sub2api-import-oauth.json"), "utf8"), exportBeforeMfa, "MFA changes must not regenerate Codex OAuth");
+  const afterDirectExport = await fetch(`${base}/api/jobs/export-source`, { method: "POST", headers: headers(), body: JSON.stringify({ ids: [id] }) });
+  assert.equal((await afterDirectExport.text()).replace(/^\uFEFF/, "").trim(), `${email}----${password}----${newSecret}`);
+  assert.equal((await request("logout-all", { ids: [primaryId] })).status, 200);
+  await until(async () => (await (await request(`accounts/${primaryId}/logs`)).json()).logs.split('[success] 所有设备登出').length === 3);
+  const invalidated = JSON.parse(await fs.readFile(sessionPath, "utf8"));
+  assert.equal(invalidated.accessToken, "");
+  assert.ok(invalidated.invalidatedAt);
+  assert.equal((await callMfa()).status, 409, "logged-out authorization must prompt instead of signing in");
   console.log("MFA console API, synchronization, export, and restart smoke passed");
 } catch (error) {
   error.message += `\nConsole output:\n${logs}`;

@@ -78,6 +78,7 @@ function PhoneBindingOption({ enabled, onChange, disabled }) {
 function App({ auth }) {
   const [adminView, setAdminView] = useState(auth.account.role === "admin" && auth.account.id === auth.workspace.id);
   const [activeWorkspace, setActiveWorkspace] = useState(auth.account.role === "admin" && auth.account.id === auth.workspace.id ? "cdk-management" : "authorization");
+  const [mfaFocusAccountId, setMfaFocusAccountId] = useState(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [remoteBindingOpen, setRemoteBindingOpen] = useState(false);
   const [remoteBindingError, setRemoteBindingError] = useState("");
@@ -416,6 +417,12 @@ function App({ auth }) {
     setExportReport(report);
     if (!report.exportable) throw new Error("没有通过校验的导入文件，请查看导出检查结果");
     return report;
+  }
+
+  function showStartedMfa(accountId) {
+    setMfaFocusAccountId(accountId);
+    setExpandedJobId(null);
+    setActiveWorkspace("mfa");
   }
 
   async function uploadSelected(ids) {
@@ -879,7 +886,9 @@ function App({ auth }) {
       </header>
       {auth.workspace.id !== auth.account.id && <p className="cdk-scope-note">管理员正在查看 {auth.workspace.note || auth.workspace.label} 的工作区。此处操作和新增导入属于该 CDK。</p>}
       {activeWorkspace.startsWith("cdk-") && <CdkWorkspace auth={auth} section={activeWorkspace.slice(4)} onNavigate={(section) => setActiveWorkspace(`cdk-${section}`)} />}
-      {activeWorkspace === "mfa" && <MfaWorkspace token={token} defaultProxyUrl={accountProxyUrl} onReconnect={() => setConnectionAttempt((current) => current + 1)} />}
+      {activeWorkspace === "mfa" && <MfaWorkspace token={token} defaultProxyUrl={accountProxyUrl} focusAccountId={mfaFocusAccountId} onReconnect={() => setConnectionAttempt((current) => current + 1)} onOpenAuthorization={() => {
+        setPhoneTab("disabled"); setFilters(DEFAULT_FILTERS); setEmailFilter([]); setSelectedJobIds(new Set()); setExpandedJobId(null); setPage(1); setActiveWorkspace("authorization");
+      }} />}
       {activeWorkspace === "authorization" && <>
       <section className="workspace">
         <div className="section-heading"><div><h2>账号授权</h2><p>查看任务进度、管理授权和账号额度</p></div><button type="button" className="primary-button" disabled={!token} onClick={() => setSingleOpen(true)}><Plus size={17} />新建任务</button></div>
@@ -1019,6 +1028,8 @@ function App({ auth }) {
                     onError={setError}
                     onPreviewExport={previewExport}
                     onDownloadNotice={setUploadNotice}
+                    onMfaStarted={showStartedMfa}
+                    mfaChangeAvailable={Boolean(features.mfaChange)}
                     selected={selectedJobIds.has(job.id)}
                     onToggleSelected={() => toggleJobSelection(job.id)}
                     selectionSupported={Boolean(features.bulkActions)}
@@ -1043,6 +1054,8 @@ function App({ auth }) {
                     onError={setError}
                     onPreviewExport={previewExport}
                     onDownloadNotice={setUploadNotice}
+                    onMfaStarted={showStartedMfa}
+                    mfaChangeAvailable={Boolean(features.mfaChange)}
                     selected={selectedJobIds.has(job.id)}
                     onToggleSelected={() => toggleJobSelection(job.id)}
                     selectionSupported={Boolean(features.bulkActions)}
@@ -1678,7 +1691,7 @@ function smsOrderStatusText(status) {
   return ({ acquired: "已取号", submitted: "已提交", complete_pending: "等待完成确认", completed: "已完成", cancel_pending: "等待取消确认", cancel_requested: "已请求取消", cancel_failed: "取消失败", complete_failed: "完成确认失败", error: "失败" })[status] || status || "未知";
 }
 
-function JobRow({ job, token, expanded, onToggleLogs, onError, onPreviewExport, onDownloadNotice, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, detail = false }) {
+function JobRow({ job, token, expanded, onToggleLogs, onError, onPreviewExport, onDownloadNotice, onMfaStarted, mfaChangeAvailable, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, detail = false }) {
   const [value, setValue] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
@@ -1746,6 +1759,17 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, onPreviewExport, 
     try {
       await apiFetch(token, `/api/jobs/${job.id}/account-insights`, { method: "POST", body: "{}" });
       onError("");
+    } catch (requestError) { onError(requestError.message); }
+    finally { setSubmitting(false); }
+  }
+
+  async function changeMfa() {
+    if (submitting || !job.canChangeMfa) return;
+    setSubmitting(true);
+    try {
+      const result = await apiFetch(token, `/api/jobs/${job.id}/change-mfa`, { method: "POST", body: "{}" });
+      onError("");
+      onMfaStarted(result.accountId);
     } catch (requestError) { onError(requestError.message); }
     finally { setSubmitting(false); }
   }
@@ -1992,6 +2016,11 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, onPreviewExport, 
               重新登录并授权
             </button>
           )}
+          {detail && mfaChangeAvailable && (job.canChangeMfa || job.mfaBusy) && (
+            <button type="button" className="secondary-button" onClick={changeMfa} disabled={submitting || job.mfaBusy} title="使用已有账号授权修改 MFA；过期时提示，成功后同步账号资料">
+              <ShieldCheck size={16} />{job.mfaBusy ? "MFA 处理中" : "修改 MFA"}
+            </button>
+          )}
           {totpSetupAvailable && job.canSetupTotp && (
             <button type="button" className="icon-button" onClick={setupTotp} disabled={submitting} title="设置 2FA">
               {submitting ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}设置 2FA
@@ -2021,7 +2050,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, onPreviewExport, 
     <td className="insight-cell quota-column">{quotaContent}</td>
     <td className="sms-column"><SmsSummary summary={job.smsSummary} /></td>
     <td className="task-time-cell"><div><span>创建</span><time dateTime={job.createdAt} title={formatInsightDate(job.createdAt)}>{formatDateTime(job.createdAt)}</time></div><div><span>操作</span><time dateTime={job.lastOperationAt || job.createdAt} title={formatInsightDate(job.lastOperationAt || job.createdAt)}>{formatDateTime(job.lastOperationAt || job.createdAt)}</time></div><small>{operationLabel(job.lastOperationType)}</small></td>
-    <td className="actions-cell"><div className="row-actions"><button type="button" className="text-action" onClick={onToggleLogs} aria-label={`查看 ${job.email} 的任务详情`}>查看</button>{job.canDownload && <button type="button" className="text-action" onClick={download}><Download size={14} />下载</button>}{job.canRetry && !job.canDownload && <button type="button" className="text-action" onClick={retry} disabled={submitting}>{job.canResume ? "继续" : "重试"}</button>}<MoreActions label="更多">{actionContent}</MoreActions></div></td>
+    <td className="actions-cell"><div className="row-actions"><button type="button" className="text-action" onClick={onToggleLogs} aria-label={`查看 ${job.email} 的任务详情`}>查看</button>{job.canDownload && <button type="button" className="text-action" onClick={download}><Download size={14} />下载</button>}{mfaChangeAvailable && (job.canChangeMfa || job.mfaBusy) && <button type="button" className="text-action" onClick={changeMfa} disabled={submitting || job.mfaBusy} title="复用已有授权，成功后同步账号资料"><ShieldCheck size={14} />{job.mfaBusy ? "MFA 处理中" : "修改 MFA"}</button>}{job.canRetry && !job.canDownload && <button type="button" className="text-action" onClick={retry} disabled={submitting}>{job.canResume ? "继续" : "重试"}</button>}<MoreActions label="更多">{actionContent}</MoreActions></div></td>
   </tr>;
 }
 
@@ -2276,6 +2305,7 @@ function operationLabel(type) {
     resume: "继续中断流程",
     setup_2fa: "设置 2FA",
     change_mfa: "修改 MFA",
+    sync_mfa_authorization: "从 MFA 同步",
     add_password: "添加密码",
     account_update: "更新账号资料",
     proxy_update: "更新代理 IP",

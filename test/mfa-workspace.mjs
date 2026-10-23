@@ -20,7 +20,9 @@ if (process.argv.includes("--logout-all")) {
   await fs.appendFile(log, JSON.stringify({email, event:"logout-start", at:Date.now()}) + "\\n");
   if (email.startsWith("logout-stale")) process.exit(1);
   await new Promise(resolve => setTimeout(resolve, 200));
-  if (process.env.CHATGPT_TOTP_SECRET !== "${newSecret}") process.exit(9);
+  if (!process.argv.includes("--mfa-session") || process.env.CHATGPT_TOTP_SECRET || process.env.CHATGPT_LOGIN_PASSWORD) process.exit(9);
+  const session = JSON.parse(await fs.readFile(process.argv[process.argv.indexOf("--mfa-session") + 1], "utf8"));
+  if (session.email !== email || !session.accessToken) process.exit(10);
   const marker = path.join(path.dirname(target), "logout-failed-once");
   const failed = email.startsWith("logout-failed") && !(await fs.stat(marker).catch(() => null));
   if (failed) await fs.writeFile(marker, "1");
@@ -31,7 +33,10 @@ if (process.argv.includes("--logout-all")) {
 const target = process.argv[process.argv.indexOf("--totp-result") + 1];
 const log = path.join(path.dirname(target), "mock-runs.jsonl");
 await fs.appendFile(log, JSON.stringify({email, event:"start", at:Date.now()}) + "\\n");
-if (!process.argv.includes("--rotate-totp") || !process.env.CHATGPT_LOGIN_PASSWORD) process.exit(8);
+if (!process.argv.includes("--rotate-totp") || (!process.argv.includes("--mfa-session") && !process.env.CHATGPT_LOGIN_PASSWORD)) process.exit(8);
+if (process.argv.includes("--mfa-session") && (process.env.CHATGPT_LOGIN_PASSWORD || process.env.CHATGPT_TOTP_SECRET)) process.exit(11);
+const sessionTarget = process.argv[process.argv.indexOf("--mfa-session-output") + 1];
+await fs.writeFile(sessionTarget, JSON.stringify({type:"chatgpt-session",version:1,email,accessToken:"synthetic-private-session",accountId:"fixture-account",expiresAt:"2099-01-01T00:00:00Z"}));
 console.log('[mfa-stage] authenticated');
 console.error('< GET /api/auth/session 200');
 await new Promise(resolve => setTimeout(resolve, 200));
@@ -84,6 +89,43 @@ async function logRows(directory) {
 }
 
 try {
+  const sessionSource = path.join(root, "authorization-session.json");
+  const sessionEmail = "from-authorization@example.com";
+  const session = { type: "chatgpt-session", version: 1, email: sessionEmail, accessToken: "synthetic-authorization-session", accountId: "fixture-account", expiresAt: "2099-01-01T00:00:00Z" };
+  await fs.writeFile(sessionSource, JSON.stringify(session));
+  const sessionSynchronized = [];
+  const fromAuthorization = await workspace("from-authorization", {
+    resolveAuthorization: async (email) => ({ sessionPath: sessionSource, credentials: { password: "", totpSecret: "", proxyUrl: "" } }),
+    onSuccess: async (email, credentials) => sessionSynchronized.push({ email, credentials }),
+  });
+  const directlyStarted = await fromAuthorization.instance.startFromAuthorization(sessionEmail);
+  assert.equal(directlyStarted.started, 1);
+  await assert.rejects(fromAuthorization.instance.startFromAuthorization(sessionEmail), { status: 409 });
+  await settled(fromAuthorization.instance);
+  let directlyChanged = fromAuthorization.instance.list().accounts[0];
+  assert.equal(directlyChanged.status, "success");
+  assert.equal(directlyChanged.sessionOnly, true);
+  assert.equal(directlyChanged.hasPassword, false, "valid sessions do not require a saved login password");
+  assert.equal(sessionSynchronized[0].credentials.totpSecret, newSecret);
+  assert.equal(sessionSynchronized[0].email, sessionEmail);
+  assert.equal((await fromAuthorization.instance.exportAccounts({ ids: [directlyChanged.id], format: "txt" })).body.trim(), `${sessionEmail}--------${newSecret}`);
+  await fs.writeFile(sessionSource, JSON.stringify({ ...session, expiresAt: "2000-01-01T00:00:00Z" }));
+  const beforeExpiredStart = await logRows(fromAuthorization.directory);
+  await assert.rejects(fromAuthorization.instance.startFromAuthorization(sessionEmail), { mfaCode: "MFA_SESSION_EXPIRED" });
+  assert.equal((await logRows(fromAuthorization.directory)).length, beforeExpiredStart.length, "expired authorization must not spawn a login");
+  assert.equal(fromAuthorization.instance.list().accounts[0].status, "success", "preflight failure must preserve earlier confirmed success");
+  await fromAuthorization.instance.shutdown();
+  const reusedAfterRestart = await workspace("from-authorization", { credentialStore: fromAuthorization.store });
+  assert.equal(reusedAfterRestart.instance.list().accounts[0].sessionOnly, true);
+  await reusedAfterRestart.instance.logoutAll({ ids: [directlyChanged.id] });
+  await settled(reusedAfterRestart.instance);
+  directlyChanged = reusedAfterRestart.instance.list().accounts[0];
+  assert.equal(directlyChanged.logoutStatus, "success", "logout must reuse the persisted MFA session even after restart");
+  await reusedAfterRestart.instance.logoutAll({ ids: [directlyChanged.id] });
+  await settled(reusedAfterRestart.instance);
+  assert.match(reusedAfterRestart.instance.list().accounts[0].logoutError, /授权已过期/);
+  assert.equal((await logRows(reusedAfterRestart.directory)).filter((row) => row.event === "logout-start").length, 1);
+
   const dated = await workspace("creation-dates");
   await dated.instance.importAccounts("dated@example.com----synthetic-password");
   const createdAt = dated.instance.list().accounts[0].createdAt;
@@ -102,6 +144,17 @@ try {
   assert.equal(legacy.instance.list().accounts[0].createdAt, "", "legacy dates must stay unknown");
   await legacy.instance.importAccounts("dated@example.com----synthetic-password");
   assert.equal(legacy.instance.list().accounts[0].createdAt, "", "reimport must not invent a legacy creation time");
+  const ordered = await workspace("import-order");
+  await ordered.instance.importAccounts("old@example.com----fixture-password");
+  const oldCreation = ordered.instance.list().accounts[0].createdAt;
+  await ordered.instance.importAccounts("new-first@example.com----fixture-password\nnew-second@example.com----fixture-password");
+  assert.deepEqual(ordered.instance.list().accounts.map((account) => account.email), ["new-first@example.com", "new-second@example.com", "old@example.com"]);
+  await ordered.instance.importAccounts("old@example.com----updated-fixture-password");
+  assert.equal(ordered.instance.list().accounts[0].email, "old@example.com", "reimport moves the account to the front");
+  assert.equal(ordered.instance.list().accounts[0].createdAt, oldCreation);
+  await ordered.instance.shutdown();
+  const orderedRestart = await workspace("import-order", { credentialStore: ordered.store });
+  assert.deepEqual(orderedRestart.instance.list().accounts.map((account) => account.email), ["old@example.com", "new-first@example.com", "new-second@example.com"]);
   const busy = new Set();
   const synchronized = [];
   const { instance, directory, store } = await workspace("batch", {
