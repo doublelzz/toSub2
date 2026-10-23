@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import "./console-auth.mjs";
 import fs from "node:fs/promises";
 import http from "node:http";
 import net from "node:net";
@@ -873,6 +874,10 @@ try {
   assert.equal(monitorSaved.enabled, true);
   assert.equal(monitorSaved.configured, true);
 
+  remoteErrorAccounts = [{ id: 90, name: "unbound-same-email", platform: "openai", status: "error", credentials: { email: "password-mail@example.com" }, group_ids: [7] }];
+  const unboundMonitor = await fetch(`${baseUrl}/api/sub2api/monitor/check`, { method: "POST", headers }).then((response) => response.json());
+  assert.equal(unboundMonitor.result.started, 0, "same email without CDK binding must not be automatically repaired");
+  assert.equal(updatedRemoteAccounts.has(90), false, "unbound remote account must not be updated");
   remoteErrorAccounts = [{
     id: 91,
     name: "oauth---password-mail@example.com",
@@ -881,7 +886,7 @@ try {
     status: "error",
     error_message: "refresh token expired",
     credentials: { email: "password-mail@example.com", model_mapping: { "gpt-5": "gpt-5" } },
-    extra: { existing_setting: "preserved", codex_fingerprint_mode: "off" },
+    extra: { existing_setting: "preserved", codex_fingerprint_mode: "off", tosub2_cdk_id: bootstrap.workspace.id, tosub2_config_id: monitorSaved.bindingId },
     group_ids: [7],
   }];
   failClearOnce.add(91);
@@ -921,6 +926,8 @@ try {
   assert.deepEqual(updatedRemoteAccounts.get(91).extra, {
     existing_setting: "preserved",
     codex_fingerprint_mode: "device",
+    tosub2_cdk_id: bootstrap.workspace.id,
+    tosub2_config_id: monitorSaved.bindingId,
   });
 
   const bannedCreateResponse = await fetch(`${baseUrl}/api/jobs`, {
@@ -940,6 +947,7 @@ try {
     status: "error",
     error_message: "token invalid",
     credentials: { email: "monitor-banned@example.com" },
+    extra: { tosub2_cdk_id: bootstrap.workspace.id, tosub2_config_id: monitorSaved.bindingId },
     group_ids: [7],
   }];
   const bannedMonitorResponse = await fetch(`${baseUrl}/api/sub2api/monitor/check`, {
@@ -1076,7 +1084,7 @@ try {
   assert.equal(deleted.deleted, 27);
 
   const finalPage = await (await fetch(`${baseUrl}/api/jobs`, { headers })).json();
-  assert.equal(finalPage.pagination.total, 0);
+  assert.equal(finalPage.pagination.total, 0, `remaining fixture jobs: ${JSON.stringify(finalPage.jobs.map((job) => ({ email: job.email, status: job.status })))}`);
   console.log("console smoke tests passed");
 } catch (error) {
   error.message = `${error.message}\nConsole output:\n${logs}`;

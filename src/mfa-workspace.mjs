@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { protocolEnvironment } from "./cdk-security.mjs";
 
 const BUSY = new Set(["queued", "running"]);
 const STATUSES = new Set(["ready", "queued", "running", "success", "failed", "interrupted"]);
@@ -250,7 +251,7 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
     await appendLog(account, `[proxy] ${credentials.proxyUrl || "直连"}`);
     return new Promise((resolve) => {
       const child = spawn(process.execPath, [protocolScript, ...args, "--verbose"], {
-        env: { ...process.env, CHATGPT_LOGIN_PASSWORD: credentials.password, CHATGPT_TOTP_SECRET: credentials.totpSecret, CHATGPT_PROXY_URL: credentials.proxyUrl },
+        env: { ...protocolEnvironment(), CHATGPT_LOGIN_PASSWORD: credentials.password, CHATGPT_TOTP_SECRET: credentials.totpSecret, CHATGPT_PROXY_URL: credentials.proxyUrl },
         stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
       });
       entry.child = child;

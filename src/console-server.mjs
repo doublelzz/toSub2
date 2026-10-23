@@ -1,14 +1,13 @@
 #!/usr/bin/env node
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
-import http from "node:http";
-import os from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import react from "@vitejs/plugin-react";
-import { createServer as createViteServer } from "vite";
+import { startCdkServer } from "./cdk-server.mjs";
+import { protocolEnvironment } from "./cdk-security.mjs";
 import { createCredentialStore } from "./credential-store.mjs";
 import { createMfaWorkspace } from "./mfa-workspace.mjs";
 import { matchesTaskQuery, normalizeTaskQuery, summarizeTasks } from "./task-query.mjs";
@@ -23,8 +22,6 @@ import {
 import { createSmsProvider, publicSmsProviderDefinitions } from "./sms-providers.mjs";
 import { DEFAULT_TLS_PROFILE, DirectTlsProfileProbe, proxySupportsSessionRotation } from "./tls-transport.mjs";
 
-const DEFAULT_HOST = "127.0.0.1";
-const DEFAULT_PORT = 4399;
 const MAX_ACTIVE_JOBS = 20;
 const MAX_BATCH_JOBS = 500;
 const MAX_PROXY_RISK_RETRIES = 10;
@@ -37,9 +34,6 @@ const JOB_META_FILENAME = "job-meta.json";
 const LOGIN_CHECKPOINT_FILENAME = "login-checkpoint.json";
 const TOTP_SETUP_RESULT_FILENAME = "totp-setup-result.json";
 const PASSWORD_ADD_RESULT_FILENAME = "password-add-result.json";
-const SUB2API_MONITOR_FILENAME = "sub2api-monitor.json";
-const SUB2API_MONITOR_INTERVAL_MS = readDurationEnv("SUB2API_MONITOR_INTERVAL_MS", 5 * 60_000, 1_000);
-const SUB2API_AUTO_REPAIR_COOLDOWN_MS = readDurationEnv("SUB2API_AUTO_REPAIR_COOLDOWN_MS", 5 * 60_000, 0);
 const MAIL_POLL_INTERVAL_MS = 2_500;
 const MAIL_POLL_TIMEOUT_MS = 10 * 60_000;
 const DEFAULT_SMS_NUMBER_MAX_ATTEMPTS = 3;
@@ -64,14 +58,31 @@ const SMS_POLL_INTERVAL_MS = Number(process.env.SMS_POLL_INTERVAL_MS || process.
 const SMS_POLL_TIMEOUT_MS = Number(process.env.SMS_POLL_TIMEOUT_MS || process.env.LUBAN_SMS_POLL_TIMEOUT_MS || 10 * 60_000);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const TOOL_ROOT = path.resolve(__dirname, "..");
-const WEB_ROOT = path.join(TOOL_ROOT, "web");
-const PROTOCOL_SCRIPT = path.resolve(process.env.ONBOARDING_PROTOCOL_SCRIPT || path.join(__dirname, "protocol-login.mjs"));
 const WORKSPACE_ROOT = TOOL_ROOT;
+export async function createConsoleWorkspace(options) {
+const PROTOCOL_SCRIPT = path.resolve(options.protocolScript || process.env.ONBOARDING_PROTOCOL_SCRIPT || path.join(__dirname, "protocol-login.mjs"));
+const SUB2API_MONITOR_INTERVAL_MS = readDurationEnv("SUB2API_MONITOR_INTERVAL_MS", 5 * 60_000, 1_000);
+const SUB2API_AUTO_REPAIR_COOLDOWN_MS = readDurationEnv("SUB2API_AUTO_REPAIR_COOLDOWN_MS", 5 * 60_000, 0);
 const OUTPUT_ROOT = path.resolve(
-  process.env.ONBOARDING_OUTPUT_ROOT || path.join(WORKSPACE_ROOT, "tmp", "chatgpt-onboarding-console"),
+  options.root,
 );
-const SUB2API_MONITOR_PATH = path.join(OUTPUT_ROOT, SUB2API_MONITOR_FILENAME);
-const credentialStore = createCredentialStore();
+const baseCredentialStore = createCredentialStore({ windowsRoot: path.join(OUTPUT_ROOT, ".credentials"), macRoot: path.join(OUTPUT_ROOT, ".credentials") });
+const legacyCredentialStore = createCredentialStore();
+const credentialPrefix = `cdk:${options.namespace}:${options.cdkId}:`;
+const credentialStore = {
+  save: (email, credentials) => baseCredentialStore.save(`${credentialPrefix}${email}`, credentials),
+  async delete(email) {
+    await baseCredentialStore.delete(`${credentialPrefix}${email}`);
+    if (options.legacyEmails?.has(email.toLowerCase())) options.markLegacyUsed?.(email);
+  },
+  async load(email) {
+    const saved = await baseCredentialStore.load(`${credentialPrefix}${email}`);
+    if (saved.password || saved.totpSecret || saved.proxyUrl || !options.legacyEmails?.has(email.toLowerCase()) || options.legacyUsed?.(email)) return saved;
+    const legacy = await legacyCredentialStore.load(email);
+    if (legacy.password || legacy.totpSecret || legacy.proxyUrl) { await baseCredentialStore.save(`${credentialPrefix}${email}`, legacy); options.markLegacyUsed?.(email); }
+    return legacy;
+  },
+};
 const consoleToken = crypto.randomBytes(24).toString("base64url");
 const jobs = new Map();
 const customSmsPoolPositions = new Map();
@@ -80,7 +91,7 @@ let mfaWorkspace = null;
 let outputSyncPromise = null;
 let lastOutputSyncAt = 0;
 let shuttingDown = false;
-let queueSchedulingPaused = false;
+let queueSchedulingPaused = true;
 let shutdownPromise = null;
 let sub2ApiMonitorConfig = null;
 let sub2ApiMonitorTimer = null;
@@ -101,30 +112,7 @@ const sub2ApiMonitorState = {
   lastResult: null,
 };
 
-const hostArg = process.argv.find((item) => item.startsWith("--host="));
-const hostIndex = process.argv.indexOf("--host");
-const requestedHost = String(
-  hostArg?.slice("--host=".length)
-    || (hostIndex >= 0 ? process.argv[hostIndex + 1] : "")
-    || process.env.ONBOARDING_HOST
-    || DEFAULT_HOST,
-).trim();
-const portArg = process.argv.find((item) => item.startsWith("--port="));
-const portIndex = process.argv.indexOf("--port");
-const requestedPort = Number(
-  portArg?.slice("--port=".length) || (portIndex >= 0 ? process.argv[portIndex + 1] : "") || DEFAULT_PORT,
-);
-const hmrPort = requestedPort <= 45_535 ? requestedPort + 20_000 : requestedPort - 20_000;
-
-if (!requestedHost || requestedHost.startsWith("--")) {
-  throw new Error("--host must be a valid hostname or IP address");
-}
-
-if (!Number.isInteger(requestedPort) || requestedPort < 1 || requestedPort > 65535) {
-  throw new Error("--port must be an integer between 1 and 65535");
-}
-
-await fs.mkdir(OUTPUT_ROOT, { recursive: true });
+await fs.mkdir(OUTPUT_ROOT, { recursive: true, mode: 0o700 });
 await loadSub2ApiMonitorConfiguration();
 await syncCompletedOutputs(true);
 const mfaCredentialStore = createCredentialStore({
@@ -145,79 +133,6 @@ mfaWorkspace = await createMfaWorkspace({
 });
 scheduleQueuedJobs();
 scheduleSub2ApiMonitor();
-
-const vite = await createViteServer({
-  root: WEB_ROOT,
-  configFile: false,
-  appType: "spa",
-  plugins: [react()],
-  server: {
-    middlewareMode: true,
-    hmr: { port: hmrPort, clientPort: hmrPort },
-  },
-});
-
-const server = http.createServer(async (req, res) => {
-  try {
-    enforceUtf8ContentType(res);
-    const requestUrl = new URL(req.url || "/", `http://${req.headers.host || `${requestedHost}:${requestedPort}`}`);
-    if (requestUrl.pathname.startsWith("/api/")) {
-      await handleApi(req, res, requestUrl);
-      return;
-    }
-    vite.middlewares(req, res, (error) => {
-      if (error) sendJson(res, 500, { error: error.message || "Page rendering failed" });
-    });
-  } catch (error) {
-    sendJson(res, error.status || 500, { error: error.message || "Internal server error" });
-  }
-});
-
-function enforceUtf8ContentType(res) {
-  const setHeader = res.setHeader;
-  res.setHeader = function setUtf8Header(name, value) {
-    if (String(name).toLowerCase() === "content-type") {
-      value = addUtf8Charset(value);
-    }
-    return setHeader.call(this, name, value);
-  };
-}
-
-function addUtf8Charset(value) {
-  if (typeof value !== "string" || /;\s*charset=/i.test(value)) return value;
-  if (/^(?:text\/(?:html|css|javascript|plain)|application\/(?:javascript|json))(?:\s*;|$)/i.test(value)) {
-    return `${value}; charset=utf-8`;
-  }
-  return value;
-}
-
-server.listen(requestedPort, requestedHost, () => {
-  const urls = getConsoleUrls(requestedHost, requestedPort);
-  console.log(`[ok] ChatGPT onboarding console: ${urls[0]}`);
-  for (const url of urls.slice(1)) console.log(`[ok] LAN access: ${url}`);
-  console.log(`[info] Output directory: ${OUTPUT_ROOT}`);
-  if (isWildcardHost(requestedHost)) {
-    console.log("[note] LAN access is enabled without authentication. Keep downloaded OAuth files private.");
-  } else {
-    console.log("[note] This server only listens on the configured host. Keep downloaded OAuth files private.");
-  }
-});
-
-function isWildcardHost(host) {
-  return host === "0.0.0.0" || host === "::";
-}
-
-function getConsoleUrls(host, port) {
-  if (!isWildcardHost(host)) return [`http://${host}:${port}`];
-  const addresses = Object.values(os.networkInterfaces())
-    .flatMap((entries) => entries || [])
-    .filter((entry) => entry.family === "IPv4" && !entry.internal)
-    .map((entry) => entry.address);
-  return [
-    `http://127.0.0.1:${port}`,
-    ...[...new Set(addresses)].map((address) => `http://${address}:${port}`),
-  ];
-}
 
 async function handleApi(req, res, requestUrl) {
   if (req.method === "GET" && requestUrl.pathname === "/api/bootstrap") {
@@ -318,7 +233,7 @@ async function handleApi(req, res, requestUrl) {
     const proxyUrl = normalizeProxyUrl(body.proxyUrl);
     const phoneOptions = normalizePhoneOptions(body);
     const { phoneBindingEnabled } = phoneOptions;
-    const results = await Promise.all(entries.map((entry) => withEmailJobLock(entry.email, async () => {
+    const settled = await Promise.allSettled(entries.map((entry) => withEmailJobLock(entry.email, async () => {
       const existing = findJobByEmail(entry.email);
       if (existing) {
         const hasPolicy = Object.hasOwn(body, "phoneBindingEnabled") || Object.hasOwn(body, "phoneBindingMode");
@@ -328,6 +243,9 @@ async function handleApi(req, res, requestUrl) {
       }
       return { job: await startJob(entry.email, entry, proxyUrl, phoneBindingEnabled, phoneOptions), updated: false };
     })));
+    const rejection = settled.find((item) => item.status === "rejected");
+    if (rejection) throw rejection.reason;
+    const results = settled.map((item) => item.value);
     sendJson(res, 201, {
       jobs: results.map((item) => publicJob(item.job)),
       created: results.filter((item) => !item.updated).length,
@@ -525,6 +443,8 @@ async function handleApi(req, res, requestUrl) {
       const credentials = { ...(account.credentials || {}) };
       const extra = {
         ...(account.extra && typeof account.extra === "object" ? account.extra : {}),
+        tosub2_cdk_id: options.cdkId,
+        tosub2_config_id: monitorBackendIdentity(config),
         codex_fingerprint_mode: config.codexFingerprintMode,
       };
       if (config.modelWhitelist.length) {
@@ -548,6 +468,12 @@ async function handleApi(req, res, requestUrl) {
       headers: { "Idempotency-Key": idempotencyKey },
       body: JSON.stringify({ accounts }),
     });
+    const upstreamRows = response?.data?.results || response?.results || [];
+    for (const [index, row] of upstreamRows.entries()) {
+      const remoteId = Number(row?.account_id ?? row?.accountId ?? row?.id);
+      const source = payload.sources[index];
+      if (source && row?.success !== false && Number.isSafeInteger(remoteId) && remoteId > 0) options.bindRemote(monitorBackendIdentity(config), remoteId, selected.find((job) => job.id === source.id || job.id === source.jobId)?.email || accounts[index]?.credentials?.email || accounts[index]?.name);
+    }
     const result = summarizeSub2ApiUpload(response, accounts, [config.adminApiKey]);
     result.results = result.results.map((row, index) => ({ ...row, ...payload.sources[index] }));
 
@@ -569,12 +495,13 @@ async function handleApi(req, res, requestUrl) {
 
   if (req.method === "POST" && requestUrl.pathname === "/api/sub2api/monitor") {
     const body = await readJson(req);
-    if (body.enabled) {
+    const previousIdentity = sub2ApiMonitorConfig ? monitorBackendIdentity(sub2ApiMonitorConfig) : null;
+    if (body.config || body.enabled) {
       const config = normalizeSub2ApiConfig(body.config);
-      sub2ApiMonitorConfig = { ...config, enabled: true };
-    } else {
-      sub2ApiMonitorConfig = null;
-    }
+      const same = sub2ApiMonitorConfig && options.fingerprint(JSON.stringify(normalizeSub2ApiConfig(sub2ApiMonitorConfig))) === options.fingerprint(JSON.stringify(config));
+      sub2ApiMonitorConfig = { ...config, enabled: body.enabled === true, configurationId: same ? sub2ApiMonitorConfig.configurationId : crypto.randomUUID() };
+    } else if (sub2ApiMonitorConfig) sub2ApiMonitorConfig = { ...sub2ApiMonitorConfig, enabled: false };
+    if (!sub2ApiMonitorConfig?.enabled || previousIdentity !== monitorBackendIdentity(sub2ApiMonitorConfig)) for (const controller of sub2ApiRequestControllers) controller.abort();
     sub2ApiMonitorState.lastError = null;
     await persistSub2ApiMonitorConfiguration();
     scheduleSub2ApiMonitor();
@@ -993,13 +920,15 @@ async function startJob(email, credentials = {}, proxyUrl = null, phoneBindingEn
   return job;
 }
 
-function scheduleQueuedJobs() {
-  if (shuttingDown || queueSchedulingPaused) return;
-  let availableSlots = MAX_ACTIVE_JOBS - [...jobs.values()].filter(occupiesActiveSlot).length;
+function scheduleQueuedJobs(coordinator = false) {
+  if (shuttingDown || queueSchedulingPaused || !options.isEnabled()) return;
+  if (!coordinator) { options.requestSchedule(); return; }
+  let availableSlots = Math.min(1, MAX_ACTIVE_JOBS - [...jobs.values()].filter(occupiesActiveSlot).length, options.availableSlots());
   if (availableSlots <= 0) return;
   const queuedJobs = [...jobs.values()]
     .filter((job) => job.status === "queued")
     .sort((a, b) => String(a.queuedAt || a.createdAt).localeCompare(String(b.queuedAt || b.createdAt)));
+  let started = 0;
   for (const job of queuedJobs.slice(0, availableSlots)) {
     const mode = job.queuedMode || "full";
     const queueRunId = crypto.randomUUID();
@@ -1023,9 +952,11 @@ function scheduleQueuedJobs() {
     touch(job);
     void saveJobMetadata(job).catch(() => {});
     void prepareAndLaunchJob(job, mode, queueRunId);
+    started += 1;
     availableSlots -= 1;
     if (availableSlots <= 0) break;
   }
+  return started;
 }
 
 async function prepareAndLaunchJob(job, mode, queueRunId) {
@@ -1034,7 +965,7 @@ async function prepareAndLaunchJob(job, mode, queueRunId) {
       try { job.pendingSmsSetup = JSON.parse(await fs.readFile(path.join(path.dirname(job.outputPath), "sms-provider.json"), "utf8")); } catch { job.pendingSmsSetup = null; }
     }
     if (["full", "totp_setup", "password_add"].includes(mode) && job.mailApiUrl) await loadMailboxBaseline(job);
-    if (!isActive(job.status) || job.status === "queued" || job.queueRunId !== queueRunId) return;
+    if (job.deleted || shuttingDown || !options.isEnabled() || !isActive(job.status) || job.status === "queued" || job.queueRunId !== queueRunId) return;
     launchJob(job, { mode });
   } catch (error) {
     if (mode === "totp_setup") {
@@ -1126,7 +1057,7 @@ function launchJob(job, options = {}) {
   const child = spawn(process.execPath, args, {
     cwd: WORKSPACE_ROOT,
     env: {
-      ...process.env,
+      ...protocolEnvironment(),
       CHATGPT_LOGIN_PASSWORD: job.password || "",
       CHATGPT_TOTP_SECRET: job.totpSecret || "",
       CHATGPT_NEW_PASSWORD: mode === "password_add" ? job.pendingNewPassword || "" : "",
@@ -3154,9 +3085,11 @@ function sub2ApiResponseMessage(payload, text) {
 
 async function loadSub2ApiMonitorConfiguration() {
   try {
-    const saved = JSON.parse(await fs.readFile(SUB2API_MONITOR_PATH, "utf8"));
+    const saved = await options.readMonitor();
+    if (!saved) return;
     const config = normalizeSub2ApiConfig(saved.config);
-    sub2ApiMonitorConfig = { ...config, enabled: saved.enabled === true };
+    sub2ApiMonitorConfig = { ...config, enabled: saved.enabled === true, configurationId: saved.configurationId || crypto.randomUUID() };
+    if (!saved.configurationId) await persistSub2ApiMonitorConfiguration();
     sub2ApiMonitorState.lastCheckAt = saved.state?.lastCheckAt || null;
     sub2ApiMonitorState.lastError = saved.state?.lastError || null;
     sub2ApiMonitorState.lastResult = saved.state?.lastResult && typeof saved.state.lastResult === "object"
@@ -3172,11 +3105,12 @@ async function loadSub2ApiMonitorConfiguration() {
 
 async function persistSub2ApiMonitorConfiguration() {
   if (!sub2ApiMonitorConfig) {
-    await fs.rm(SUB2API_MONITOR_PATH, { force: true });
+    await options.writeMonitor(null);
     return;
   }
   const payload = {
     version: 1,
+    configurationId: sub2ApiMonitorConfig.configurationId,
     enabled: Boolean(sub2ApiMonitorConfig.enabled),
     config: {
       baseUrl: sub2ApiMonitorConfig.baseUrl,
@@ -3196,14 +3130,13 @@ async function persistSub2ApiMonitorConfiguration() {
     },
     updatedAt: new Date().toISOString(),
   };
-  const tempPath = `${SUB2API_MONITOR_PATH}.${process.pid}.${crypto.randomUUID()}.tmp`;
-  await fs.writeFile(tempPath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
-  await fs.rename(tempPath, SUB2API_MONITOR_PATH);
+  await options.writeMonitor(payload);
 }
 
 function publicSub2ApiMonitorState() {
   return {
     configured: Boolean(sub2ApiMonitorConfig?.baseUrl && sub2ApiMonitorConfig?.adminApiKey),
+    bindingId: sub2ApiMonitorConfig ? monitorBackendIdentity(sub2ApiMonitorConfig) : null,
     enabled: Boolean(sub2ApiMonitorConfig?.enabled),
     baseUrl: sub2ApiMonitorConfig?.baseUrl || null,
     groupIds: sub2ApiMonitorConfig?.groupIds || [],
@@ -3238,6 +3171,8 @@ function scheduleSub2ApiMonitor() {
 }
 
 async function runSub2ApiMonitor(trigger = "scheduled") {
+  if (!options.isEnabled()) throw httpError(403, "CDK 已被禁用，自动修复已暂停");
+  if (queueSchedulingPaused) throw httpError(409, "工作区正在导入或恢复，自动修复暂缓");
   if (!sub2ApiMonitorConfig?.enabled) throw httpError(409, "Sub2API 号池监控未启用");
   if (sub2ApiMonitorPromise) return sub2ApiMonitorPromise;
   const config = { ...sub2ApiMonitorConfig, groupIds: [...sub2ApiMonitorConfig.groupIds] };
@@ -3263,9 +3198,14 @@ async function runSub2ApiMonitor(trigger = "scheduled") {
       await retryPendingSub2ApiUploads(config, summary);
       if (shuttingDown) throw httpError(503, "服务正在关闭，已停止号池巡检");
       const remoteAccounts = await listSub2ApiErrorAccounts(config);
+      assertMonitorContext(config, monitorBackendIdentity(config));
       summary.checked = remoteAccounts.length;
       const grouped = new Map();
       for (const account of remoteAccounts) {
+        const remoteId = Number(account.id);
+        if (!Number.isSafeInteger(remoteId) || remoteId <= 0) { summary.missingTask += 1; continue; }
+        if (account.extra?.tosub2_cdk_id === options.cdkId && account.extra?.tosub2_config_id === monitorBackendIdentity(config) && findJobByEmail(sub2ApiAccountEmail(account))) options.bindRemote(monitorBackendIdentity(config), account.id, sub2ApiAccountEmail(account));
+        if (!options.remoteBound(monitorBackendIdentity(config), account.id)) { summary.outsideGroups += 1; continue; }
         if (!isSub2ApiAccountInMonitoredGroups(account, config.groupIds)) {
           summary.outsideGroups += 1;
           continue;
@@ -3280,6 +3220,8 @@ async function runSub2ApiMonitor(trigger = "scheduled") {
       }
 
       for (const [email, accounts] of grouped) {
+        const ownedAccounts = accounts.filter((account) => options.remoteBound(monitorBackendIdentity(config), account.id));
+        if (!ownedAccounts.length) { summary.outsideGroups += accounts.length; continue; }
         await withEmailJobLock(email, async () => {
           const job = findJobByEmail(email);
           if (!job) {
@@ -3306,7 +3248,8 @@ async function runSub2ApiMonitor(trigger = "scheduled") {
             return;
           }
 
-          const operation = createSub2ApiAutoRepairOperation(config, accounts);
+          const operation = createSub2ApiAutoRepairOperation(config, ownedAccounts);
+          assertMonitorContext(config, operation.backend);
           await forceReloginJob(job, {}, { autoRepair: operation });
           appendJobLog(job, `[monitor] Sub2API 号池发现 ${accounts.length} 条异常记录，已自动加入重新登录并授权队列。\n`);
           await saveJobMetadata(job);
@@ -3368,8 +3311,10 @@ async function retryPendingSub2ApiUploads(config, summary) {
       const missingIds = [];
       try {
         for (const accountId of pendingIds) {
+          assertMonitorContext(config, backend);
+          if (!options.remoteBound(backend, accountId)) throw httpError(409, "待回写账号尚未关联当前 CDK 与配置，已暂停重试");
           const account = await getSub2ApiAccount(config, accountId);
-          if (account) accounts.push(account);
+          if (account) { assertRepairTarget(config, backend, account, job.email); accounts.push(account); }
           else missingIds.push(accountId);
         }
       } catch (error) {
@@ -3459,7 +3404,20 @@ function isSub2ApiAccountInMonitoredGroups(account, groupIds) {
 }
 
 function monitorBackendIdentity(config) {
-  return crypto.createHash("sha256").update(String(config?.baseUrl || "")).digest("hex").slice(0, 24);
+  if (!config) return null;
+  const normalized = normalizeSub2ApiConfig(config);
+  const same = sub2ApiMonitorConfig && options.fingerprint(JSON.stringify(normalizeSub2ApiConfig(sub2ApiMonitorConfig))) === options.fingerprint(JSON.stringify(normalized));
+  const configurationId = config.configurationId || (same ? sub2ApiMonitorConfig.configurationId : "unsaved");
+  return options.fingerprint(JSON.stringify({ cdkId: options.cdkId, configurationId, config: normalized }));
+}
+
+function assertMonitorContext(config, backend) {
+  if (shuttingDown || !options.isEnabled() || !sub2ApiMonitorConfig?.enabled || monitorBackendIdentity(config) !== backend || monitorBackendIdentity(sub2ApiMonitorConfig) !== backend) throw httpError(409, "Sub2API 配置或启用状态已变化，旧操作已暂停");
+}
+
+function assertRepairTarget(config, backend, account, email) {
+  assertMonitorContext(config, backend);
+  if (!options.remoteBound(backend, account.id) || sub2ApiAccountEmail(account) !== email.toLowerCase() || account.extra?.tosub2_cdk_id && account.extra.tosub2_cdk_id !== options.cdkId) throw httpError(409, "远端账号与当前 CDK 关联或邮箱不一致，已暂停回写");
 }
 
 function isAutoRepairCoolingDown(job) {
@@ -3495,6 +3453,7 @@ async function performSub2ApiAutoRepairSuccess(job) {
   job.autoRepairPendingAccountIds = [...new Set(operation.accountIds)];
   job.autoRepairPendingBackend = operation.backend;
   try {
+    assertMonitorContext(operation.config, operation.backend);
     const payload = await buildSub2ApiUploadPayload([job]);
     if (payload.errors.length) throw httpError(409, payload.errors[0].message);
     const localAccount = payload.accounts.find((account) => sub2ApiAccountEmail(account) === job.email.toLowerCase())
@@ -3505,19 +3464,25 @@ async function performSub2ApiAutoRepairSuccess(job) {
     for (const remoteAccount of operation.accounts) {
       const accountId = Number(remoteAccount.id);
       if (!Number.isSafeInteger(accountId) || accountId <= 0) continue;
-      const credentials = mergeSub2ApiCredentials(remoteAccount.credentials, localAccount.credentials);
+      assertRepairTarget(operation.config, operation.backend, remoteAccount, job.email);
+      const currentAccount = await getSub2ApiAccount(operation.config, accountId);
+      if (!currentAccount) throw httpError(409, "远端账号已删除，已暂停回写");
+      assertRepairTarget(operation.config, operation.backend, currentAccount, job.email);
+      const credentials = mergeSub2ApiCredentials(currentAccount.credentials, localAccount.credentials);
       const extra = {
-        ...(remoteAccount.extra && typeof remoteAccount.extra === "object" ? remoteAccount.extra : {}),
+        ...(currentAccount.extra && typeof currentAccount.extra === "object" ? currentAccount.extra : {}),
         codex_fingerprint_mode: operation.config.codexFingerprintMode,
       };
       await requestSub2Api(operation.config, `/api/v1/admin/accounts/${accountId}`, {
         method: "PUT",
         body: JSON.stringify({ credentials, extra }),
       });
+      assertMonitorContext(operation.config, operation.backend);
       await requestSub2Api(operation.config, `/api/v1/admin/accounts/${accountId}/clear-error`, {
         method: "POST",
         body: "{}",
       });
+      assertMonitorContext(operation.config, operation.backend);
       await requestSub2Api(operation.config, `/api/v1/admin/accounts/${accountId}/schedulable`, {
         method: "POST",
         body: JSON.stringify({ schedulable: true }),
@@ -3904,17 +3869,20 @@ async function deleteJobsByEmail(email) {
   assertMfaIdle(email);
   const matching = [...jobs.values()].filter((job) => job.email.toLowerCase() === email);
   const directories = new Set();
+  const childWaits = [];
   matching.forEach((job) => {
     job.deleted = true;
+    job.status = "canceled";
+    job.queueRunId = null;
     stopMailPolling(job);
     releaseSmsNumber(job, "idle");
     job.runId = crypto.randomUUID();
-    job.child?.kill("SIGTERM");
+    if (job.child) { childWaits.push(waitForChildExit(job.child, 3000)); job.child.kill("SIGTERM"); }
     job.child = null;
     directories.add(path.dirname(job.outputPath));
     jobs.delete(job.id);
   });
-  await Promise.allSettled(matching.map((job) => job.metadataWritePromise).filter(Boolean));
+  await Promise.allSettled([...childWaits, ...matching.map((job) => job.metadataWritePromise).filter(Boolean)]);
   await Promise.all([
     ...[...directories].map((directory) => fs.rm(directory, { recursive: true, force: true })),
     deleteStoredLoginCredentials(email),
@@ -5303,6 +5271,7 @@ async function fileExists(filePath) {
 }
 
 async function readJson(req) {
+  if (Object.hasOwn(req, "jsonBody")) return req.jsonBody;
   let raw = "";
   for await (const chunk of req) {
     raw += chunk;
@@ -5333,8 +5302,6 @@ function httpError(status, message) {
   return error;
 }
 
-process.on("SIGINT", () => void shutdown().catch(reportShutdownFailure));
-process.on("SIGTERM", () => void shutdown().catch(reportShutdownFailure));
 
 async function shutdown() {
   if (shutdownPromise) return shutdownPromise;
@@ -5362,8 +5329,6 @@ async function shutdown() {
       ...childWaits,
       ...[...jobs.values()].map((job) => job.metadataWritePromise).filter(Boolean),
     ]);
-    await vite.close();
-    await closeHttpServer(server);
   })();
   return shutdownPromise;
 }
@@ -5384,20 +5349,98 @@ function waitForChildExit(child, timeoutMs) {
   });
 }
 
-function closeHttpServer(httpServer) {
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      httpServer.closeAllConnections?.();
-      resolve();
-    }, 3_000);
-    httpServer.close(() => {
-      clearTimeout(timer);
-      resolve();
-    });
-  });
+async function dispatch(method, pathname, body = {}) {
+  let response;
+  const req = Readable.from([]); req.method = method; req.headers = { "x-console-token": consoleToken }; req.jsonBody = body;
+  const res = { headersSent: false, headers: {}, setHeader(name, value) { this.headers[name] = value; }, writeHead(status, headers) { this.headersSent = true; response = { status, headers: { ...this.headers, ...headers } }; }, end(value) { response = { ...response, body: Buffer.from(value || "") }; } };
+  await handleApi(req, res, new URL(pathname, "http://workspace.internal"));
+  return response || { status: 204, headers: {}, body: Buffer.alloc(0) };
 }
 
-function reportShutdownFailure(error) {
-  console.error(`[shutdown] ${error.message}`);
-  process.exitCode = 1;
+function planImport(mode, body) {
+  let emails;
+  if (mode === "mfa") emails = mfaWorkspace.preview(body.text).accounts.map((account) => account.email);
+  else {
+    if (mode === "single") {
+      const email = String(body.email || "").trim(); if (!isEmail(email)) throw httpError(422, "邮箱格式不正确");
+      normalizeLoginCredentials(body); emails = [email.toLowerCase()];
+    } else emails = parseBatchEntries(body.text, mailRequestConfig).map((entry) => entry.email.toLowerCase());
+    normalizeProxyUrl(body.proxyUrl); normalizePhoneOptions(body);
+  }
+  for (const email of emails) {
+    const existing = findJobByEmail(email);
+    if ((mode === "mfa" && existing && isActive(existing.status) && existing.status !== "queued") || mfaWorkspace.isBusy(email)) throw httpError(409, "部分账号正在执行任务，请结束后再更新导入资料");
+  }
+  return [...new Set(emails)];
+}
+
+async function applyImport(mode, body) {
+  const emails = planImport(mode, body);
+  const route = mode === "mfa" ? "/api/mfa/import" : mode === "single" ? "/api/jobs" : "/api/jobs/batch";
+  const activeUpdate = mode !== "mfa" && emails.some((email) => { const job = findJobByEmail(email); return job && isActive(job.status) && job.status !== "queued"; });
+  if (activeUpdate) {
+    if (emails.some((email) => !findJobByEmail(email))) { const error = httpError(409, "请将新增账号与进行中的账号更新分别导入"); error.importRolledBack = true; throw error; }
+    try {
+      const response = await dispatch("POST", route, body);
+      if (response.status >= 400) throw httpError(response.status, JSON.parse(response.body.toString()).error || "账号更新失败");
+      return { status: response.status, data: JSON.parse(response.body.toString()) };
+    } catch (error) { error.importUpdateOnly = true; throw error; }
+  }
+  const existingIds = new Set(jobs.keys());
+  const before = new Map([...jobs.values()].filter((job) => emails.includes(job.email.toLowerCase())).map((job) => [job.id, Object.fromEntries(Object.entries(job).map(([key, value]) => {
+    try { return [key, structuredClone(value)]; } catch { return [key, value]; }
+  }))]));
+  const credentials = new Map(); const files = new Map();
+  for (const email of emails) {
+    credentials.set(email, await loadStoredLoginCredentials(email));
+    const existing = findJobByEmail(email);
+    if (existing) for (const filename of [JOB_META_FILENAME, "sms-provider.json"]) {
+      const target = path.join(path.dirname(existing.outputPath), filename);
+      files.set(target, await fs.readFile(target).catch((error) => { if (error.code === "ENOENT") return null; throw error; }));
+    }
+  }
+  const pausedBefore = queueSchedulingPaused; queueSchedulingPaused = true;
+  try {
+    const response = await dispatch("POST", route, body);
+    if (response.status >= 400) throw httpError(response.status, JSON.parse(response.body.toString()).error || "导入失败");
+    return { status: response.status, data: JSON.parse(response.body.toString()) };
+  } catch (error) {
+    for (const job of [...jobs.values()]) if (!existingIds.has(job.id)) await deleteJobsByEmail(job.email.toLowerCase());
+    for (const [id, snapshot] of before) {
+      if (!emails.includes(snapshot.email.toLowerCase())) continue;
+      const current = jobs.get(id); await current?.metadataWritePromise;
+      jobs.set(id, snapshot);
+    }
+    for (const [email, previous] of credentials) await saveStoredLoginCredentials(email, previous);
+    for (const [target, content] of files) { if (content) await fs.writeFile(target, content, { mode: 0o600 }); else await fs.rm(target, { force: true }); }
+    error.importRolledBack = true;
+    throw error;
+  } finally { queueSchedulingPaused = pausedBefore; }
+}
+
+return {
+  async handle(req, res, url) { req.headers["x-console-token"] = consoleToken; await handleApi(req, res, url); },
+  dispatch, planImport, applyImport,
+  async bindRemote(remoteId, email, configValue) {
+    const config = normalizeSub2ApiConfig(configValue);
+    const id = Number(remoteId); if (!Number.isSafeInteger(id) || id <= 0) throw httpError(422, "远端账号 ID 不正确");
+    const local = findJobByEmail(email); if (!local) throw httpError(404, "当前 CDK 下没有此账号");
+    const account = await getSub2ApiAccount(config, id);
+    if (!account || sub2ApiAccountEmail(account) !== local.email.toLowerCase()) throw httpError(409, "远端账号与当前邮箱不匹配");
+    options.bindRemote(monitorBackendIdentity(config), id, local.email);
+  },
+  inventory() { return [...new Set([...listUniqueJobs().map((job) => job.email.toLowerCase()), ...mfaWorkspace.list().accounts.map((account) => account.email.toLowerCase())])]; },
+  publicJobs: () => listUniqueJobs().map(publicJob),
+  activeCount: () => [...jobs.values()].filter(occupiesActiveSlot).length,
+  pendingCount: () => [...jobs.values()].filter((job) => job.status === "queued").length,
+  resume() { queueSchedulingPaused = false; scheduleQueuedJobs(); },
+  pause() { queueSchedulingPaused = true; },
+  tick: () => scheduleQueuedJobs(true),
+  async stop() { queueSchedulingPaused = true; await cancelAllJobs(); await mfaWorkspace.cancel(mfaWorkspace.list().accounts.map((account) => account.id)); queueSchedulingPaused = true; },
+  shutdown,
+};
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  await startCdkServer({ createWorkspace: createConsoleWorkspace });
 }

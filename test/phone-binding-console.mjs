@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import "./console-auth.mjs";
 import fs from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";

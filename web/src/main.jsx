@@ -34,6 +34,10 @@ import {
 import "./styles.css";
 import "./workspace.css";
 import MfaWorkspace from "./MfaWorkspace.jsx";
+import CdkGate from "./CdkGate.jsx";
+import CdkWorkspace from "./CdkWorkspace.jsx";
+import CurrentCdk from "./CurrentCdk.jsx";
+import { cdkFetch, flushWorkspaceSettings, readWorkspaceValue, writeWorkspaceValue } from "./cdk-api.mjs";
 import SmsPriceSelector from "./SmsPriceSelector.jsx";
 import { filterSmsOptionsByGrade, findSmsNumberOption, preferredSmsNumberOption } from "./sms-number-options.mjs";
 import { Drawer, MoreActions, TaskFilters, TaskOverview, ThemeControl, useCalendarDay, useDialogFocus } from "./WorkspaceUi.jsx";
@@ -71,9 +75,13 @@ function PhoneBindingOption({ enabled, onChange, disabled }) {
   </label>;
 }
 
-function App() {
-  const [activeWorkspace, setActiveWorkspace] = useState("authorization");
+function App({ auth }) {
+  const [adminView, setAdminView] = useState(auth.account.role === "admin" && auth.account.id === auth.workspace.id);
+  const [activeWorkspace, setActiveWorkspace] = useState(auth.account.role === "admin" && auth.account.id === auth.workspace.id ? "cdk-management" : "authorization");
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [remoteBindingOpen, setRemoteBindingOpen] = useState(false);
+  const [remoteBindingError, setRemoteBindingError] = useState("");
+  const [remoteBindingBusy, setRemoteBindingBusy] = useState(false);
   const [singleOpen, setSingleOpen] = useState(false);
   const [filters, setFilters] = useState(DEFAULT_FILTERS);
   const [phoneTab, setPhoneTab] = useState("all");
@@ -83,8 +91,8 @@ function App() {
   const [density, setDensity] = useState(() => readLocalTextSetting("tosub2.density") === "compact" ? "compact" : "comfortable");
   const calendarDay = useCalendarDay();
   const requestFilters = useMemo(() => ({ ...queryFilters(filters), phoneBinding: phoneTab }), [filters, calendarDay, phoneTab]);
-  const [token, setToken] = useState("");
-  const [features, setFeatures] = useState({});
+  const [token, setToken] = useState(auth.token);
+  const [features, setFeatures] = useState(auth.features);
   const [jobs, setJobs] = useState([]);
   const [email, setEmail] = useState("");
   const [busy, setBusy] = useState(false);
@@ -154,10 +162,11 @@ function App() {
 
   useEffect(() => {
     let stopped = false;
-    fetch("/api/bootstrap")
+    cdkFetch("/api/bootstrap")
       .then(readResponse)
       .then((data) => {
         if (!stopped) {
+          if (!data.authenticated) { window.dispatchEvent(new Event("cdk-session-refresh")); return; }
           setToken(data.token);
           setFeatures(data.features || {});
         }
@@ -663,7 +672,7 @@ function App() {
     setBatchAction("download");
     try {
       await previewExport([...selectedJobIds]);
-      const response = await fetch("/api/jobs/download-batch", {
+      const response = await cdkFetch("/api/jobs/download-batch", {
         method: "POST",
         headers: { "content-type": "application/json", "x-console-token": token },
         body: JSON.stringify({ ids: [...selectedJobIds] }),
@@ -786,7 +795,7 @@ function App() {
     if (!selectedJobIds.size || batchAction) return;
     setBatchAction("source");
     try {
-      const response = await fetch("/api/jobs/export-source", {
+      const response = await cdkFetch("/api/jobs/export-source", {
         method: "POST",
         headers: { "content-type": "application/json", "x-console-token": token },
         body: JSON.stringify({ ids: [...selectedJobIds] }),
@@ -843,12 +852,33 @@ function App() {
         <nav className="workspace-tabs" aria-label="工作区">
           <button type="button" className={activeWorkspace === "authorization" ? "active" : ""} aria-pressed={activeWorkspace === "authorization"} onClick={() => setActiveWorkspace("authorization")}><LogIn size={17} />账号授权</button>
           <button type="button" className={activeWorkspace === "mfa" ? "active" : ""} aria-pressed={activeWorkspace === "mfa"} onClick={() => setActiveWorkspace("mfa")}><ShieldCheck size={17} />MFA 修改</button>
-          <button type="button" className="sidebar-settings" onClick={() => setSettingsOpen(true)}><Settings2 size={17} />配置</button>
+          <button type="button" className={activeWorkspace === "cdk-mine" ? "active" : ""} aria-pressed={activeWorkspace === "cdk-mine"} onClick={() => setActiveWorkspace("cdk-mine")}><KeyRound size={17} />我的 CDK</button>
+          {adminView && auth.account.role === "admin" && <>
+            <button type="button" className={activeWorkspace === "cdk-management" ? "active" : ""} aria-pressed={activeWorkspace === "cdk-management"} onClick={() => setActiveWorkspace("cdk-management")}><KeyRound size={17} />CDK 管理</button>
+            <button type="button" className={activeWorkspace === "cdk-security" ? "active" : ""} aria-pressed={activeWorkspace === "cdk-security"} onClick={() => setActiveWorkspace("cdk-security")}><ShieldCheck size={17} />安全中心</button>
+          </>}
+          <button type="button" className="sidebar-settings" onClick={() => setSettingsOpen(true)}><Settings2 size={17} />{auth.account.role === "admin" ? "系统配置" : "配置"}</button>
         </nav>
-        <div className="sidebar-footer"><span>本地工作区</span><p>授权与 MFA 独立管理</p></div>
+        <div className="sidebar-footer"><span>{auth.workspace.note || "当前 CDK 工作区"}</span><p>授权与 MFA 共用账号归属</p></div>
       </aside>
       <div className="workspace-content">
-      <header className="topbar"><div className="workspace-path"><span>工作区</span><ChevronRight size={14} /><strong>{activeWorkspace === "authorization" ? "账号授权" : "MFA 修改"}</strong></div><div className="topbar-actions"><button type="button" className="density-control" aria-pressed={density === "compact"} onClick={() => setDensity(density === "compact" ? "comfortable" : "compact")}>{density === "compact" ? "紧凑列表" : "舒适列表"}</button><ThemeControl /><button type="button" className="secondary-button" onClick={() => setSettingsOpen(true)}><Settings2 size={16} />配置</button></div></header>
+      <header className="topbar">
+        <div className="workspace-path"><span>工作区</span><ChevronRight size={14} /><strong>{({ authorization: "账号授权", mfa: "MFA 修改", "cdk-mine": "我的 CDK", "cdk-management": "CDK 管理", "cdk-security": "安全中心" })[activeWorkspace]}</strong></div>
+        <div className="topbar-actions cdk-session-actions">
+          <CurrentCdk auth={auth} onOpen={() => setActiveWorkspace("cdk-mine")} />
+          {auth.account.role === "admin" && <button className="secondary-button" onClick={async () => {
+            try {
+              if (adminView) { setAdminView(false); setActiveWorkspace("authorization"); }
+              else if (auth.workspace.id !== auth.account.id) await auth.switchWorkspace(auth.account.id);
+              else { setAdminView(true); setActiveWorkspace("cdk-management"); }
+            } catch (failure) { setError(failure.message); }
+          }}>{adminView ? "切换用户视角" : "返回管理视角"}</button>}
+          <ThemeControl /><button type="button" className="secondary-button" onClick={() => setSettingsOpen(true)}><Settings2 size={16} />{auth.account.role === "admin" ? "系统配置" : "配置"}</button>
+          <button type="button" className="secondary-button" onClick={() => void auth.logout().catch((failure) => setError(failure.message))}>退出</button>
+        </div>
+      </header>
+      {auth.workspace.id !== auth.account.id && <p className="cdk-scope-note">管理员正在查看 {auth.workspace.note || auth.workspace.label} 的工作区。此处操作和新增导入属于该 CDK。</p>}
+      {activeWorkspace.startsWith("cdk-") && <CdkWorkspace auth={auth} section={activeWorkspace.slice(4)} onNavigate={(section) => setActiveWorkspace(`cdk-${section}`)} />}
       {activeWorkspace === "mfa" && <MfaWorkspace token={token} defaultProxyUrl={accountProxyUrl} onReconnect={() => setConnectionAttempt((current) => current + 1)} />}
       {activeWorkspace === "authorization" && <>
       <section className="workspace">
@@ -1466,7 +1496,7 @@ function App() {
         </div>
       )}
       </>}
-      {settingsOpen && <Drawer title="工作区配置" onClose={() => setSettingsOpen(false)} wide><p className="drawer-description">配置代理、收码方式和 Sub2API，任务页面会显示当前配置摘要。</p>
+      {settingsOpen && <Drawer title={auth.account.role === "admin" ? "系统配置" : "工作区配置"} onClose={() => setSettingsOpen(false)} wide><p className="drawer-description">配置当前 CDK 的代理、接码平台、邮件 API 和 Sub2API。配置加密保存在服务端，切换 CDK 后分别加载。</p>
         <div className="provider-toolbar sms-provider-toolbar" aria-label="接码平台配置">
           <div className="provider-heading"><PhoneIncoming size={17} /><strong>接码平台</strong></div>
           <span className="provider-name">{activeSmsProvider.name || "未选择"}</span>
@@ -1528,6 +1558,7 @@ function App() {
           <button type="button" className="secondary-button provider-settings-button" onClick={() => { setSettingsOpen(false); openSub2ApiSettings(); }} disabled={!token}>
             <Settings2 size={16} />配置
           </button>
+          <button type="button" className="secondary-button" disabled={!sub2apiSettings.adminApiKey} onClick={() => { setSettingsOpen(false); setRemoteBindingError(""); setRemoteBindingOpen(true); }}>关联已有远端账号</button>
         </div>
 
         <div className="provider-toolbar account-proxy-toolbar" aria-label="代理 IP 配置">
@@ -1560,6 +1591,11 @@ function App() {
         </div>
 
       </Drawer>}
+      {remoteBindingOpen && <Drawer title="关联 Sub2API 远端账号" onClose={() => { if (!remoteBindingBusy) setRemoteBindingOpen(false); }}><p className="drawer-description">仅关联当前 CDK 下同邮箱的账号，供自动修复使用。先保存本 CDK 的 Sub2API 配置。</p><form onSubmit={async (event) => {
+        event.preventDefault(); const values = new FormData(event.currentTarget); setRemoteBindingBusy(true); setRemoteBindingError("");
+        try { await flushWorkspaceSettings(); await apiFetch(token, "/api/sub2api/bind", { method: "POST", body: JSON.stringify({ email: values.get("email"), remoteId: Number(values.get("remoteId")) }) }); setRemoteBindingOpen(false); }
+        catch (failure) { setRemoteBindingError(failure.message); } finally { setRemoteBindingBusy(false); }
+      }}><label className="cdk-field">本地账号邮箱<input name="email" type="email" required /></label><label className="cdk-field">远端账号 ID<input name="remoteId" type="number" min="1" required /></label>{remoteBindingError && <p className="cdk-error" role="alert">{remoteBindingError}</p>}<button className="primary-button" disabled={remoteBindingBusy}>{remoteBindingBusy ? "正在核对" : "核对并关联"}</button></form></Drawer>}
       </div>
     </main>
   );
@@ -1801,7 +1837,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, onPreviewExport, 
   async function download() {
     try {
       await onPreviewExport([job.id]);
-      const response = await fetch(`/api/jobs/${job.id}/download`, {
+      const response = await cdkFetch(`/api/jobs/${job.id}/download`, {
         headers: { "x-console-token": token },
       });
       if (!response.ok) throw new Error((await response.json()).error || "下载失败");
@@ -2194,7 +2230,7 @@ function formatRelativeMonitorTime(value) {
 }
 
 async function apiFetch(token, url, options = {}) {
-  const response = await fetch(url, {
+  const response = await cdkFetch(url, {
     ...options,
     headers: {
       "content-type": "application/json",
@@ -2290,7 +2326,7 @@ function extractResponseMessage(value) {
 
 function readLocalSetting(key) {
   try {
-    return window.localStorage.getItem(key) || "";
+    return readWorkspaceValue(key) || "";
   } catch {
     return "";
   }
@@ -2313,7 +2349,7 @@ function readLocalTextSetting(key) {
 
 function readSmsProviderSettings() {
   try {
-    const stored = JSON.parse(window.localStorage.getItem(SMS_PROVIDER_SETTINGS_KEY) || "null");
+    const stored = JSON.parse(readWorkspaceValue(SMS_PROVIDER_SETTINGS_KEY) || "null");
     if (stored && typeof stored === "object" && stored.configs && typeof stored.configs === "object") {
       return stored;
     }
@@ -2344,7 +2380,7 @@ function normalizeMailRequestSettings(value) {
 
 function readMailRequestSettings(value) {
   try {
-    const stored = value || JSON.parse(window.localStorage.getItem(MAIL_REQUEST_SETTINGS_KEY) || "null");
+    const stored = value || JSON.parse(readWorkspaceValue(MAIL_REQUEST_SETTINGS_KEY) || "null");
     return normalizeMailRequestSettings(stored);
   } catch {
     return normalizeMailRequestSettings({});
@@ -2412,7 +2448,7 @@ function normalizeSub2ApiSettings(value) {
 
 function readSub2ApiSettings(value) {
   try {
-    const stored = value || JSON.parse(window.localStorage.getItem(SUB2API_UPLOAD_SETTINGS_KEY) || "null");
+    const stored = value || JSON.parse(readWorkspaceValue(SUB2API_UPLOAD_SETTINGS_KEY) || "null");
     if (stored && typeof stored === "object") return normalizeSub2ApiSettings(stored);
   } catch {}
   return normalizeSub2ApiSettings({});
@@ -2505,7 +2541,7 @@ function formatSmsCountryName(option) {
 
 function writeLocalJson(key, value) {
   try {
-    window.localStorage.setItem(key, JSON.stringify(value));
+    writeWorkspaceValue(key, JSON.stringify(value));
   } catch {
     // Private browsing modes may disable localStorage; the current tab still works.
   }
@@ -2513,7 +2549,7 @@ function writeLocalJson(key, value) {
 
 function writeLocalTextSetting(key, value) {
   try {
-    window.localStorage.setItem(key, String(value || ""));
+    writeWorkspaceValue(key, String(value || ""));
   } catch {
     // Private browsing modes may disable localStorage; the current tab still works.
   }
@@ -2521,4 +2557,4 @@ function writeLocalTextSetting(key, value) {
 
 const appRoot = globalThis.__chatgptOnboardingRoot || createRoot(document.getElementById("root"));
 globalThis.__chatgptOnboardingRoot = appRoot;
-appRoot.render(<App />);
+appRoot.render(<CdkGate>{(auth) => <App key={`${auth.workspace.id}:${auth.token}`} auth={auth} />}</CdkGate>);

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import "./console-auth.mjs";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import net from "node:net";
@@ -69,7 +70,7 @@ let token = "";
 try {
   await startServer();
   const unauthenticated = await fetch(`${base}/api/mfa/accounts`);
-  assert.equal(unauthenticated.status, 403);
+  assert.equal(unauthenticated.status, 401);
   const invalid = await request("preview", { text: "bad-input" });
   assert.equal(invalid.status, 400);
   const input = `${email}----${password}----${oldSecret}\n${queuedEmail}----${password}----${oldSecret}`;
@@ -85,7 +86,7 @@ try {
   const ids = state.accounts.map((account) => account.id);
   const primaryId = state.accounts.find((account) => account.email === email).id;
   const queuedId = state.accounts.find((account) => account.email === queuedEmail).id;
-  assert.equal((await fetch(`${base}/api/mfa/accounts/${primaryId}/logs`)).status, 403);
+  assert.equal((await fetch(`${base}/api/mfa/accounts/${primaryId}/logs`)).status, 401);
   assert.equal((await request('accounts/missing/logs')).status, 404);
   assert.equal((await (await request(`accounts/${primaryId}/logs`)).json()).logs, '');
   assert.equal((await request("logout-all", { ids: [primaryId] })).status, 400);
@@ -168,7 +169,7 @@ try {
   throw error;
 } finally {
   await stopServer();
-  await createCredentialStore().delete(email);
+  await createCredentialStore({ windowsRoot: path.join(root, "test-local-appdata", "toSub2", "credentials") }).delete(email);
   const isolatedStore = createCredentialStore({ windowsRoot: path.join(root, "mfa", "credentials"), macRoot: path.join(root, "mfa", "credentials") });
   const prefix = `mfa:${crypto.createHash("sha256").update(root).digest("hex")}:`;
   await Promise.all([email, queuedEmail].map((value) => isolatedStore.delete(`${prefix}${value}`)));
@@ -186,7 +187,7 @@ function request(action, body) {
 async function startServer() {
   child = spawn(process.execPath, [path.join(projectRoot, "src", "console-server.mjs"), "--port", String(port)], {
     cwd: projectRoot, windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env, ONBOARDING_OUTPUT_ROOT: root, ONBOARDING_PROTOCOL_SCRIPT: protocolScript },
+    env: { ...process.env, LOCALAPPDATA: path.join(root, "test-local-appdata"), ONBOARDING_OUTPUT_ROOT: root, ONBOARDING_PROTOCOL_SCRIPT: protocolScript },
   });
   child.stdout.on("data", (chunk) => { logs = `${logs}${chunk}`.slice(-8000); });
   child.stderr.on("data", (chunk) => { logs = `${logs}${chunk}`.slice(-8000); });

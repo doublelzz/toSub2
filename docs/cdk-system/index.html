@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="description" content="toSub2 CDK 系统交互设计原型，使用独立的示例数据。">
+  <title>CDK 系统设计预览 — toSub2</title>
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <link rel="stylesheet" href="prototype.css">
+  <script src="prototype.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">跳到主要内容</a>
+  <div class="preview-bar">
+    <div class="preview-caption"><strong>交互原型</strong><span>全部为示例数据，未接入真实服务</span></div>
+    <div class="preview-tools">
+      <label for="scene">查看场景</label>
+      <select id="scene">
+        <option value="admin/cdks">管理员 / CDK 管理</option>
+        <option value="user/tasks">普通用户 / 账号任务</option>
+        <option value="user/mine">普通用户 / 我的 CDK</option>
+        <option value="user/sub2api">普通用户 / Sub2API</option>
+        <option value="zero/tasks">普通用户 / 次数耗尽</option>
+        <option value="admin/security">管理员 / 安全日志</option>
+        <option value="admin/blacklist">管理员 / IP 黑名单</option>
+        <option value="login">CDK 登录</option>
+        <option value="login-error">CDK 验证失败</option>
+        <option value="blocked">IP 已封禁</option>
+      </select>
+      <details class="demo-help"><summary>示例密钥</summary><div>登录：<code>DEMO-USER</code> / <code>DEMO-ADMIN</code><br>可融合：<code>DEMO-NEW-100</code><br>已用过：<code>DEMO-USED-200</code></div></details>
+      <button type="button" id="reset-preview">重置预览</button>
+    </div>
+  </div>
+  <div id="app"></div>
+  <dialog id="panel" aria-labelledby="panel-title"></dialog>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>

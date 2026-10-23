@@ -67,6 +67,8 @@ export function useDialogFocus(active, onClose, rootRef, returnFocus) {
     document.body.style.overflow = "hidden";
     if (!panel.contains(previous)) panel.querySelector("button:not(:disabled),input:not(:disabled),textarea:not(:disabled)")?.focus();
     const onKey = (event) => {
+      const top = [...document.querySelectorAll('[role="dialog"][aria-modal="true"]')].at(-1);
+      if (top && top !== panel) return;
       if (event.key === "Escape") { event.stopPropagation(); closeRef.current(); }
       if (event.key === "Tab") {
         const controls = [...panel.querySelectorAll('button:not(:disabled),input:not(:disabled),select:not(:disabled),textarea:not(:disabled),a[href],summary,[tabindex="0"]')].filter((element) => element.getClientRects().length && element.tabIndex >= 0);

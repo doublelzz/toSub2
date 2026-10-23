@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import "./console-auth.mjs";
 import fs from "node:fs/promises";
 import http from "node:http";
 import net from "node:net";
@@ -135,7 +136,7 @@ const child = spawn(process.execPath, [
     TOSUB2_MAC_CREDENTIAL_ROOT: path.join(tempRoot, "credentials"),
     TOSUB2_TLS_PROFILE: "chrome142",
   },
-  stdio: ["ignore", "pipe", "pipe"],
+  stdio: ["ignore", "pipe", "pipe", "ipc"],
   windowsHide: true,
 });
 
@@ -205,14 +206,14 @@ try {
     delay(3_000).then(() => { throw new Error("monitor request did not start"); }),
   ]);
   const shutdownStartedAt = Date.now();
-  child.kill("SIGTERM");
+  child.send({ type: "tosub2:shutdown" });
   const exit = await Promise.race([childExit, delay(10_000).then(() => null)]);
-  assert.ok(exit, "console did not exit after SIGTERM");
+  assert.ok(exit, "console did not exit after graceful IPC shutdown");
   assert.equal(exit.code, 0, logs);
   assert.ok(Date.now() - shutdownStartedAt < 5_000, "shutdown should abort the pending Sub2API monitor request");
   const metadata = JSON.parse(await fs.readFile(path.join(outputRoot, created.job.id, "job-meta.json"), "utf8"));
   assert.equal(metadata.status, "canceled");
-  assert.equal(metadata.prompt, "流程已取消");
+  assert.equal(metadata.prompt, "本次流程已取消，已检测的账号信息仍可查看");
   console.log("console restore and graceful shutdown tests passed");
 } finally {
   if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");

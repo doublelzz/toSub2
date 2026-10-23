@@ -4,6 +4,9 @@
   "description": "通过协议登录 ChatGPT、完成 Codex 授权并生成 sub2api 导入文件",
   "type": "module",
   "scripts": {
+    "build": "vite build web --outDir dist",
+    "predev": "npm run build",
+    "prestart": "npm run build",
     "dev": "node src/console-server.mjs",
     "start": "node src/console-server.mjs",
     "daemon:start": "pm2 start ecosystem.config.cjs",
@@ -16,7 +19,8 @@
     "check:sms": "node --check src/hero-sms.mjs && node test/hero-sms.mjs && node test/sms-providers.mjs && node test/sms-provider-console-smoke.mjs && node test/sms-price-selector.mjs",
     "check:ui": "node test/task-query.mjs && node test/task-query-console.mjs",
     "check:phone-binding": "node test/phone-binding-console.mjs",
-    "check:sms-orders": "node test/sms-orders.mjs"
+    "check:sms-orders": "node test/sms-orders.mjs",
+    "check:cdk": "node test/cdk-store.mjs && node test/cdk-console.mjs && node test/cdk-sub2api-context.mjs"
   },
   "keywords": [
     "chatgpt",
@@ -43,6 +47,6 @@
     "vite": "^6.4.2"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.13.0"
   }
 }

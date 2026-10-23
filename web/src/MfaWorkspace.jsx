@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Ban, Check, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, CircleAlert, Copy, Download, FileText, History, ListPlus, LoaderCircle, LogOut, RefreshCw, Search, ShieldCheck, X } from "lucide-react";
 import { Drawer, MoreActions, TaskFilters, TaskOverview, useCalendarDay, useDialogFocus } from "./WorkspaceUi.jsx";
 import { DEFAULT_FILTERS, matchesDate } from "./task-filters.mjs";
+import { cdkFetch } from "./cdk-api.mjs";
 
 const PAGE_SIZE = 20;
 const ACTIVE_STATUSES = new Set(["queued", "running"]);
@@ -47,7 +48,7 @@ export default function MfaWorkspace({ token, defaultProxyUrl, onReconnect }) {
   useDialogFocus(importOpen, () => { if (!action) setImportOpen(false); });
 
   const request = useCallback(async (path, options = {}) => {
-    const response = await fetch(`/api/mfa/${path}`, {
+    const response = await cdkFetch(`/api/mfa/${path}`, {
       ...options,
       headers: { "content-type": "application/json", "x-console-token": token, ...options.headers },
     });
