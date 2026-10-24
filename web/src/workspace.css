@@ -9,9 +9,9 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 a { text-underline-offset: 3px; }
 .app-shell { display: grid; grid-template-columns: 176px minmax(0, 1fr); min-height: 100vh; }
 .app-sidebar { position: sticky; top: 0; height: 100vh; display: flex; flex-direction: column; padding: 25px 12px 22px; background: var(--surface); border-right: 1px solid var(--line); }
-.brand-block { padding: 0 11px 28px; gap: 10px; }
-.brand-block h1 { font-size: 23px; letter-spacing: -.6px; font-weight: 650; }
-.brand-mark { width: 31px; height: 31px; border-radius: 8px; background: var(--green); color: var(--button-ink); }
+.brand-block { padding: 0 7px 28px; gap: 8px; }
+.brand-block h1 { font-size: 18px; letter-spacing: -.4px; font-weight: 650; white-space: nowrap; }
+.brand-mark { width: 31px; height: 31px; flex-shrink: 0; border-radius: 8px; background: var(--green); color: var(--button-ink); }
 .workspace-tabs { flex-direction: column; padding: 0; border: 0; background: transparent; gap: 5px; }
 .workspace-tabs button { min-height: 42px; padding: 10px 12px; border: 0; border-radius: 8px; font-weight: 500; text-align: left; }
 .workspace-tabs button.active { color: var(--green); background: var(--green-soft); border: 0; }
@@ -302,6 +302,7 @@ input::placeholder, textarea::placeholder { color: var(--muted); opacity: 1; }
 @media (min-width: 1600px) { .workspace { padding-left: 40px; padding-right: 40px; } .authorization-table th:nth-child(3) { width: 27%; } }
 @media (max-width: 1100px) {
   .app-shell { grid-template-columns: 152px minmax(0, 1fr); }
+  .brand-block { padding-left: 0; padding-right: 0; }
   .workspace, .topbar { padding-left: 22px; padding-right: 22px; }
   .overview-states { gap: 18px; }
   .authorization-table th:nth-child(6), .authorization-table .task-time-cell { display: none; }

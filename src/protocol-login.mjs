@@ -7,6 +7,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { ACCOUNT_SESSION_FILENAME, checkAccountInsights, sessionIdentity } from "./account-insights.mjs";
 import { normalizeOAuthCredentials, withSub2ApiExpiry, validateSub2ApiData } from "./sub2api-export.mjs";
 import { readMfaSession, writeMfaSession } from "./mfa-session.mjs";
+import { emailRebindStep } from "./email-rebind-protocol.mjs";
 import {
   browserIdentityForTlsProfile,
   DEFAULT_TLS_PROFILE,
@@ -313,11 +314,35 @@ async function run() {
       args.tlsProfile
       || process.env.TOSUB2_TLS_PROFILE
       || DEFAULT_TLS_PROFILE,
-    verbose: Boolean(args.verbose && !args.rotateTotp && !args.logoutAll),
+    verbose: Boolean(args.verbose && !args.rotateTotp && !args.logoutAll && !args.rebindOperation),
     maxProxySessionAttempts: process.env.CHATGPT_PROXY_MAX_ATTEMPTS || 10,
     sameProxyRiskRetryDelayMs: process.env.CHATGPT_SAME_PROXY_RISK_RETRY_DELAY_MS,
   });
   try {
+    if (args.rebindOperation) {
+      if (!args.rebindResult) throw new Error("Email rebind result path is required");
+      let result;
+      try {
+        const chunks = [];
+        for await (const chunk of input) chunks.push(chunk);
+        const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        if (payload.session?.chatgptBase && payload.session.chatgptBase !== chatgptBase) throw new Error("SESSION_INVALID");
+        await transport.configure(proxyTemplate, { force: true });
+        const client = new ProtocolClient({ transport, verbose: false, hideUrlQuery: true, jar: CookieJar.fromJSON(payload.cookies) });
+        const deviceId = payload.session?.deviceId || crypto.randomUUID();
+        const data = await emailRebindStep({ ...payload, operation: args.rebindOperation }, async (target, options) => {
+          const response = await client.request(options.method, `${chatgptBase}${target}`, {
+            headers: { ...chatgptMfaHeaders({ chatgptBase, accessToken: options.session.accessToken, deviceId }, target),
+              "ChatGPT-Account-Id": options.session.accountId, accept: "application/json" },
+            referer: `${chatgptBase}/`, ...(options.payload ? { json: options.payload } : {}),
+          });
+          return { status: response.res.status, body: response.text };
+        });
+        result = { ok: true, data, cookies: client.jar.toJSON() };
+      } catch (error) { result = { ok: false, code: error.rebindCode || "REQUEST_FAILED" }; }
+      await writePrivateJson(path.resolve(args.rebindResult), result);
+      return;
+    }
     if (args.checkAccountInsights) {
       await transport.configure(proxyTemplate, { force: true });
       await detectAccountInsights(path.resolve(args.checkAccountInsights), { chatgptBase, transport, expectedEmail: args.email });
@@ -2573,6 +2598,8 @@ function parseArgs(argv) {
     else if (item === "--setup-totp") args.setupTotp = true;
     else if (item === "--rotate-totp") args.rotateTotp = true;
     else if (item === "--logout-all") args.logoutAll = true;
+    else if (item === "--rebind-operation") args.rebindOperation = argv[++i];
+    else if (item === "--rebind-result") args.rebindResult = argv[++i];
     else if (item.startsWith("--mfa-session=")) args.mfaSession = item.slice("--mfa-session=".length);
     else if (item === "--mfa-session") args.mfaSession = argv[++i];
     else if (item.startsWith("--mfa-session-output=")) args.mfaSessionOutput = item.slice("--mfa-session-output=".length);

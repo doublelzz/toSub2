@@ -1,0 +1,108 @@
+.rebind-workspace { min-width: 0; }
+.rebind-heading, .rebind-heading > div, .rebind-filterbar, .rebind-actionbar, .rebind-actionbar > div, .rebind-record-actions, .rebind-pagination, .rebind-pagination > div, .rebind-detail-actions { display: flex; align-items: center; gap: 12px; }
+.rebind-heading { justify-content: space-between; margin-bottom: 24px; }
+.rebind-heading > button { flex-shrink: 0; white-space: nowrap; }
+.rebind-heading > div { display: block; }
+.rebind-heading h2 { margin: 0 0 8px; font-size: 24px; font-weight: 600; letter-spacing: -.5px; }
+.rebind-heading p { margin: 0; max-width: 70ch; color: var(--muted); font-size: 13px; line-height: 1.7; }
+.rebind-tabs { display: flex; gap: 24px; border-bottom: 1px solid var(--line); margin-bottom: 20px; }
+.rebind-tabs button { padding: 10px 0 14px; background: transparent; border: 0; border-bottom: 2px solid transparent; color: var(--muted); display: flex; gap: 10px; font-size: 14px; cursor: pointer; }
+.rebind-tabs button.active { color: var(--green); border-bottom-color: var(--green); font-weight: 600; }
+.rebind-tabs span { font-variant-numeric: tabular-nums; color: var(--muted); }
+.rebind-filterbar { flex-wrap: wrap; margin-bottom: 16px; }
+.rebind-search { display: flex; align-items: center; gap: 8px; min-width: 240px; width: min(420px, 100%); padding: 0 12px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); color: var(--muted); }
+.rebind-search input { width: 100%; min-width: 0; height: 38px; border: 0; background: transparent; color: var(--ink); outline: 0; }
+.rebind-search:focus-within { outline: 2px solid var(--green); outline-offset: 2px; }
+.rebind-filterbar > label:not(.rebind-search) { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
+.rebind-filterbar select { min-height: 38px; border: 1px solid var(--line); border-radius: 7px; padding: 6px 10px; color: var(--ink); background: var(--surface); }
+.rebind-actionbar { justify-content: space-between; padding: 14px 0; border-top: 1px solid var(--line); margin-bottom: 16px; flex-wrap: wrap; }
+.rebind-actionbar strong { font-size: 13px; font-weight: 500; }
+.rebind-record-actions, .rebind-detail-actions { flex-wrap: wrap; }
+.rebind-batch-progress { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 0 0 16px; font-size: 13px; color: var(--muted); }
+.rebind-batch-progress strong { color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+.rebind-table { width: 100%; min-width: 0; border-collapse: collapse; table-layout: fixed; }
+.rebind-table th, .rebind-table td { padding: 15px 14px; text-align: left; vertical-align: top; overflow-wrap: anywhere; border-bottom: 1px solid var(--line); }
+.rebind-table th { font-size: 12px; font-weight: 500; color: var(--muted); background: var(--surface-subtle); }
+.rebind-table td { font-size: 13px; line-height: 1.6; }
+.rebind-table th:first-child { width: 42px; }
+.rebind-table th:nth-child(2) { width: 27%; }
+.rebind-results th:nth-child(3) { width: 30%; }
+.rebind-table th:last-child { width: 100px; }
+.rebind-secondary { display: block; color: var(--muted); font-size: 12px; font-weight: 400; line-height: 1.7; }
+.rebind-email { font-weight: 600; }
+.rebind-email-pair { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; min-width: 0; overflow-wrap: anywhere; }
+.rebind-email-pair > span { min-width: 0; display: grid; gap: 2px; }
+.rebind-email-pair small { color: var(--muted); font-size: 12px; }
+.rebind-email-pair strong { font-size: 13px; font-weight: 500; }
+.rebind-email-pair > svg { color: var(--muted); }
+.rebind-status { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 500; }
+.rebind-status-success { color: var(--success); }
+.rebind-status-failed, .rebind-count-error { color: var(--danger); }
+.rebind-status-uncertain, .rebind-status-waiting_manual { color: var(--amber); }
+.rebind-status-checking, .rebind-status-verifying, .rebind-status-waiting_auto { color: var(--green); }
+.rebind-row-message { margin: 6px 0; color: var(--muted); font-size: 12px; line-height: 1.7; }
+.rebind-time { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.rebind-code-form { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.rebind-code-form input { width: 132px; min-width: 0; min-height: 36px; border: 1px solid var(--line); border-radius: 7px; padding: 7px 10px; color: var(--ink); background: var(--surface); font-size: 14px; font-variant-numeric: tabular-nums; }
+.rebind-pagination { justify-content: space-between; margin-top: 16px; font-size: 12px; color: var(--muted); }
+.rebind-detail-actions { margin-top: 12px; }
+.rebind-events { list-style: none; padding: 0; margin: 0; }
+.rebind-events li { display: grid; gap: 4px; padding: 12px 0; border-bottom: 1px solid var(--line); }
+.rebind-events time { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.rebind-events strong { font-size: 13px; }
+.rebind-events span { font-size: 13px; color: var(--muted); }
+.rebind-mapping-backdrop { z-index: 140; }
+.rebind-mapping-dialog { width: min(1040px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); overflow: auto; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); color: var(--ink); padding: 24px; box-shadow: 0 18px 60px rgba(15, 23, 42, .18); }
+.rebind-mapping-dialog > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.rebind-mapping-dialog h2 { font-size: 21px; font-weight: 600; margin: 0 0 8px; }
+.rebind-mapping-dialog header p { max-width: 70ch; margin: 0; color: var(--muted); font-size: 13px; line-height: 1.7; }
+.rebind-mapping-count { display: flex; gap: 16px; flex-wrap: wrap; padding: 18px 0; margin-top: 12px; border-bottom: 1px solid var(--line); font-size: 13px; }
+.rebind-mapping-count strong { font-weight: 600; }
+.rebind-mapping-body { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 24px; padding-top: 20px; }
+.rebind-target-input { display: flex; flex-direction: column; gap: 10px; font-size: 13px; }
+.rebind-target-input textarea { width: 100%; min-height: 260px; resize: vertical; background: var(--surface-subtle); border: 1px solid var(--line); border-radius: 7px; padding: 14px; color: var(--ink); font: inherit; line-height: 1.9; overflow-wrap: anywhere; }
+.rebind-target-input small { color: var(--muted); font-size: 12px; line-height: 1.7; }
+.rebind-map-review > strong { font-size: 13px; font-weight: 500; }
+.rebind-map-review ol { list-style: none; margin: 10px 0 0; padding: 0; max-height: 330px; overflow: auto; }
+.rebind-map-review li { display: grid; grid-template-columns: 24px minmax(0, 1fr); gap: 10px; padding: 12px 0; border-top: 1px solid var(--line); }
+.rebind-map-number { font-size: 12px; font-variant-numeric: tabular-nums; color: var(--muted); padding-top: 2px; }
+.rebind-map-review li > div { display: grid; gap: 6px; overflow-wrap: anywhere; }
+.rebind-map-review small { color: var(--muted); font-size: 12px; }
+.rebind-map-review strong { font-size: 13px; font-weight: 500; }
+.rebind-map-review svg { color: var(--muted); }
+.rebind-map-target { color: var(--green); font-size: 13px; font-weight: 500; }
+.rebind-mapping-options { display: flex; gap: 16px; align-items: flex-end; flex-wrap: wrap; margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--line); }
+.rebind-mapping-options label { display: grid; gap: 7px; font-size: 12px; color: var(--muted); }
+.rebind-mapping-options input { width: 130px; min-height: 36px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); color: var(--ink); }
+.rebind-mapping-options p { flex: 1; min-width: 180px; margin: 0; font-size: 12px; color: var(--muted); line-height: 1.7; }
+.rebind-mapping-dialog > footer { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--line); }
+.rebind-mapping-dialog footer > div { display: flex; gap: 10px; flex-wrap: wrap; }
+@media (max-width: 900px) { .rebind-table th:nth-child(5), .rebind-table td:nth-child(5) { display: none; } .rebind-results th:nth-child(2) { width: 34%; } .rebind-results th:nth-child(3) { width: 36%; } }
+@media (max-width: 640px) {
+  .rebind-heading { align-items: flex-start; margin-bottom: 18px; }
+  .rebind-heading h2 { font-size: 22px; }
+  .rebind-search { min-width: 0; width: 100%; }
+  .rebind-filterbar > label { width: 100%; }
+  .rebind-record-actions { width: 100%; }
+  .rebind-record-actions > button { flex: 1 1 auto; }
+  .rebind-table thead { display: none; }
+  .rebind-table, .rebind-table tbody, .rebind-table tr { display: block; width: 100%; }
+  .rebind-table tr { padding: 12px 14px; border-bottom: 1px solid var(--line); }
+  .rebind-table td { display: block; width: 100%; min-height: 0; border: 0; padding: 6px 0; }
+  .rebind-table td:nth-child(5) { display: block; }
+  .rebind-table .select-cell { float: right; width: auto; }
+  .rebind-table td[data-label]::before { content: attr(data-label); display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+  .rebind-table td[data-label="原账号"]::before { display: none; }
+  .rebind-email-pair { grid-template-columns: minmax(0, 1fr) 20px minmax(0, 1fr); align-items: center; }
+  .rebind-code-form input { flex: 1; }
+  .rebind-code-form button { flex-shrink: 0; }
+  .rebind-mapping-dialog { padding: 18px; }
+  .rebind-mapping-dialog h2 { font-size: 20px; }
+  .rebind-mapping-body { grid-template-columns: minmax(0, 1fr); gap: 20px; }
+  .rebind-target-input textarea { min-height: 180px; }
+  .rebind-map-review ol { max-height: 230px; }
+  .rebind-mapping-dialog footer { position: sticky; bottom: -18px; padding-bottom: 18px; background: var(--surface); }
+  .rebind-mapping-dialog footer > div { flex: 1; }
+  .rebind-mapping-dialog footer .primary-button { flex: 1; }
+}
+@media (pointer: coarse) { .rebind-workspace button, .rebind-workspace input, .rebind-workspace select, .rebind-mapping-dialog button, .rebind-mapping-dialog input { min-height: 44px; } .rebind-workspace input:not([type="checkbox"]), .rebind-mapping-dialog textarea, .rebind-mapping-dialog input { font-size: 16px; } }

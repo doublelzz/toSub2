@@ -65,7 +65,7 @@ export async function flushWorkspaceSettings() {
 export async function cdkFetch(url, options = {}) {
   const headers = new Headers(options.headers || {});
   const method = String(options.method || "GET").toUpperCase();
-  const mode = method === "POST" && ({ "/api/jobs": "single", "/api/jobs/batch": "authorization", "/api/mfa/import": "mfa" })[url];
+  const mode = method === "POST" && ({ "/api/jobs": "single", "/api/jobs/batch": "authorization", "/api/mfa/import": "mfa", "/api/rebind/sync": "rebind" })[url];
   if (mode) {
     let payload; try { payload = JSON.parse(options.body || "{}"); } catch { throw new Error("导入内容格式错误"); }
     const preview = await fetch("/api/imports/preview", { method: "POST", headers, body: JSON.stringify({ mode, payload }), signal: options.signal });

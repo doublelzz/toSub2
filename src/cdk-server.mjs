@@ -89,6 +89,7 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
       const workspaceRoot = id === store.adminId ? root : path.join(root, "cdk", id);
       const workspace = await createWorkspace({
         root: workspaceRoot, cdkId: id, namespace, legacyEmails: id === store.adminId ? initialLegacyEmails : new Set(),
+        rebindVault: { seal: (value, scope) => vault.seal(value, `rebind:${id}:${scope}`), open: (value, scope) => vault.open(value, `rebind:${id}:${scope}`) },
         legacyUsed: (email) => store.legacyUsed(id, email),
         markLegacyUsed: (email) => store.markLegacyUsed(id, email),
         isEnabled: () => acceptingWork && !shuttingDown && store.get(id)?.status === "active",
@@ -305,10 +306,10 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
       await workspace.bindRemote(body.remoteId, body.email, config); send(res, 200, { ok: true }); return;
     }
     if (url.pathname === "/api/imports/preview" && req.method === "POST") {
-      const body = await readRequestJson(req); const mode = ["single", "authorization", "mfa"].includes(body.mode) ? body.mode : "authorization";
+      const body = await readRequestJson(req); const mode = ["single", "authorization", "mfa", "rebind"].includes(body.mode) ? body.mode : "authorization";
       const emails = workspace.planImport(mode, body.payload || {}); send(res, 200, store.preview(owner, emails)); return;
     }
-    const importMode = req.method === "POST" && ({ "/api/jobs": "single", "/api/jobs/batch": "authorization", "/api/mfa/import": "mfa" })[url.pathname];
+    const importMode = req.method === "POST" && ({ "/api/jobs": "single", "/api/jobs/batch": "authorization", "/api/mfa/import": "mfa", "/api/rebind/sync": "rebind" })[url.pathname];
     if (importMode) {
       const body = await readRequestJson(req); const result = await importFor(owner, importMode, body, String(req.headers["idempotency-key"] || body.requestKey || ""), actor);
       res.setHeader("x-cdk-balance", String(store.get(owner).balance)); send(res, result.status, result.data); return;
