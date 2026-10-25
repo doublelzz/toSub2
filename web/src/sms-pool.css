@@ -7,6 +7,17 @@
 .sp-pool-status { flex-wrap: wrap; padding: 16px 0; border-block: 1px solid var(--line); color: var(--muted); font-size: 12px; gap: 12px 25px; }
 .sp-pool-fee { margin-left: auto; color: var(--ink); }
 .sp-pool-fee strong { font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; padding: 0 3px; }
+.sp-cost-summary { padding: 17px 0 15px; border-bottom: 1px solid var(--line); }
+.sp-cost-heading { display: flex; align-items: baseline; flex-wrap: wrap; gap: 7px 15px; }
+.sp-cost-heading h3 { margin: 0; font-size: 13px; font-weight: 600; }
+.sp-cost-heading p, .sp-cost-unknown { margin: 0; font-size: 11px; color: var(--muted); line-height: 1.8; }
+.sp-cost-currency { display: grid; grid-template-columns: 48px minmax(0, 1fr) minmax(0, 1fr); align-items: baseline; gap: 14px; padding-top: 12px; font-size: 12px; }
+.sp-cost-currency > strong { font-weight: 600; }
+.sp-cost-currency > span { display: flex; align-items: baseline; gap: 5px 9px; flex-wrap: wrap; color: var(--muted); }
+.sp-cost-currency b { font-variant-numeric: tabular-nums; color: var(--ink); font-weight: 550; }
+.sp-cost-currency small { font-size: 11px; }
+.sp-cost-counts { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px 20px; margin: 12px 0 0; color: var(--muted); font-size: 11px; }
+.sp-cost-unknown { margin-top: 9px; }
 .sp-state { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; font-size: 12px; color: var(--muted); }
 .sp-state i { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex-shrink: 0; }
 .sp-state-available, .sp-success { color: var(--success); }
@@ -84,7 +95,19 @@
 .sp-credential-row .sp-credential-actions { display: flex; flex: 0 1 auto; align-items: center; gap: 10px; flex-wrap: wrap; }
 .sp-credential-row small.sp-credential-error { color: var(--danger); }
 .sp-operation-table strong { font-size: 12px; font-weight: 550; overflow-wrap: anywhere; }
-.sp-operation-table th:first-child { width: 35%; }
+.sp-operation-table th:first-child { width: 25%; }
+.sp-operation-table th:nth-child(2) { width: 17%; }
+.sp-operation-table th:nth-child(3) { width: 12%; }
+.sp-operation-table th:nth-child(4) { width: 28%; }
+.sp-operation-table td { vertical-align: top; }
+.sp-order-cost strong { display: block; font-size: 12px; font-weight: 550; font-variant-numeric: tabular-nums; }
+.sp-order-cost small { display: block; color: var(--muted); line-height: 1.7; font-size: 11px; margin-top: 4px; }
+.sp-cost-orders { margin-top: 9px; min-width: 0; }
+.sp-cost-orders summary { color: var(--green); cursor: pointer; font-size: 11px; line-height: 1.7; }
+.sp-cost-orders ol { padding: 0; margin: 8px 0 0; list-style: none; }
+.sp-cost-orders li { display: grid; gap: 7px; padding: 9px 0; border-top: 1px solid var(--line); }
+.sp-cost-orders li > div:first-child { display: grid; gap: 4px; }
+.sp-cost-orders li span { font-size: 11px; font-variant-numeric: tabular-nums; }
 .sp-buffer { padding-top: 23px; }
 .sp-buffer-heading, .sp-buffer-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .sp-buffer-heading { justify-content: space-between; }
@@ -98,7 +121,9 @@
 .sp-buffer-table-frame { margin-top: 20px; }
 .sp-buffer-table { min-width: 0; table-layout: fixed; }
 .sp-buffer-table th { width: auto; }
-.sp-buffer-table th:first-child { width: 27%; }
+.sp-buffer-table th:first-child { width: 23%; }
+.sp-buffer-table th:nth-child(2) { width: 15%; }
+.sp-buffer-table th:nth-child(3) { width: 21%; }
 .sp-buffer-table td { font-size: 12px; overflow-wrap: anywhere; }
 .sp-buffer-table strong { font-weight: 550; font-variant-numeric: tabular-nums; }
 .sp-buffer-table small { display: block; margin-top: 6px; font-size: 11px; line-height: 1.7; color: var(--muted); }
@@ -118,6 +143,7 @@
 .sp-settlement { font-size: 12px; }
 .sp-settlement-committed, .sp-settlement-verified { color: var(--success); }
 .sp-dialog { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; max-width: calc(100vw - 32px); width: 460px; max-height: calc(100dvh - 40px); overflow: auto; box-shadow: 0 12px 40px var(--shadow); }
+.modal-backdrop.sp-confirmation-backdrop { justify-content: center; align-items: center; padding: 16px; overflow: auto; }
 .sp-dialog > header { padding: 23px 24px 19px; justify-content: space-between; border-bottom: 1px solid var(--line); }
 .sp-dialog h2 { font-size: 18px; font-weight: 600; margin: 0; }
 .sp-dialog header p { color: var(--muted); font-size: 12px; margin: 7px 0 0; }
@@ -176,4 +202,5 @@
 @media(max-width: 640px) { .sp-quote-filters { flex-direction: column; align-items: stretch; } .sp-quote-grade { min-width: 0; } .sp-credential-row .sp-credential-actions { margin-left: auto; min-width: 0; } .sp-tabs { flex-wrap: wrap; } }
 @media(max-width: 1150px) and (min-width: 641px) { .sp-rules .sp-buffer-rule-settings { grid-column: 1 / -1; } .sp-buffer-rule-fields { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
 @media(max-width: 640px) { .sp-buffer-heading { align-items: flex-start; } .sp-buffer-table thead { display: none; } .sp-buffer-table, .sp-buffer-table tbody, .sp-buffer-table tr, .sp-buffer-table td { display: block; width: 100%; } .sp-buffer-table tr { padding: 16px; border-bottom: 1px solid var(--line); } .sp-buffer-table td { padding: 7px 0; border: 0; min-height: 0; } .sp-buffer-table td:not(:first-child)::before { content: attr(data-label); display: block; margin-bottom: 5px; font-size: 11px; color: var(--muted); } .sp-buffer-actions > span { width: 100%; line-height: 1.7; } }
+@media(max-width: 640px) { .sp-cost-currency { grid-template-columns: 40px minmax(0, 1fr); gap: 8px 12px; } .sp-cost-currency > span:last-child { grid-column: 2; } .sp-operation-table td[data-label="服务商费用"] { align-items: flex-start; } .sp-operation-costs { flex: 1; min-width: 0; } .sp-operation-table td[data-label="服务商费用"] .sp-order-cost small { display: block; margin-top: 4px; } }
 @media(prefers-reduced-motion: reduce) { .sp-toggle-row input[role="switch"]::after { transition: none; } }

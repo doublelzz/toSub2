@@ -211,6 +211,7 @@ input[type="checkbox"] { accent-color: var(--green); width: 15px; height: 15px; 
 .creation-email { display: flex; flex-direction: column; gap: 9px; font-size: 13px; }
 .creation-email .email-field { width: 100%; min-height: 42px; background: var(--surface-subtle); border-color: var(--line); }
 .modal-backdrop { justify-content: flex-end; align-items: stretch; padding: 0; z-index: 40; background: var(--backdrop); }
+.modal-backdrop.sp-confirmation-backdrop, .modal-backdrop.cdk-import-backdrop { z-index: 180; }
 .batch-dialog { --dialog-padding: 25px; width: min(680px, 100%); max-width: 100%; max-height: 100dvh; height: 100dvh; border-radius: 0; border: 0; border-left: 1px solid var(--line); background: var(--surface); box-shadow: -10px 0 30px var(--shadow); }
 .dialog-header h2 { font-size: 21px; font-weight: 600; }
 .dialog-footer { background: var(--surface); gap: 8px; flex-wrap: wrap; }

@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { poolCostOrder } from "./sms-pool-costs.mjs";
 
 export const DEFAULT_BUFFER_RULES = { enabled: false, target: 3, lowWater: 1, perEntry: 1, refillConcurrency: 1, minRemainingSeconds: 480, idleMinutes: 10, maxOutstanding: 10, maxPerMinute: 6 };
 const timestamp = (value) => typeof value === "number" ? value : Date.parse(value);
@@ -29,8 +30,8 @@ export function createSmsBuffer({ store, config, mutate, now, createProvider, pr
       items: rows.map((item) => ({ id: item.id, entryId: item.entryId, providerId: item.providerId, state: item.state,
         phone: item.order?.number?.replace(/.(?=.{4})/g, "*") || null, createdAt: item.createdAt, expiresAt: item.expiresAt,
         expiresSource: item.expiresSource || null, cancelAllowedAt: item.cancelAllowedAt || null, nextActionAt: item.nextActionAt || null,
-        refundStatus: item.refundStatus || "unconfirmed", hasSms: item.hasSms === true, canReconcile: ["purchase_unknown", "quarantined", "cancel_pending"].includes(item.state),
-        cost: item.order?.cost || null, maxPrice: item.config?.maxPrice || null, currency: item.config?.currency || null,
+        ...poolCostOrder(item, { refundExpected: ["cancel_pending", "quarantined", "closed"].includes(item.state) }),
+        hasSms: item.hasSms === true, canReconcile: ["purchase_unknown", "quarantined", "cancel_pending"].includes(item.state),
         cancelState: item.cancelState || null, lastError: item.lastError || "" })) };
   }
   function publicStatus() {

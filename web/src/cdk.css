@@ -43,6 +43,24 @@
 .cdk-confirm h2 { font-size: 21px; margin: 0 0 12px; }
 .cdk-confirm > p { font-size: 13px; line-height: 1.8; }
 .cdk-confirm footer { display: flex; justify-content: flex-end; gap: 10px; margin-top: 25px; flex-wrap: wrap; }
+.cdk-confirm-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }
+.cdk-confirm-heading h2 { margin-bottom: 0; line-height: 1.5; }
+.cdk-confirm-heading .icon-button { flex-shrink: 0; }
+.cdk-combined-confirm { width: min(540px, calc(100vw - 32px)); }
+.cdk-charge-lines { margin: 20px 0 0; border-top: 1px solid var(--line); }
+.cdk-charge-lines > div { display: flex; align-items: center; gap: 20px; padding: 17px 0; border-bottom: 1px solid var(--line); }
+.cdk-charge-lines dt { flex: 1; min-width: 0; font-size: 14px; font-weight: 550; }
+.cdk-charge-lines dt small { display: block; margin-top: 5px; color: var(--muted); font-size: 12px; line-height: 1.8; font-weight: 400; }
+.cdk-charge-lines dd { margin: 0; flex-shrink: 0; font-size: 23px; font-variant-numeric: tabular-nums; }
+.cdk-charge-lines dd span, .cdk-charge-lines dd small { color: var(--muted); font-size: 12px; }
+.cdk-charge-total { display: flex; justify-content: space-between; align-items: center; gap: 18px; padding: 20px 0 3px; }
+.cdk-charge-total > span { font-size: 14px; font-weight: 550; }
+.cdk-charge-total > span small { display: block; margin-top: 5px; font-size: 11px; font-weight: 400; color: var(--muted); }
+.cdk-charge-total strong { font-size: 30px; font-weight: 550; font-variant-numeric: tabular-nums; }
+.cdk-charge-total strong small { color: var(--muted); font-size: 13px; font-weight: 400; }
+.cdk-charge-balance { color: var(--muted); }
+.cdk-confirm p.cdk-charge-capacity { color: var(--amber); font-size: 12px; padding-left: 11px; border-left: 2px solid currentColor; }
+@media(max-width: 480px) { .cdk-combined-confirm { padding: 20px; } .cdk-combined-confirm h2 { font-size: 19px; } .cdk-combined-confirm footer { display: grid; grid-template-columns: auto minmax(0,1fr); } .cdk-charge-lines > div { gap: 12px; } }
 .cdk-equation { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 15px; padding: 20px 0; margin: 22px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
 .cdk-equation div { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
 .cdk-equation span { font-size: 12px; color: var(--muted); }

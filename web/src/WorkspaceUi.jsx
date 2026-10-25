@@ -55,6 +55,8 @@ export function Drawer({ title, onClose, children, wide = false }) {
   return <div className="drawer-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section ref={ref} className={`workspace-drawer ${wide ? "drawer-wide" : ""}`} role="dialog" aria-modal="true" aria-labelledby={id}><header className="drawer-heading"><h2 id={id}>{title}</h2><button type="button" className="icon-button" aria-label="关闭面板" onClick={onClose}><X size={19} /></button></header>{children}</section></div>;
 }
 
+const dialogFocusDocuments = new WeakMap();
+
 export function useDialogFocus(active, onClose, rootRef, returnFocus) {
   const closeRef = useRef(onClose);
   closeRef.current = onClose;
@@ -62,23 +64,46 @@ export function useDialogFocus(active, onClose, rootRef, returnFocus) {
     if (!active) return undefined;
     const panel = rootRef?.current || document.querySelector('.modal-backdrop [role="dialog"]');
     if (!panel) return undefined;
-    const previous = returnFocus || document.activeElement;
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
-    if (!panel.contains(previous)) panel.querySelector("button:not(:disabled),input:not(:disabled),textarea:not(:disabled)")?.focus();
+    const ownerDocument = panel.ownerDocument;
+    let state = dialogFocusDocuments.get(ownerDocument);
+    if (!state) {
+      state = { entries: [], overflow: ownerDocument.body.style.overflow };
+      dialogFocusDocuments.set(ownerDocument, state);
+    }
+    const entry = { panel, previous: returnFocus || ownerDocument.activeElement };
+    state.entries.push(entry);
+    ownerDocument.body.style.overflow = "hidden";
+    const canFocus = (element) => element?.isConnected && typeof element.focus === "function" && !element.matches(":disabled") && element.getClientRects().length;
+    const controls = (target) => [...target.querySelectorAll('button:not(:disabled),input:not(:disabled),select:not(:disabled),textarea:not(:disabled),a[href],summary,[tabindex="0"]')].filter((element) => canFocus(element) && element.tabIndex >= 0);
+    if (!panel.contains(ownerDocument.activeElement)) controls(panel)[0]?.focus();
     const onKey = (event) => {
-      const top = [...document.querySelectorAll('[role="dialog"][aria-modal="true"]')].at(-1);
-      if (top && top !== panel) return;
+      if (state.entries.at(-1) !== entry) return;
       if (event.key === "Escape") { event.stopPropagation(); closeRef.current(); }
       if (event.key === "Tab") {
-        const controls = [...panel.querySelectorAll('button:not(:disabled),input:not(:disabled),select:not(:disabled),textarea:not(:disabled),a[href],summary,[tabindex="0"]')].filter((element) => element.getClientRects().length && element.tabIndex >= 0);
-        const first = controls[0]; const last = controls[controls.length - 1];
-        if (event.shiftKey && (document.activeElement === first || !panel.contains(document.activeElement))) { event.preventDefault(); last?.focus(); }
-        else if (!event.shiftKey && (document.activeElement === last || !panel.contains(document.activeElement))) { event.preventDefault(); first?.focus(); }
+        const focusable = controls(panel);
+        const first = focusable[0]; const last = focusable[focusable.length - 1];
+        if (event.shiftKey && (ownerDocument.activeElement === first || !panel.contains(ownerDocument.activeElement))) { event.preventDefault(); last?.focus(); }
+        else if (!event.shiftKey && (ownerDocument.activeElement === last || !panel.contains(ownerDocument.activeElement))) { event.preventDefault(); first?.focus(); }
       }
     };
-    document.addEventListener("keydown", onKey);
-    return () => { document.body.style.overflow = previousOverflow; document.removeEventListener("keydown", onKey); if (previous?.isConnected) previous.focus(); };
+    ownerDocument.addEventListener("keydown", onKey);
+    return () => {
+      const wasTop = state.entries.at(-1) === entry;
+      const index = state.entries.indexOf(entry);
+      if (index >= 0) state.entries.splice(index, 1);
+      for (const remaining of state.entries) if (entry.panel.contains(remaining.previous)) remaining.previous = entry.previous;
+      ownerDocument.removeEventListener("keydown", onKey);
+      if (!state.entries.length) {
+        ownerDocument.body.style.overflow = state.overflow;
+        dialogFocusDocuments.delete(ownerDocument);
+      }
+      if (!wasTop) return;
+      const next = state.entries.at(-1);
+      if (next) {
+        if (next.panel.contains(entry.previous) && canFocus(entry.previous)) entry.previous.focus();
+        else controls(next.panel)[0]?.focus();
+      } else if (canFocus(entry.previous)) entry.previous.focus();
+    };
   }, [active, rootRef, returnFocus]);
 }
 

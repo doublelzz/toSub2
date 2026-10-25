@@ -598,7 +598,7 @@ function App({ auth }) {
     if (!email.trim() || busy) return;
     setBusy(true);
     try {
-      const smsProvider = phoneBindingEnabled && activeSmsProvider.ready ? await prepareSmsProvider(1) : undefined;
+      const smsProvider = phoneBindingEnabled && activeSmsProvider.ready ? await prepareSmsProvider(1, { importing: true }) : undefined;
       if (phoneBindingEnabled && activeSmsProvider.id === "pool" && !smsProvider) return;
       await apiFetch(token, "/api/jobs", {
         method: "POST",
@@ -622,7 +622,7 @@ function App({ auth }) {
     if (!batchText.trim() || batchBusy) return;
     setBatchBusy(true);
     try {
-      const smsProvider = phoneBindingEnabled && activeSmsProvider.ready ? await prepareSmsProvider(batchText.split(/\r?\n/).filter((line) => line.trim()).length) : undefined;
+      const smsProvider = phoneBindingEnabled && activeSmsProvider.ready ? await prepareSmsProvider(1, { importing: true }) : undefined;
       if (phoneBindingEnabled && activeSmsProvider.id === "pool" && !smsProvider) return;
       await apiFetch(token, "/api/jobs/batch", {
         method: "POST",
@@ -750,8 +750,9 @@ function App({ auth }) {
     }
   }
 
-  async function prepareSmsProvider(count = 1) {
+  async function prepareSmsProvider(count = 1, { importing = false } = {}) {
     if (activeSmsProvider.id !== "pool") return { id: activeSmsProvider.id, config: activeSmsProvider.config };
+    if (importing) return { id: "pool", config: {} };
     const summary = await apiFetch(token, "/api/sms-pool");
     if (!summary.enabled || !summary.available) throw new Error("接码池暂时无法取号，请稍后重试或选择自己的接码平台");
     const admin = auth.workspace.role === "admin";
@@ -1105,7 +1106,6 @@ function App({ auth }) {
         </div>
       </section>
       </>}
-      {smsChargeQuote && <SmsPoolChargeDialog quote={smsChargeQuote} onClose={(value) => { const resolve = smsChargeQuote.resolve; setSmsChargeQuote(null); resolve(value); }} />}
       {smsSettingsOpen && (
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
           if (event.target === event.currentTarget) setSmsSettingsOpen(false);
@@ -1645,6 +1645,7 @@ function App({ auth }) {
         try { await flushWorkspaceSettings(); await apiFetch(token, "/api/sub2api/bind", { method: "POST", body: JSON.stringify({ email: values.get("email"), remoteId: Number(values.get("remoteId")) }) }); setRemoteBindingOpen(false); }
         catch (failure) { setRemoteBindingError(failure.message); } finally { setRemoteBindingBusy(false); }
       }}><label className="cdk-field">本地账号邮箱<input name="email" type="email" required /></label><label className="cdk-field">远端账号 ID<input name="remoteId" type="number" min="1" required /></label>{remoteBindingError && <p className="cdk-error" role="alert">{remoteBindingError}</p>}<button className="primary-button" disabled={remoteBindingBusy}>{remoteBindingBusy ? "正在核对" : "核对并关联"}</button></form></Drawer>}
+      {smsChargeQuote && <SmsPoolChargeDialog quote={smsChargeQuote} onClose={(value) => { const resolve = smsChargeQuote.resolve; setSmsChargeQuote(null); resolve(value); }} />}
       </div>
     </main>
   );

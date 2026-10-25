@@ -66,17 +66,32 @@ export async function cdkFetch(url, options = {}) {
   const headers = new Headers(options.headers || {});
   const method = String(options.method || "GET").toUpperCase();
   const mode = method === "POST" && ({ "/api/jobs": "single", "/api/jobs/batch": "authorization", "/api/mfa/import": "mfa", "/api/rebind/sync": "rebind" })[url];
+  let requestOptions = options;
   if (mode) {
     let payload; try { payload = JSON.parse(options.body || "{}"); } catch { throw new Error("导入内容格式错误"); }
     const preview = await fetch("/api/imports/preview", { method: "POST", headers, body: JSON.stringify({ mode, payload }), signal: options.signal });
     const quote = await preview.json();
     if (!preview.ok) { handleSessionStatus(preview, quote); throw new Error(quote.error || "无法计算导入次数"); }
     if (!quote.canImport) throw new Error(`可用次数不足：新增 ${quote.added} 个账号需要 ${quote.charge} 次，当前可用 ${quote.balance} 次`);
+    const phoneMode = payload.phoneBindingMode ?? (Object.hasOwn(payload, "phoneBindingEnabled") ? payload.phoneBindingEnabled ? "automatic" : "manual" : "automatic");
+    if (["single", "authorization"].includes(mode) && phoneMode === "automatic" && payload.smsProvider?.id === "pool") {
+      const response = await fetch("/api/sms-pool", { headers, signal: options.signal });
+      const pool = await response.json();
+      if (!response.ok) { handleSessionStatus(response, pool); throw new Error(pool.error || "无法读取接码池费用"); }
+      if (!pool.enabled || !pool.available) throw new Error("接码池暂时无法取号，请稍后重试或选择自己的接码平台");
+      if (!Number.isSafeInteger(pool.fee) || pool.fee < 1 || !Number.isSafeInteger(quote.count) || quote.count < 1) throw new Error("接码池费用尚未确认，请刷新后重试");
+      const admin = quote.balance === null;
+      if (!admin && quote.balance < pool.fee) throw new Error(`接码池需要预留 ${pool.fee} 次，当前可用 ${quote.balance} 次`);
+      const fee = admin ? 0 : pool.fee;
+      quote.smsPool = { count: quote.count, fee, maximum: quote.count * fee, admin };
+      payload.smsProvider = { id: "pool", config: { quotedFee: pool.fee } };
+      requestOptions = { ...options, body: JSON.stringify(payload) };
+    }
     if (!confirmationHandler) throw new Error("导入确认尚未准备好，请稍后重试");
     if (!await confirmationHandler(quote)) throw new Error("已取消导入，未消耗次数");
     if (!headers.has("idempotency-key")) headers.set("idempotency-key", requestId());
   }
-  const response = await fetch(url, { ...options, headers });
+  const response = await fetch(url, { ...requestOptions, headers });
   const quotaOwner = response.headers.get("x-cdk-id");
   const balance = response.headers.get("x-cdk-balance");
   const reserved = response.headers.get("x-cdk-reserved");

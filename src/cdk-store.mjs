@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { cdkError, normalizeClientIp, positiveInteger, randomSecret, secretHash } from "./cdk-security.mjs";
+import { poolCostOrder, summarizePoolCosts } from "./sms-pool-costs.mjs";
 
 const DEFAULT_RULES = { ratePerMinute: 30, warnFailures: 5, banFailures: 10, failureWindowMinutes: 10, banMinutes: 30, escalationCount: 3, escalationHours: 24, retentionDays: 30 };
 
@@ -40,6 +41,7 @@ export async function createCdkStore(root, vault) {
     CREATE UNIQUE INDEX IF NOT EXISTS sms_inventory_provider_order ON sms_pool_inventory(provider_id,credential_id,order_id) WHERE order_id IS NOT NULL;
     CREATE INDEX IF NOT EXISTS sms_inventory_state_expiry ON sms_pool_inventory(state,expires_at,created_at);
     CREATE TABLE IF NOT EXISTS sms_pool_order_bindings (order_key TEXT PRIMARY KEY,provider_id TEXT NOT NULL,inventory_id TEXT,cdk_id TEXT,operation_id TEXT,created_at INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS sms_pool_cost_orders (identity TEXT PRIMARY KEY,payload TEXT NOT NULL,created_at INTEGER NOT NULL);
     CREATE INDEX IF NOT EXISTS ledger_owner_time ON ledger(cdk_id,created_at DESC);
     CREATE INDEX IF NOT EXISTS attempts_ip_time ON verification_attempts(ip,created_at);
     CREATE INDEX IF NOT EXISTS security_time ON security_events(last_at DESC);
@@ -87,6 +89,57 @@ export async function createCdkStore(root, vault) {
     return readInventory(inventoryRow(item.id));
   };
   const orderKey = (item) => item.order?.requestId && item.config?.apiKey ? vault.fingerprint(JSON.stringify([item.providerId, item.config.apiKey, String(item.order.requestId)])) : null;
+  let cachedCostSummary = null;
+  const clearUnknownCost = (identity) => { if (identity) { db.prepare("DELETE FROM sms_pool_cost_orders WHERE identity=?").run(identity); cachedCostSummary = null; } };
+  const recordCostOrder = (source, options = {}) => {
+    const identity = options.identity || orderKey(source); if (!identity) return;
+    const descriptor = poolCostOrder(source, options); const old = db.prepare("SELECT payload FROM sms_pool_cost_orders WHERE identity=?").get(identity);
+    const previous = old ? vault.open(old.payload, `sms-cost:${identity}`) : null;
+    if (previous?.cost && !descriptor.cost) descriptor.cost = previous.cost;
+    if (previous?.refundStatus === "confirmed") descriptor.refundStatus = "confirmed";
+    if (previous?.refundExpected) descriptor.refundExpected = true;
+    if (!descriptor.quote && previous?.quote) descriptor.quote = previous.quote;
+    if (!descriptor.maxPrice && previous?.maxPrice) descriptor.maxPrice = previous.maxPrice;
+    descriptor.feeStatus = !descriptor.cost ? "unknown_cost" : !descriptor.cost.currency ? "unknown_currency" : "confirmed_purchase";
+    db.prepare("INSERT INTO sms_pool_cost_orders VALUES(?,?,?) ON CONFLICT(identity) DO UPDATE SET payload=excluded.payload")
+      .run(identity, vault.seal(descriptor, `sms-cost:${identity}`), options.createdAt || source.createdAt || Date.now());
+    cachedCostSummary = null;
+  };
+  const operationCostOrders = (operation) => {
+    const history = [...(operation.orderHistory || [])];
+    if (operation.allocation && !history.some((item) => item.allocationId === operation.allocation.allocationId)) history.push(operation.allocation);
+    const result = history.map((allocation) => {
+      const identity = orderKey(allocation); const row = identity && db.prepare("SELECT payload FROM sms_pool_cost_orders WHERE identity=?").get(identity);
+      return row ? vault.open(row.payload, `sms-cost:${identity}`) : poolCostOrder(allocation, { state: allocation.abandoned ? "abandoned" : operation.state, createdAt: allocation.createdAt || operation.createdAt,
+        refundExpected: allocation.abandoned || operation.state === "released" });
+    });
+    for (const attempt of operation.attempts || []) if (attempt.orderId && !history.some((allocation) => String(allocation.order?.requestId) === String(attempt.orderId))) {
+      result.push(poolCostOrder({ order: { requestId: attempt.orderId } }, { state: "legacy_missing", createdAt: attempt.startedAt }));
+    }
+    for (const attempt of operation.attempts || []) if (attempt.state === "order_unknown" && !history.some((allocation) => allocation.allocationId === attempt.id)) {
+      result.push(poolCostOrder({}, { state: "purchase_unknown", createdAt: attempt.startedAt }));
+    }
+    return result;
+  };
+  if (!db.prepare("SELECT 1 FROM meta WHERE key='sms-cost-orders-migrated'").get()) transaction(() => {
+    for (const row of db.prepare("SELECT * FROM sms_pool_inventory").all()) {
+      const item = readInventory(row); if (item.order) recordCostOrder(item, { refundExpected: ["cancel_pending", "quarantined", "closed"].includes(item.state), createdAt: item.createdAt });
+      else if (item.state === "purchase_unknown" && !item.duplicateOrderId) recordCostOrder(item, { identity: `unknown-inventory:${item.id}`, createdAt: item.createdAt });
+    }
+    for (const row of db.prepare("SELECT * FROM sms_pool_operations").all()) {
+      const operation = smsOperation(row); const history = [...(operation.orderHistory || [])];
+      if (operation.allocation && !history.some((item) => item.allocationId === operation.allocation.allocationId)) history.push(operation.allocation);
+      for (const allocation of history) recordCostOrder(allocation, { state: allocation.abandoned ? "abandoned" : operation.state, createdAt: allocation.createdAt || operation.createdAt,
+        refundExpected: allocation.abandoned || operation.state === "released" });
+      for (const attempt of operation.attempts || []) if (attempt.orderId && !history.some((allocation) => String(allocation.order?.requestId) === String(attempt.orderId))) {
+        recordCostOrder({ order: { requestId: attempt.orderId }, providerId: "", createdAt: attempt.startedAt }, { identity: `legacy-missing:${operation.ownerId}:${operation.operationId}:${attempt.id}`, state: "legacy_missing", createdAt: attempt.startedAt });
+      }
+      for (const attempt of operation.attempts || []) if (attempt.state === "order_unknown" && !history.some((allocation) => allocation.allocationId === attempt.id)) {
+        recordCostOrder({}, { identity: `unknown-operation:${operation.ownerId}:${operation.operationId}:${attempt.id}`, state: "purchase_unknown", createdAt: attempt.startedAt });
+      }
+    }
+    db.prepare("INSERT INTO meta VALUES('sms-cost-orders-migrated','1')").run();
+  });
   if (!db.prepare("SELECT 1 FROM meta WHERE key='sms-order-bindings-migrated'").get()) transaction(() => {
     for (const row of db.prepare("SELECT * FROM sms_pool_inventory WHERE order_id IS NOT NULL").all()) {
       const item = readInventory(row); const key = orderKey(item);
@@ -109,6 +162,9 @@ export async function createCdkStore(root, vault) {
     list: () => db.prepare("SELECT * FROM cdks ORDER BY role,created_at DESC").all().map(publicCdk),
     rawIds: () => db.prepare("SELECT id,role,status FROM cdks").all(),
     setting, saveSetting, audit,
+    smsCostSummary() { if (!cachedCostSummary) cachedCostSummary = summarizePoolCosts(db.prepare("SELECT identity,payload FROM sms_pool_cost_orders").all().map((row) => vault.open(row.payload, `sms-cost:${row.identity}`))); return structuredClone(cachedCostSummary); },
+    smsOperationCostOrders: operationCostOrders,
+    recordSmsCostOrder(source, options = {}) { return transaction(() => recordCostOrder(source, options)); },
     inventoryItem(id) { return readInventory(inventoryRow(id)); },
     inventoryCounts() { return Object.fromEntries(db.prepare("SELECT state,COUNT(*) AS n FROM sms_pool_inventory GROUP BY state").all().map((row) => [row.state, row.n])); },
     inventoryItems({ activeOnly = false, limit = 200 } = {}) {
@@ -126,7 +182,10 @@ export async function createCdkStore(root, vault) {
         return readInventory(inventoryRow(item.id));
       });
     },
-    updateInventory(id, mutate) { return transaction(() => { const item = readInventory(inventoryRow(id)); if (!item) throw cdkError(404, "库存号码不存在"); return writeInventory(mutate(item) || item); }); },
+    updateInventory(id, mutate) { return transaction(() => { const item = readInventory(inventoryRow(id)); if (!item) throw cdkError(404, "库存号码不存在"); const saved = writeInventory(mutate(item) || item);
+      if (saved.order) { clearUnknownCost(`unknown-inventory:${saved.id}`); recordCostOrder(saved, { refundExpected: ["cancel_pending", "quarantined", "closed"].includes(saved.state), createdAt: saved.createdAt }); }
+      else if (saved.state === "purchase_unknown" && !saved.duplicateOrderId) recordCostOrder(saved, { identity: `unknown-inventory:${saved.id}`, createdAt: saved.createdAt });
+      return saved; }); },
     finishInventoryPurchase(id, fields) {
       return transaction(() => {
         const item = readInventory(inventoryRow(id)); if (!item || item.state !== "purchasing") return item;
@@ -139,13 +198,16 @@ export async function createCdkStore(root, vault) {
         if (duplicateOrder || duplicateOperation) return writeInventory({ ...item, state: "purchase_unknown", duplicateOrderId: String(fields.order.requestId), lastError: "duplicate_order", nextActionAt: 0 });
         const duplicate = fields.order?.number && db.prepare("SELECT 1 FROM sms_pool_inventory WHERE id<>? AND phone_hash=? AND state NOT IN ('closed','consumed')").get(id, vault.fingerprint(String(fields.order.number).replace(/\D/g, "")));
         const saved = writeInventory({ ...item, ...fields, ...(duplicate ? { state: "quarantined", lastError: "duplicate_phone", nextActionAt: fields.cancelAllowedAt || Date.now() } : {}) });
+        if (saved.order?.requestId) clearUnknownCost(`unknown-inventory:${saved.id}`);
+        recordCostOrder(saved, { refundExpected: ["cancel_pending", "quarantined"].includes(saved.state), createdAt: saved.createdAt });
         if (key) db.prepare("INSERT INTO sms_pool_order_bindings VALUES(?,?,?,NULL,NULL,?)").run(key, item.providerId, item.id, item.createdAt);
         return saved;
       });
     },
     allocateSmsOrder(ownerId, operationId, allocation, now = Date.now()) {
       return transaction(() => {
-        const operation = readSmsOperation(ownerId, operationId); if (!operation || !["requesting", "reserved"].includes(operation.state)) return { allocation: null, conflict: "operation_stopped" };
+        const operation = readSmsOperation(ownerId, operationId); if (allocation.order?.requestId) clearUnknownCost(`unknown-operation:${ownerId}:${operationId}:${allocation.allocationId}`);
+        if (!operation || !["requesting", "reserved"].includes(operation.state)) { recordCostOrder(allocation, { state: "operation_stopped", createdAt: now, refundExpected: true }); return { allocation: null, conflict: "operation_stopped" }; }
         requireActive(ownerId);
         const phone = String(allocation.order.number).replace(/\D/g, "");
         const key = orderKey(allocation);
@@ -163,10 +225,14 @@ export async function createCdkStore(root, vault) {
             cancelAllowedAt: Number.isFinite(Date.parse(allocation.order.cancelAllowedAt)) ? Date.parse(allocation.order.cancelAllowedAt) : now, nextActionAt: duplicateOrder ? 0 : now };
           db.prepare("INSERT INTO sms_pool_inventory VALUES(?,?,?,?,NULL,NULL,?,?,?, ?,NULL,0,NULL,NULL)").run(item.id, item.entryId, item.credentialId, item.providerId, item.state, vault.seal(item, `sms-inventory:${item.id}`), now, now);
           writeInventory(item);
+          if (!duplicateOrder) recordCostOrder(item, { refundExpected: true, createdAt: now });
           operation.state = "reserved"; operation.reason = item.lastError; Object.assign(operation.attempts.at(-1), { state: item.lastError, endedAt: now }); writeSmsOperation(operation);
           return { allocation: null, conflict: item.lastError };
         }
-        operation.state = "allocated"; operation.allocation = allocation; Object.assign(operation.attempts.at(-1), { state: "allocated", orderId: String(allocation.order.requestId), endedAt: now }); writeSmsOperation(operation);
+        allocation.createdAt ||= now;
+        operation.state = "allocated"; operation.allocation = allocation; (operation.orderHistory ||= []).push(allocation);
+        Object.assign(operation.attempts.at(-1), { state: "allocated", orderId: String(allocation.order.requestId), endedAt: now }); writeSmsOperation(operation);
+        recordCostOrder(allocation, { state: "allocated", createdAt: now });
         if (key) db.prepare("INSERT INTO sms_pool_order_bindings VALUES(?,?,NULL,?,?,?)").run(key, allocation.providerId, ownerId, operationId, now);
         return { allocation, conflict: null };
       });
@@ -190,6 +256,8 @@ export async function createCdkStore(root, vault) {
         if (duplicateAllocation) { item.state = "quarantined"; item.lastError = "duplicate_active_phone"; item.nextActionAt = Math.max(now, item.cancelAllowedAt || 0); writeInventory(item); return null; }
         item.state = "assigned"; item.allocationId = allocation.allocationId; writeInventory(item);
         operation.state = "allocated"; operation.allocation = { ...allocation, inventoryId }; operation.attempts.push({ id: allocation.allocationId, inventoryId, entryId: item.entryId, credentialId: item.credentialId, state: "allocated", orderId: item.order.requestId, startedAt: now, endedAt: now });
+        (operation.orderHistory ||= []).push(operation.allocation);
+        recordCostOrder(item, { state: "assigned", createdAt: item.createdAt });
         writeSmsOperation(operation); return operation.allocation;
       });
     },
@@ -242,7 +310,17 @@ export async function createCdkStore(root, vault) {
       });
     },
     updateSmsOperation(id, operationId, mutate) {
-      return transaction(() => { const operation = readSmsOperation(id, operationId); if (!operation) throw cdkError(404, "接码操作不存在"); if (["verified", "released"].includes(operation.state)) return operation; const next = mutate(operation) || operation; return writeSmsOperation(next); });
+      return transaction(() => { const operation = readSmsOperation(id, operationId); if (!operation) throw cdkError(404, "接码操作不存在"); if (["verified", "released"].includes(operation.state)) return operation; const next = mutate(operation) || operation;
+        if (next.allocation?.order) {
+          if (next.allocation.order.requestId) clearUnknownCost(`unknown-operation:${id}:${operationId}:${next.allocation.allocationId}`);
+          const index = (next.orderHistory ||= []).findIndex((item) => item.allocationId === next.allocation.allocationId);
+          if (index < 0) next.orderHistory.push(next.allocation); else next.orderHistory[index] = next.allocation;
+          recordCostOrder(next.allocation, { state: next.allocation.abandoned ? "abandoned" : next.state, createdAt: next.allocation.createdAt || next.createdAt, refundExpected: next.allocation.abandoned });
+        }
+        if (next.state === "unknown" && next.attempts?.at(-1)?.state === "order_unknown" && next.allocation?.allocationId !== next.attempts.at(-1).id) {
+          const attempt = next.attempts.at(-1); recordCostOrder({ createdAt: attempt.startedAt }, { identity: `unknown-operation:${id}:${operationId}:${attempt.id}`, state: "purchase_unknown", createdAt: attempt.startedAt });
+        }
+        return writeSmsOperation(next); });
     },
     settleSmsOperation(id, operationId, { success = false, evidence = null, reason = "", actor = null } = {}) {
       return transaction(() => {
@@ -255,6 +333,7 @@ export async function createCdkStore(root, vault) {
           if (fee) ledger(id, "sms-pool", -fee, operationId, `接码池手机验证成功 ${fee} 次`, actor);
         } else db.prepare("UPDATE cdks SET reserved=reserved-? WHERE id=?").run(fee, id);
         operation.state = success ? "verified" : "released"; operation.evidence = evidence; operation.reason = String(reason).slice(0, 200); operation.settledAt = Date.now();
+        if (operation.allocation?.order) recordCostOrder(operation.allocation, { state: operation.state, createdAt: operation.allocation.createdAt || operation.createdAt, refundExpected: !success });
         const inventoryRows = db.prepare("SELECT * FROM sms_pool_inventory WHERE claim_owner=? AND claim_operation=? AND state IN ('assigned','checking')").all(id, operationId);
         for (const row of inventoryRows) { const item = readInventory(row); item.state = success ? "consumed" : "cancel_pending"; item.nextActionAt = success ? 0 : Math.max(Date.now(), item.cancelAllowedAt || 0); item.cancelState = success ? null : "pending"; writeInventory(item); }
         audit(actor, success ? "sms-pool-verified" : "sms-pool-released", `${id}:${operationId}`, { jobId: operation.jobId, fee, reason: operation.reason });

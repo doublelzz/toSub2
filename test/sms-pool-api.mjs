@@ -20,7 +20,7 @@ function client() {
 try {
   app = await startCdkServer({ root, listen: false, smsPoolOptions: { createProvider: (id, config) => ({ listNumberOptions: async () => {
     optionsCalls++; assert.equal(config.apiKey, "synthetic-pool-key"); return [{ country: "1", title: "Synthetic country", price: 0.25, count: 5 }];
-  }, getNumber: async () => ({ requestId: crypto.randomUUID(), number: "+12025550123" }) }) }, createWorkspace: async (options) => {
+  }, getNumber: async () => ({ requestId: crypto.randomUUID(), number: "+12025550123", cost: { amount: "0.25", currency: "USD", source: "order" } }) }) }, createWorkspace: async (options) => {
     scopes.set(options.cdkId, options.smsPool);
     return { activeCount: () => 0, tick: () => 0, inventory: () => [], pause() {}, resume() {}, stop: async () => {}, shutdown: async () => {},
       dispatch: async () => ({ body: Buffer.from(JSON.stringify({ features: {} })) }), handle: async (req, res) => { res.writeHead(404); res.end("{}"); } };
@@ -46,7 +46,7 @@ try {
   assert.equal(response.status, 200); const entryId = response.data.entries[0].id;
   response = await user("/api/sms-pool"); assert.equal(response.status, 200); assert.equal(response.data.available, true); assert.equal(response.data.fee, 2);
   assert.equal(response.data.credentials, undefined); assert.equal(response.data.entries, undefined); assert.equal(response.data.operations, undefined);
-  for (const field of ["countries", "country", "countryLabel", "availableEntries"]) assert.equal(response.data[field], undefined, `ordinary CDKs cannot read internal ${field}`);
+  for (const field of ["countries", "country", "countryLabel", "availableEntries", "cost", "costOrders", "costSummary", "quote", "maxPrice"]) assert.equal(response.data[field], undefined, `ordinary CDKs cannot read internal ${field}`);
   assert.equal(typeof response.data.hasNumbers, "boolean");
   assert.equal((await user("/api/admin/sms-pool/buffer/warmup", "POST", {})).status, 403);
   assert.equal((await user("/api/admin/sms-pool/buffer/drain", "POST", {})).status, 403);
@@ -68,6 +68,11 @@ try {
   response = await admin(`/api/admin/sms-pool/operations/${context.operationId}/reconcile`, "POST", { cdkId: owner.id, action: "release", note: "Provider confirmed cancellation" });
   assert.equal(response.status, 200); assert.equal(app.store.get(owner.id).reserved, 0); assert.equal(app.store.get(owner.id).balance, 10);
   response = await admin("/api/admin/sms-pool"); assert.equal(JSON.stringify(response.data).includes("synthetic-pool-key"), false);
+  assert.equal(response.data.costSummary.byCurrency.find((row) => row.currency === "USD").confirmedPurchaseAmount, "0.25", "administrator sees provider-confirmed purchase amount");
+  assert.equal(response.data.operations[0].costOrders[0].cost.amount, "0.25", "administrator can inspect per-number costs");
+  response = await user("/api/sms-pool");
+  assert.equal(response.data.costSummary, undefined, "public availability stays free of administrator cost data");
+  response = await admin("/api/admin/sms-pool");
   const previousCount = response.data.entries.length;
   response = await admin("/api/admin/sms-pool/entries", "POST", { entries: [{ credentialId, country: "2", maxPrice: "0.3" }, { credentialId, country: "invalid", maxPrice: "0.5" }] });
   assert.equal(response.status, 422); assert.equal((await admin("/api/admin/sms-pool")).data.entries.length, previousCount);

@@ -47,10 +47,14 @@ export function createSmsPool({ store, createProvider = createSmsProvider, provi
     return { enabled: value.rules.enabled, available, fee: value.rules.fee, hasNumbers: inventory.ready, refilling: inventory.refilling,
       status: inventory.ready ? "ready" : inventory.refilling ? "fetching" : available ? "available_on_demand" : "unavailable", version: value.version };
   };
-  const publicOperation = (value) => ({ ...billing(value), cdkId: value.ownerId, cdkLabel: store.get(value.ownerId)?.label || "", actorId: value.actorId || "recovery", jobId: value.jobId, email: value.email,
+  const publicOperation = (value) => { const costOrders = store.smsOperationCostOrders(value);
+    const latest = costOrders.find((row) => row.orderId === String(value.allocation?.order?.requestId || "")) || costOrders.at(-1);
+    return ({ ...billing(value), cdkId: value.ownerId, cdkLabel: store.get(value.ownerId)?.label || "", actorId: value.actorId || "recovery", jobId: value.jobId, email: value.email,
     runId: value.runId, createdAt: new Date(value.createdAt).toISOString(), updatedAt: new Date(value.updatedAt).toISOString(),
     entryId: value.allocation?.entryId || value.attempts?.at(-1)?.entryId || null, orderId: value.allocation?.order?.requestId || null,
-    phone: value.allocation?.order?.number?.replace(/.(?=.{4})/g, "*") || null });
+    phone: value.allocation?.order?.number?.replace(/.(?=.{4})/g, "*") || null, costOrders, cost: latest?.cost || null, quote: latest?.quote || null,
+    maxPrice: latest?.maxPrice || null, providerId: latest?.providerId || value.allocation?.providerId || null, providerName: latest?.providerName || null,
+    countryLabel: latest?.countryLabel || "", refundStatus: latest?.refundStatus || "unconfirmed", feeStatus: latest?.feeStatus || "unknown_cost" }); };
   const recentOperations = () => [...new Map([...store.pendingSmsOperations(), ...store.smsOperations()].map((row) => [`${row.ownerId}:${row.operationId}`, row])).values()];
   const operationsPage = (query = {}) => { const page = store.smsOperationPage(query); return { ...page, items: page.items.map(publicOperation) }; };
   const snapshot = () => {
@@ -61,7 +65,7 @@ export function createSmsPool({ store, createProvider = createSmsProvider, provi
         state: !entry.enabled ? "disabled" : !value.credentials.find((row) => row.id === entry.credentialId)?.enabled || value.credentials.find((row) => row.id === entry.credentialId)?.blockedReason ? "credential_error"
           : entry.halfOpen ? "probing" : Math.max(entry.cooldownUntil || 0, value.credentials.find((row) => row.id === entry.credentialId)?.cooldownUntil || 0) > now() ? "cooling" : entry.state === "disabled" ? "disabled" : "available",
         credentialCooldownUntil: value.credentials.find((row) => row.id === entry.credentialId)?.cooldownUntil || 0 }); }),
-      operations: recentOperations().map(publicOperation), buffer: buffer?.snapshot() || { rules: { ...DEFAULT_BUFFER_RULES }, counts: {}, items: [] } };
+      operations: recentOperations().map(publicOperation), costSummary: store.smsCostSummary(), buffer: buffer?.snapshot() || { rules: { ...DEFAULT_BUFFER_RULES }, counts: {}, items: [] } };
   };
 
   // Recovery never repeats an interrupted purchase or a submitted verification.
