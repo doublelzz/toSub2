@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import fs from "node:fs/promises";
+import fs, { registerWorkspaceStorage } from "./workspace-storage.mjs";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -39,9 +39,9 @@ async function legacyEmails(root) {
       const data = await fs.readFile(path.join(root, "mfa", "accounts.json"), "utf8").then(JSON.parse).catch((error) => { if (error.code === "ENOENT" || error instanceof SyntaxError) return null; throw error; });
       for (const account of data?.accounts || []) if (account.email) emails.add(account.email.toLowerCase());
     } else {
-      for (const filename of ["job-meta.json", "sub2api-import-oauth.json"]) {
+      for (const filename of ["job-meta.json"]) {
         const data = await fs.readFile(path.join(root, entry.name, filename), "utf8").then(JSON.parse).catch((error) => { if (error.code === "ENOENT" || error instanceof SyntaxError) return null; throw error; });
-        const email = data?.email || data?.accounts?.[0]?.credentials?.email || data?.accounts?.[0]?.name;
+        const email = data?.email;
         if (typeof email === "string" && email.includes("@")) emails.add(email.toLowerCase());
       }
     }
@@ -58,6 +58,7 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
   const smsPool = createSmsPool({ store, ...smsPoolOptions });
   const namespace = crypto.createHash("sha256").update(root).digest("hex");
   const workspaces = new Map(); const creating = new Map(); const importing = new Map(); const atPhoneWorkspaces = new Map();
+  const storage = new Map();
   const recoveryLocked = new Set();
   const trustedProxies = String(process.env.TOSUB2_TRUSTED_PROXIES || "").split(",").map((value) => value.trim()).filter(Boolean);
   if (trustedProxies.some((address) => !normalizeClientIp(address))) throw new Error("TOSUB2_TRUSTED_PROXIES 需要有效的明确 IP 地址列表");
@@ -65,8 +66,9 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
   cleanupFailedStart = async () => {
     shuttingDown = true; clearInterval(queueTimer); clearInterval(cleanupTimer);
     if (server?.listening) await new Promise((resolve) => { server.close(resolve); server.closeIdleConnections?.(); });
-    await Promise.allSettled([...creating.values()]); await Promise.allSettled([...workspaces.values()].map((workspace) => workspace.shutdown())); await smsPool.close(); store.close();
+    await Promise.allSettled([...creating.values()]); await Promise.allSettled([...workspaces.values()].map((workspace) => workspace.shutdown())); await smsPool.close(); for (const value of storage.values()) value.close(); store.close();
   };
+  storage.set(store.adminId, await registerWorkspaceStorage({ root, ownerId: store.adminId, store, vault }));
   const initialLegacyEmails = await legacyEmails(root);
   let globalSlots = 20;
   const availableSlots = () => globalSlots;
@@ -92,14 +94,18 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
     if (creating.has(id)) return creating.get(id);
     const promise = (async () => {
       const workspaceRoot = id === store.adminId ? root : path.join(root, "cdk", id);
+      if (!storage.has(id)) storage.set(id, await registerWorkspaceStorage({ root: workspaceRoot, ownerId: id, store, vault }));
       const workspace = await createWorkspace({
         root: workspaceRoot, cdkId: id, namespace, legacyEmails: id === store.adminId ? initialLegacyEmails : new Set(),
+        storage: storage.get(id),
+        credentialVault: { seal: (value, scope) => vault.seal(value, `credentials:${id}:${scope}`), open: (value, scope) => vault.open(value, `credentials:${id}:${scope}`) },
         smsPool: smsPool.forOwner(id),
         rebindVault: { seal: (value, scope) => vault.seal(value, `rebind:${id}:${scope}`), open: (value, scope) => vault.open(value, `rebind:${id}:${scope}`) },
         offerVault: { seal: (value, scope) => vault.seal(value, `offers:${id}:${scope}`), open: (value, scope) => vault.open(value, `offers:${id}:${scope}`) },
         offerCanUse: () => !shuttingDown && store.get(id)?.status === "active" && store.get(id).balance >= 1,
         legacyUsed: (email) => store.legacyUsed(id, email),
         markLegacyUsed: (email) => store.markLegacyUsed(id, email),
+        markLegacyUsedMany: (emails) => store.markLegacyUsedMany(id, emails),
         isEnabled: () => acceptingWork && !shuttingDown && store.get(id)?.status === "active",
         availableSlots,
         requestSchedule,
@@ -439,6 +445,7 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
     await Promise.allSettled([...workspaces.values()].map((workspace) => workspace.shutdown()));
     await smsPool.close();
     let timer; await Promise.race([closed, new Promise((resolve) => { timer = setTimeout(() => { server.closeAllConnections?.(); resolve(); }, 3000); })]); clearTimeout(timer);
+    for (const value of storage.values()) value.close();
     store.close(); await processLock.close();
   })();
   if (listen) {

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import "./console-auth.mjs";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
+import { storedFiles } from "./stored-files.mjs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -33,7 +34,7 @@ await fs.writeFile(path.join(jobDir, "job-meta.json"), JSON.stringify({
   created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
 }));
 await fs.writeFile(protocolScript, `
-import fs from 'node:fs/promises';
+import fs from ${JSON.stringify(new URL("../src/workspace-storage.mjs", import.meta.url).href)};
 const arg = (name) => process.argv[process.argv.indexOf(name) + 1];
 if (process.argv.includes('--logout-all')) {
   console.log('[mfa-stage] logout_requested');
@@ -174,13 +175,13 @@ try {
   assert.equal((await restoredExport.text()).replace(/^\uFEFF/, "").trim(), `${email}----${password}----${newSecret}`);
   const sessionPath = path.join(jobDir, "account-session.json");
   const sourceSession = { type: "chatgpt-session", version: 1, email, accountId: "fixture-account", accessToken: "fixture-auth-page-session", expiresAt: "2000-01-01T00:00:00Z" };
-  await fs.writeFile(sessionPath, JSON.stringify(sourceSession));
+  await storedFiles(root).writeFile(sessionPath, JSON.stringify(sourceSession));
   const callMfa = () => fetch(`${base}/api/jobs/${id}/change-mfa`, { method: "POST", headers: headers(), body: "{}" });
   assert.equal((await fetch(`${base}/api/jobs/${id}/change-mfa`, { method: "POST", body: "{}" })).status, 401);
   const expiredStart = await callMfa();
   assert.equal(expiredStart.status, 409);
   assert.match((await expiredStart.json()).error, /授权已过期/);
-  await fs.writeFile(sessionPath, JSON.stringify({ ...sourceSession, expiresAt: "2099-01-01T00:00:00Z" }));
+  await storedFiles(root).writeFile(sessionPath, JSON.stringify({ ...sourceSession, expiresAt: "2099-01-01T00:00:00Z" }));
   const exportBeforeMfa = await fs.readFile(path.join(jobDir, "sub2api-import-oauth.json"), "utf8");
   const directStart = await callMfa();
   assert.equal(directStart.status, 200, await directStart.clone().text());
@@ -197,7 +198,7 @@ try {
   assert.equal((await afterDirectExport.text()).replace(/^\uFEFF/, "").trim(), `${email}----${password}----${newSecret}`);
   assert.equal((await request("logout-all", { ids: [primaryId] })).status, 200);
   await until(async () => (await (await request(`accounts/${primaryId}/logs`)).json()).logs.split('[success] 所有设备登出').length === 3);
-  const invalidated = JSON.parse(await fs.readFile(sessionPath, "utf8"));
+  const invalidated = JSON.parse(await storedFiles(root).readFile(sessionPath, "utf8"));
   assert.equal(invalidated.accessToken, "");
   assert.ok(invalidated.invalidatedAt);
   assert.equal((await callMfa()).status, 409, "logged-out authorization must prompt instead of signing in");

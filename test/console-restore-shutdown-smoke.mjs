@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import "./console-auth.mjs";
 import fs from "node:fs/promises";
+import { storedFiles } from "./stored-files.mjs";
 import http from "node:http";
 import net from "node:net";
 import os from "node:os";
@@ -166,21 +167,27 @@ try {
   assert.match(interrupted.prompt, /服务重启中断/);
   const recoveredPassword = page.jobs.find((job) => job.id === interruptedPasswordId);
   assert.equal(recoveredPassword.status, "resume_available");
-  assert.equal(recoveredPassword.loginMode, "password");
+  assert.equal(recoveredPassword.loginMode, "manual", "startup does not inspect the saved password result");
   assert.equal(recoveredPassword.canAddPassword, false);
   assert.equal(recoveredPassword.canRetry, true);
   assert.equal(recoveredPassword.passwordAddError, null);
-  assert.equal(recoveredPassword.passwordAddedAt, "2026-08-17T05:00:00.000Z");
-  assert.match(recoveredPassword.prompt, /已恢复成功添加的新密码/);
-  await assert.rejects(fs.access(path.join(interruptedPasswordDir, "password-add-result.json")));
+  assert.equal(recoveredPassword.passwordAddedAt, null);
+  assert.match(recoveredPassword.prompt, /执行操作时恢复/);
+  await storedFiles(outputRoot).access(path.join(interruptedPasswordDir, "password-add-result.json"));
   const recoveredTotp = page.jobs.find((job) => job.id === interruptedTotpId);
   assert.equal(recoveredTotp.status, "resume_available");
-  assert.equal(recoveredTotp.hasTotpKey, true);
+  assert.equal(recoveredTotp.hasTotpKey, false, "startup does not inspect the pending TOTP secret");
   assert.equal(recoveredTotp.canSetupTotp, false);
   assert.equal(recoveredTotp.canRetry, true);
   assert.equal(recoveredTotp.totpSetupError, null);
-  assert.match(recoveredTotp.prompt, /已恢复成功激活的 2FA 密钥/);
-  await assert.rejects(fs.access(path.join(interruptedTotpDir, "totp-setup-result.json")));
+  assert.match(recoveredTotp.prompt, /执行操作时恢复/);
+  await storedFiles(outputRoot).access(path.join(interruptedTotpDir, "totp-setup-result.json"));
+  const lazyExport = await fetch(`${baseUrl}/api/jobs/export-source`, { method: "POST", headers, body: JSON.stringify({ ids: [interruptedPasswordId] }) });
+  assert.equal(lazyExport.status, 200);
+  assert.match(await lazyExport.text(), /Recovered_Test_4826!/);
+  await assert.rejects(storedFiles(outputRoot).access(path.join(interruptedPasswordDir, "password-add-result.json")));
+  const recovered = await fetch(`${baseUrl}/api/jobs`, { headers }).then((response) => response.json());
+  assert.equal(recovered.jobs.find((job) => job.id === interruptedPasswordId).passwordAddedAt, "2026-08-17T05:00:00.000Z");
 
   const createResponse = await fetch(`${baseUrl}/api/jobs`, {
     method: "POST",
@@ -211,7 +218,7 @@ try {
   assert.ok(exit, "console did not exit after graceful IPC shutdown");
   assert.equal(exit.code, 0, logs);
   assert.ok(Date.now() - shutdownStartedAt < 5_000, "shutdown should abort the pending Sub2API monitor request");
-  const metadata = JSON.parse(await fs.readFile(path.join(outputRoot, created.job.id, "job-meta.json"), "utf8"));
+  const metadata = JSON.parse(await storedFiles(outputRoot).readFile(path.join(outputRoot, created.job.id, "job-meta.json"), "utf8"));
   assert.equal(metadata.status, "canceled");
   assert.equal(metadata.prompt, "本次流程已取消，已检测的账号信息仍可查看");
   console.log("console restore and graceful shutdown tests passed");

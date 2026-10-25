@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import crypto from "node:crypto";
-import fs from "node:fs/promises";
+import fs, { attachWorkspaceStorage, workspaceChildOptions } from "./workspace-storage.mjs";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { spawn } from "node:child_process";
@@ -72,7 +72,7 @@ const SUB2API_AUTO_REPAIR_COOLDOWN_MS = readDurationEnv("SUB2API_AUTO_REPAIR_COO
 const OUTPUT_ROOT = path.resolve(
   options.root,
 );
-const baseCredentialStore = createCredentialStore({ windowsRoot: path.join(OUTPUT_ROOT, ".credentials"), macRoot: path.join(OUTPUT_ROOT, ".credentials") });
+const baseCredentialStore = createCredentialStore({ windowsRoot: path.join(OUTPUT_ROOT, ".credentials"), macRoot: path.join(OUTPUT_ROOT, ".credentials"), vault: options.credentialVault });
 const legacyCredentialStore = createCredentialStore();
 const credentialPrefix = `cdk:${options.namespace}:${options.cdkId}:`;
 const credentialStore = {
@@ -91,6 +91,7 @@ const credentialStore = {
 };
 const consoleToken = crypto.randomBytes(24).toString("base64url");
 const jobs = new Map();
+const credentialLoads = new Map();
 const customSmsPoolPositions = new Map();
 const emailJobLocks = new Map();
 let mfaWorkspace = null;
@@ -127,10 +128,12 @@ await recoverSmsPoolJobs();
 const mfaCredentialStore = createCredentialStore({
   windowsRoot: path.join(OUTPUT_ROOT, "mfa", "credentials"),
   macRoot: path.join(OUTPUT_ROOT, "mfa", "credentials"),
+  vault: options.credentialVault,
 });
 const mfaCredentialPrefix = `mfa:${crypto.createHash("sha256").update(OUTPUT_ROOT).digest("hex")}:`;
 mfaWorkspace = await createMfaWorkspace({
   root: OUTPUT_ROOT,
+  deferCredentialRecovery: true,
   protocolScript: PROTOCOL_SCRIPT,
   credentialStore: {
     save: (email, credentials) => mfaCredentialStore.save(`${mfaCredentialPrefix}${email}`, credentials),
@@ -1137,6 +1140,8 @@ async function createJobRecord(email, credentials = {}, proxyUrl = null, phoneBi
     hasPasswordCredential: Boolean(password),
     hasTotpCredential: Boolean(totpSecret),
     proxyUrl,
+    credentialsLoaded: true,
+    hasProxyCredential: Boolean(proxyUrl),
     mailApiUrl,
     mailRequestBody,
     mailSeenCandidateKeys: new Set(),
@@ -1246,6 +1251,13 @@ function scheduleQueuedJobs(coordinator = false) {
 async function prepareAndLaunchJob(job, mode, queueRunId) {
   try {
     await job.smsPoolTask;
+    await reloadMissingJobCredentials(job);
+    if (job.pendingPasswordRecovery || job.pendingTotpRecovery) throw httpError(409, "上次凭据恢复尚未完成，请先核对账号资料");
+    if (mode === "totp_setup" && (job.totpSecret || job.hasTotpCredential)) throw httpError(409, "该账号已经保存 2FA 密钥，无需重复设置");
+    if (mode === "password_add" && job.password) throw httpError(409, "该账号已经保存密码，无需重复添加");
+    const missing = restoredMissingCredentials({ has_password: ["full", "totp_setup", "password_add"].includes(mode) && job.hasPasswordCredential,
+      has_totp_key: ["full", "totp_setup", "password_add"].includes(mode) && job.hasTotpCredential, proxy_configured: job.hasProxyCredential }, job);
+    if (missing.length) throw httpError(409, `已保存的${missing.join("、")}无法读取，请重新填写后再执行`);
     if (mode === "full" && (job.phoneBindingRequested || job.phoneBindingMode === "automatic")) {
       try { job.pendingSmsSetup = JSON.parse(await fs.readFile(path.join(path.dirname(job.outputPath), "sms-provider.json"), "utf8")); } catch { job.pendingSmsSetup = null; }
     }
@@ -1344,6 +1356,7 @@ function launchJob(job, options = {}) {
     cwd: WORKSPACE_ROOT,
     env: {
       ...protocolEnvironment(),
+      ...workspaceChildOptions(OUTPUT_ROOT),
       CHATGPT_LOGIN_PASSWORD: job.password || "",
       CHATGPT_TOTP_SECRET: job.totpSecret || "",
       CHATGPT_NEW_PASSWORD: mode === "password_add" ? job.pendingNewPassword || "" : "",
@@ -1357,8 +1370,10 @@ function launchJob(job, options = {}) {
         String(process.env.TOSUB2_TLS_PROFILE || "").trim()
         || (!job.proxyUrl ? String(options.tlsProfile || DEFAULT_TLS_PROFILE) : ""),
     },
-    stdio: ["pipe", "pipe", "pipe"],
+    stdio: ["pipe", "pipe", "pipe", "ipc"],
+    windowsHide: true,
   });
+  attachWorkspaceStorage(child, OUTPUT_ROOT);
   job.child = child;
 
   child.stdout.on("data", (chunk) => {
@@ -1503,7 +1518,9 @@ async function retryJob(job, options = {}) {
   }
   const retryingSecurityCheck = Boolean(job.securityCheckRequired);
   if (Object.hasOwn(options, "proxyUrl")) {
+    await reloadMissingJobCredentials(job);
     job.proxyUrl = normalizeProxyUrl(options.proxyUrl);
+    job.hasProxyCredential = Boolean(job.proxyUrl);
     const persisted = await saveStoredLoginCredentials(job.email, job);
   }
   const resumingCheckpoint = await fileExists(job.checkpointPath);
@@ -1552,7 +1569,9 @@ async function regenerateJob(job, options = {}) {
     throw httpError(409, "只能为已经完成的任务重新生成授权");
   }
   if (Object.hasOwn(options, "proxyUrl")) {
+    await reloadMissingJobCredentials(job);
     job.proxyUrl = normalizeProxyUrl(options.proxyUrl);
+    job.hasProxyCredential = Boolean(job.proxyUrl);
     await saveStoredLoginCredentials(job.email, job);
   }
   job.lastError = null;
@@ -1579,12 +1598,13 @@ async function forceReloginJob(job, options = {}, context = {}) {
   if (!canForceRelogin(job)) {
     throw httpError(409, "当前任务正在进行中，不能重新登录");
   }
-  await reloadMissingJobCredentials(job);
+  if (job.pendingPasswordRecovery || job.pendingTotpRecovery || Object.hasOwn(options, "proxyUrl")) await reloadMissingJobCredentials(job);
   if (!canForceRelogin(job)) {
     throw httpError(409, "当前任务正在进行中，不能重新登录");
   }
   if (Object.hasOwn(options, "proxyUrl")) {
     job.proxyUrl = normalizeProxyUrl(options.proxyUrl);
+    job.hasProxyCredential = Boolean(job.proxyUrl);
     await saveStoredLoginCredentials(job.email, job);
   }
   stopMailPolling(job);
@@ -1631,27 +1651,15 @@ async function forceReloginJob(job, options = {}, context = {}) {
   beginAuthorizationAutomationAttempt(job, context.autoRepair ? "sub2api_monitor" : "manual_relogin");
   recordJobOperation(job, context.autoRepair ? "automatic_relogin" : "relogin");
   appendJobLog(job, `\n[relogin] 第 ${job.attempt} 次授权：跳过刷新令牌并强制重新登录。\n`);
-  if (job.hasTotpCredential && !job.totpSecret) {
+  if (job.credentialsLoaded !== false && job.hasTotpCredential && !job.totpSecret) {
     appendJobLog(job, "[mfa] 本地未能读取已记录的 2FA 密钥，遇到 2FA 时需要手动输入验证码。\n");
   }
   enqueueJob(job, "full", "正在强制重新登录并完成授权");
 }
 
 async function reloadMissingJobCredentials(job) {
-  if (
-    (job.password || !job.hasPasswordCredential)
-    && (job.totpSecret || !job.hasTotpCredential)
-    && job.proxyUrl
-  ) return;
-  const stored = await loadStoredLoginCredentials(job.email);
-  job.password ||= stored.password;
-  job.totpSecret ||= stored.totpSecret;
-  job.proxyUrl ||= stored.proxyUrl;
-  if (job.password) job.hasPasswordCredential = true;
-  if (job.totpSecret) job.hasTotpCredential = true;
-  if (stored.password || stored.totpSecret || stored.proxyUrl) {
-    await saveStoredLoginCredentials(job.email, job);
-  }
+  if (job.credentialsLoaded !== false && !job.pendingPasswordRecovery && !job.pendingTotpRecovery) return;
+  await loadStoredLoginCredentials(job.email);
 }
 
 async function startTotpSetup(job, options = {}) {
@@ -1671,7 +1679,9 @@ async function startTotpSetup(job, options = {}) {
     throw httpError(409, "邮箱登录检查点已丢失，请先重新登录");
   }
   if (Object.hasOwn(options, "proxyUrl")) {
+    await reloadMissingJobCredentials(job);
     job.proxyUrl = normalizeProxyUrl(options.proxyUrl);
+    job.hasProxyCredential = Boolean(job.proxyUrl);
     await saveStoredLoginCredentials(job.email, job);
   }
   stopMailPolling(job);
@@ -1712,7 +1722,9 @@ async function startPasswordAdd(job, options = {}) {
     throw httpError(409, "邮箱登录检查点已丢失，请先重新登录");
   }
   if (Object.hasOwn(options, "proxyUrl")) {
+    await reloadMissingJobCredentials(job);
     job.proxyUrl = normalizeProxyUrl(options.proxyUrl);
+    job.hasProxyCredential = Boolean(job.proxyUrl);
     await saveStoredLoginCredentials(job.email, job);
   }
   stopMailPolling(job);
@@ -4036,11 +4048,14 @@ function getAutoRepairEligibility(job) {
   if (job.autoRepairBlocked) return { eligible: false, reason: "账号已确认封禁、删除或永久停用" };
   if (!job.lastAuthAutomated) return { eligible: false, reason: job.lastAuthAutomationReason || "上次授权不是全自动完成" };
   const requirements = job.lastAuthRequirements || {};
-  if (requirements.password && !job.password) return { eligible: false, reason: "已保存的密码无法读取" };
+  const passwordAvailable = job.password || job.credentialsLoaded === false && job.hasPasswordCredential;
+  const totpAvailable = job.totpSecret || job.credentialsLoaded === false && job.hasTotpCredential;
+  if (requirements.password && !passwordAvailable) return { eligible: false, reason: "已保存的密码无法读取" };
   if (requirements.emailOtp && !job.mailApiUrl) return { eligible: false, reason: "缺少可自动收取邮箱验证码的 API" };
-  if (requirements.mfa && !job.totpSecret) return { eligible: false, reason: "已保存的 2FA 密钥无法读取" };
-  if (!job.password && !job.mailApiUrl) return { eligible: false, reason: "缺少可自动登录的密码或邮件收码 API" };
-  if (job.hasTotpCredential && !job.totpSecret) return { eligible: false, reason: "2FA 密钥在当前系统上无法恢复" };
+  if (requirements.mfa && !totpAvailable) return { eligible: false, reason: "已保存的 2FA 密钥无法读取" };
+  if (!passwordAvailable && !job.mailApiUrl) return { eligible: false, reason: "缺少可自动登录的密码或邮件收码 API" };
+  if (job.hasTotpCredential && !totpAvailable) return { eligible: false, reason: "2FA 密钥在当前系统上无法恢复" };
+  if (job.credentialsLoaded === false) return { eligible: true, reason: "所需资料已记录，执行前将加载并校验" };
   return { eligible: true, reason: "上次完整登录全自动完成，所需资料仍可用" };
 }
 
@@ -4140,6 +4155,8 @@ async function exportSourceAccounts(res, ids) {
   const selected = resolveSelectedJobs(ids);
   const lines = [];
   for (const job of selected) {
+    await reloadMissingJobCredentials(job);
+    if (job.pendingPasswordRecovery || job.pendingTotpRecovery) throw httpError(409, "账号凭据尚未恢复完成，请先核对后再导出");
     let password = job.password || "";
     let totpSecret = job.totpSecret || "";
     if ((!password && job.hasPasswordCredential) || (!totpSecret && job.hasTotpCredential)) {
@@ -4264,7 +4281,7 @@ function publicJob(job) {
     mfaBusy: mfaWorkspace?.isBusy(job.email) || false,
     canAddPassword: canAddPassword(job),
     restartRequired: job.restartRequired,
-    proxyConfigured: Boolean(job.proxyUrl),
+    proxyConfigured: Boolean(job.proxyUrl || job.hasProxyCredential),
     autoRepairEligible: autoRepair.eligible,
     autoRepairEligibilityReason: autoRepair.reason,
     autoRepairBlocked: Boolean(job.autoRepairBlocked),
@@ -4304,14 +4321,14 @@ function canChangeMfa(job) {
 }
 
 function canSetupTotp(job) {
-  if (job.totpSecret || job.hasTotpCredential || job.totpKnownEnabled) return false;
+  if (job.totpSecret || job.hasTotpCredential || job.totpKnownEnabled || job.pendingTotpRecovery) return false;
   if (job.status === "completed" && job.resultSaved) return true;
   return Boolean(job.loginCheckpointAvailable)
     && ["phone", "phone_otp", "resume_available", "failed", "canceled", "reauth_required"].includes(job.status);
 }
 
 function canAddPassword(job) {
-  if (job.password || job.hasPasswordCredential) return false;
+  if (job.password || job.hasPasswordCredential || job.pendingPasswordRecovery) return false;
   if (job.status === "completed" && job.resultSaved) return true;
   return Boolean(job.loginCheckpointAvailable)
     && ["phone", "phone_otp", "resume_available", "failed", "canceled", "reauth_required"].includes(job.status);
@@ -4529,301 +4546,93 @@ function downloadTimestamp(date = new Date()) {
   return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
 }
 
+async function storedTaskMetadata() {
+  if (options.storage) return options.storage.taskMetadata(new Set(jobs.keys()));
+  // Standalone workspace fixtures use the same metadata-only restoration
+  // contract. The application supplies its SQLite storage above.
+  const rows = [];
+  const entries = await fs.readdir(OUTPUT_ROOT, { withFileTypes: true });
+  for (const entry of entries) {
+    if (!entry.isDirectory() || jobs.has(entry.name)) continue;
+    const directory = path.join(OUTPUT_ROOT, entry.name);
+    let metadata;
+    try { metadata = JSON.parse(await fs.readFile(path.join(directory, JOB_META_FILENAME), "utf8")); } catch { continue; }
+    const output = await fs.stat(path.join(directory, "sub2api-import-oauth.json")).catch((error) => { if (error.code === "ENOENT") return null; throw error; });
+    rows.push({ id: entry.name, metadata: { ...metadata, result_saved: Boolean(output), result_file_mtime: output?.mtime.toISOString(),
+      login_checkpoint_available: await fileExists(path.join(directory, LOGIN_CHECKPOINT_FILENAME)),
+      pending_password_recovery: await fileExists(path.join(directory, PASSWORD_ADD_RESULT_FILENAME)),
+      pending_totp_recovery: await fileExists(path.join(directory, TOTP_SETUP_RESULT_FILENAME)) } });
+  }
+  return rows;
+}
+
 async function syncCompletedOutputs(force = false) {
   if (!force && Date.now() - lastOutputSyncAt < 2_000) return;
   if (outputSyncPromise) return outputSyncPromise;
   outputSyncPromise = (async () => {
     lastOutputSyncAt = Date.now();
-    let entries = [];
-    try {
-      entries = await fs.readdir(OUTPUT_ROOT, { withFileTypes: true });
-    } catch {
-      return;
+    for (const { id, metadata } of await storedTaskMetadata()) {
+      if (!isEmail(metadata.email)) continue;
+      const outputDir = path.join(OUTPUT_ROOT, id);
+      const resultSaved = metadata.result_saved === true;
+      const checkpoint = metadata.login_checkpoint_available === true;
+      const savedStatus = restoredTaskStatus(metadata);
+      const restartable = !resultSaved && !checkpoint && ["queued", "starting"].includes(savedStatus);
+      const interrupted = Boolean(savedStatus) && !isTerminalStatus(savedStatus) && !restartable;
+      const completedAt = metadata.completed_at || metadata.result_file_mtime;
+      const emptyRecovery = { recovered: false, error: null };
+      const operation = resultSaved ? restoredOutputOperationState(metadata, completedAt, emptyRecovery, emptyRecovery) : null;
+      const status = operation?.status || (checkpoint ? isTerminalStatus(savedStatus) ? savedStatus : "resume_available"
+        : restartable ? "queued" : interrupted || !savedStatus ? "failed" : savedStatus);
+      const stamp = metadata.updated_at || metadata.created_at || new Date().toISOString();
+      const mailApiUrl = validateMailApiUrl(metadata.mail_api_url) ? metadata.mail_api_url : null;
+      const pendingRecovery = metadata.pending_password_recovery || metadata.pending_totp_recovery;
+      const prompt = operation?.prompt || (status === "phone_skipped" ? "已跳过接码，可查看账号信息；新的 OAuth 授权尚未完成"
+        : pendingRecovery ? "上次账号操作结果已保留，将在执行操作时恢复凭据"
+        : restartable ? "服务重启后已恢复，等待任务槽位"
+        : checkpoint ? metadata.prompt || "检测到邮箱登录检查点，可以继续流程"
+        : interrupted || !savedStatus ? "上次流程因服务重启中断，可以重新授权"
+        : metadata.prompt || "已恢复上次任务状态");
+      const flags = restoredCredentialFlags(metadata);
+      jobs.set(id, {
+        id, email: metadata.email, status, prompt,
+        createdAt: metadata.created_at || stamp, updatedAt: stamp,
+        lastOperationAt: metadata.last_operation_at || metadata.created_at || stamp,
+        lastOperationType: metadata.last_operation_type || "initial_authorization",
+        completedAt: resultSaved ? completedAt : null,
+        outputPath: path.join(outputDir, "sub2api-import-oauth.json"),
+        checkpointPath: path.join(outputDir, LOGIN_CHECKPOINT_FILENAME),
+        totpResultPath: path.join(outputDir, TOTP_SETUP_RESULT_FILENAME),
+        passwordAddResultPath: path.join(outputDir, PASSWORD_ADD_RESULT_FILENAME),
+        logs: operation?.log || (interrupted && !checkpoint ? "[restore] 上次任务在生成授权文件前中断，已恢复为可重试状态。\n" : "[restore] 已加载任务元数据，账号凭据将在操作时读取。\n"),
+        lastError: operation ? operation.lastError : metadata.last_error || (interrupted && !checkpoint ? `上次 ${savedStatus} 阶段未完成` : null),
+        child: null, parserTail: "", resultSaved,
+        accountInsights: metadata.account_insights_snapshot || null,
+        loginMode: metadata.login_mode === "password" || flags.hasPasswordCredential ? "password" : mailApiUrl ? "email_otp" : metadata.login_mode || "manual",
+        password: "", totpSecret: "", proxyUrl: null,
+        credentialsLoaded: false, hasProxyCredential: metadata.proxy_configured === true,
+        pendingPasswordRecovery: metadata.pending_password_recovery === true,
+        pendingTotpRecovery: metadata.pending_totp_recovery === true,
+        ...flags,
+        mailApiUrl, mailRequestBody: typeof metadata.mail_request_body === "string" ? metadata.mail_request_body : "",
+        mailSeenCandidateKeys: new Set(), mailCandidateCounts: new Map(),
+        mailStatus: mailApiUrl ? "ready" : "manual", mailApiError: null, mailPollRunning: false, mailPollToken: null,
+        currentPhone: metadata.sms_number || metadata.luban_number || null, phoneError: null,
+        restartRequired: status === "reauth_required", attempt: Math.max(1, Number(metadata.attempt || 1)), runId: null, runMode: null,
+        queuedMode: restartable ? metadata.queued_mode === "refresh" ? "refresh" : "full" : null,
+        queuedAt: restartable ? metadata.queued_at || stamp : null,
+        queuedStartPrompt: metadata.queued_mode === "refresh" ? "正在使用已有刷新令牌直接生成新授权" : "正在建立登录会话",
+        fallbackInProgress: false,
+        ...restoredTotpSetupState(metadata), ...restoredProxyRiskState(metadata), ...restoredAutoRepairState(metadata),
+        totpSetupError: operation?.totpSetupError || null,
+        passwordAddError: operation?.passwordAddError || metadata.password_add_error || null,
+        passwordAddedAt: metadata.password_added_at || null, pendingNewPassword: null,
+        totpSetupResumesAuthorization: false, passwordAddResumesAuthorization: false,
+        loginCheckpointAvailable: checkpoint, securityCheckRequired: Boolean(metadata.security_check_required),
+        ...newSmsState(), ...restoredSmsState(metadata),
+      });
     }
-    await Promise.all(entries.filter((entry) => entry.isDirectory()).map(async (entry) => {
-      if (jobs.has(entry.name)) return;
-      const outputDir = path.join(OUTPUT_ROOT, entry.name);
-      const outputPath = path.join(outputDir, "sub2api-import-oauth.json");
-      const checkpointPath = path.join(outputDir, LOGIN_CHECKPOINT_FILENAME);
-      const totpResultPath = path.join(outputDir, TOTP_SETUP_RESULT_FILENAME);
-      const passwordAddResultPath = path.join(outputDir, PASSWORD_ADD_RESULT_FILENAME);
-      let metadata = {};
-      try {
-        metadata = JSON.parse(await fs.readFile(path.join(outputDir, JOB_META_FILENAME), "utf8"));
-      } catch {}
-
-      try {
-        const [raw, stat] = await Promise.all([fs.readFile(outputPath, "utf8"), fs.stat(outputPath)]);
-        const data = JSON.parse(raw);
-        if (data.type !== "sub2api-data" || !Array.isArray(data.accounts) || !data.accounts.length) throw new Error("invalid output");
-        const account = data.accounts[0];
-        const email = metadata.email || account?.credentials?.email || account?.extra?.email || account?.name || `restored-${entry.name}`;
-        const mailApiUrl = validateMailApiUrl(metadata.mail_api_url) ? metadata.mail_api_url : null;
-        let storedCredentials = await loadStoredLoginCredentials(email);
-        const completedAt = stat.mtime.toISOString();
-        const updatedAt = metadata.updated_at || completedAt;
-        const passwordRecovery = await recoverAddedPasswordCredential({
-          email,
-          resultPath: passwordAddResultPath,
-          credentials: storedCredentials,
-        });
-        storedCredentials = passwordRecovery.credentials;
-        const totpRecovery = await recoverActivatedTotpCredential({
-          email,
-          resultPath: totpResultPath,
-          credentials: storedCredentials,
-        });
-        storedCredentials = totpRecovery.credentials;
-        const restoredOperation = restoredOutputOperationState(metadata, completedAt, totpRecovery, passwordRecovery);
-        const accountInsights = await loadAccountInsights(accountInsightsPath({ outputPath, status: restoredOperation.status, accountInsightsSource: metadata.account_insights_source }), email);
-        jobs.set(entry.name, {
-          id: entry.name,
-          email,
-          status: restoredOperation.status,
-          prompt: restoredOperation.prompt,
-          createdAt: metadata.created_at || completedAt,
-          updatedAt,
-          lastOperationAt: metadata.last_operation_at || metadata.created_at || completedAt,
-          lastOperationType: metadata.last_operation_type || "initial_authorization",
-          completedAt: metadata.completed_at || completedAt,
-          outputPath,
-          checkpointPath,
-          totpResultPath,
-          passwordAddResultPath,
-          logs: restoredOperation.log,
-          lastError: restoredOperation.lastError,
-          child: null,
-          parserTail: "",
-          resultSaved: true,
-          accountInsights,
-          loginMode: metadata.login_mode === "password" || storedCredentials.password ? "password" : (mailApiUrl ? "email_otp" : metadata.login_mode || "manual"),
-          password: storedCredentials.password,
-          totpSecret: storedCredentials.totpSecret,
-          ...restoredCredentialFlags(metadata, storedCredentials),
-          mailApiUrl,
-          mailRequestBody: typeof metadata.mail_request_body === "string" ? metadata.mail_request_body : "",
-          proxyUrl: storedCredentials.proxyUrl,
-          mailSeenCandidateKeys: new Set(),
-          mailCandidateCounts: new Map(),
-          mailStatus: mailApiUrl ? "ready" : "manual",
-          mailApiError: null,
-          mailPollRunning: false,
-          mailPollToken: null,
-          currentPhone: metadata.sms_number || metadata.luban_number || null,
-          phoneError: null,
-          restartRequired: false,
-          attempt: Math.max(1, Number(metadata.attempt || 1)),
-          runId: null,
-          runMode: null,
-          fallbackInProgress: false,
-          ...restoredTotpSetupState(metadata, storedCredentials),
-          ...restoredProxyRiskState(metadata),
-          ...restoredAutoRepairState(metadata),
-          totpSetupError: restoredOperation.totpSetupError,
-          passwordAddError: restoredOperation.passwordAddError,
-          passwordAddedAt: metadata.password_added_at || passwordRecovery.addedAt || null,
-          pendingNewPassword: null,
-          totpSetupResumesAuthorization: false,
-          passwordAddResumesAuthorization: false,
-          loginCheckpointAvailable: false,
-          securityCheckRequired: Boolean(metadata.security_check_required),
-          ...newSmsState(),
-        });
-        return;
-      } catch {}
-
-      try {
-        const [raw, stat] = await Promise.all([fs.readFile(checkpointPath, "utf8"), fs.stat(checkpointPath)]);
-        const checkpoint = JSON.parse(raw);
-        if (checkpoint?.version !== 1 || typeof checkpoint.email !== "string" || !checkpoint.email) return;
-        const mailApiUrl = validateMailApiUrl(metadata.mail_api_url) ? metadata.mail_api_url : null;
-        const email = metadata.email || checkpoint.email;
-        let storedCredentials = await loadStoredLoginCredentials(email);
-        const passwordRecovery = await recoverAddedPasswordCredential({
-          email,
-          resultPath: passwordAddResultPath,
-          credentials: storedCredentials,
-        });
-        storedCredentials = passwordRecovery.credentials;
-        const totpRecovery = await recoverActivatedTotpCredential({
-          email,
-          resultPath: totpResultPath,
-          credentials: storedCredentials,
-        });
-        storedCredentials = totpRecovery.credentials;
-        const restoredAt = stat.mtime.toISOString();
-        const savedStatus = restoredTaskStatus(metadata);
-        const restoredStatus = passwordRecovery.recovered || totpRecovery.recovered
-          ? "resume_available"
-          : isTerminalStatus(savedStatus) ? savedStatus : "resume_available";
-        jobs.set(entry.name, {
-          id: entry.name,
-          email,
-          status: restoredStatus,
-          prompt: totpRecovery.recovered
-            ? "已恢复成功激活的 2FA 密钥，可以继续未完成的 Codex 授权"
-            : passwordRecovery.recovered
-              ? "已恢复成功添加的新密码，可以继续未完成的 Codex 授权"
-            : restoredStatus === "phone_skipped" ? "已跳过接码，可查看账号信息；新的 OAuth 授权尚未完成"
-            : metadata.prompt || (restoredStatus === "resume_available"
-              ? "检测到邮箱登录检查点，可以继续手机号绑定"
-              : "已恢复上次操作状态，登录检查点仍然保留"),
-          createdAt: metadata.created_at || restoredAt,
-          updatedAt: metadata.updated_at || restoredAt,
-          lastOperationAt: metadata.last_operation_at || metadata.created_at || restoredAt,
-          lastOperationType: metadata.last_operation_type || "initial_authorization",
-          completedAt: null,
-          outputPath,
-          checkpointPath,
-          totpResultPath,
-          passwordAddResultPath,
-          logs: totpRecovery.recovered
-            ? "[restore] 已从中断的 2FA 设置流程恢复并安全保存密钥。\n"
-            : passwordRecovery.recovered
-              ? "[restore] 已从中断的添加密码流程恢复并安全保存新密码。\n"
-            : `[restore] 已恢复 ${checkpoint.stage || "unknown"} 阶段的登录检查点。\n`,
-          lastError: passwordRecovery.recovered || totpRecovery.recovered
-            ? "ChatGPT 登录状态已保留，点击继续流程即可重新开始 Codex 授权"
-            : metadata.last_error || (restoredStatus === "resume_available"
-              ? "上次流程在生成授权文件前中断"
-              : null),
-          child: null,
-          parserTail: "",
-          resultSaved: false,
-          accountInsights: await loadAccountInsights(accountInsightsPath({ outputPath, status: restoredStatus, accountInsightsSource: metadata.account_insights_source }), email),
-          loginMode: metadata.login_mode === "password" || storedCredentials.password ? "password" : (mailApiUrl ? "email_otp" : metadata.login_mode || "manual"),
-          password: storedCredentials.password,
-          totpSecret: storedCredentials.totpSecret,
-          ...restoredCredentialFlags(metadata, storedCredentials),
-          mailApiUrl,
-          mailRequestBody: typeof metadata.mail_request_body === "string" ? metadata.mail_request_body : "",
-          proxyUrl: storedCredentials.proxyUrl,
-          mailSeenCandidateKeys: new Set(),
-          mailCandidateCounts: new Map(),
-          mailStatus: mailApiUrl ? "ready" : "manual",
-          mailApiError: null,
-          mailPollRunning: false,
-          mailPollToken: null,
-          currentPhone: checkpoint.oauth?.phone || metadata.sms_number || metadata.luban_number || null,
-          phoneError: null,
-          restartRequired: false,
-          attempt: Math.max(1, Number(metadata.attempt || 1)),
-          runId: null,
-          runMode: null,
-          fallbackInProgress: false,
-          ...restoredTotpSetupState(metadata, storedCredentials),
-          ...restoredProxyRiskState(metadata),
-          ...restoredAutoRepairState(metadata),
-          totpSetupError: totpRecovery.error || null,
-          passwordAddError: passwordRecovery.error || metadata.password_add_error || null,
-          passwordAddedAt: metadata.password_added_at || passwordRecovery.addedAt || null,
-          pendingNewPassword: null,
-          totpSetupResumesAuthorization: false,
-          passwordAddResumesAuthorization: false,
-          loginCheckpointAvailable: true,
-          securityCheckRequired: Boolean(metadata.security_check_required),
-          ...restoredSmsState(metadata),
-        });
-      } catch {
-        if (
-          !metadata.email
-          || !isEmail(metadata.email)
-        ) return;
-        const storedCredentials = await loadStoredLoginCredentials(metadata.email);
-        const mailApiUrl = validateMailApiUrl(metadata.mail_api_url) ? metadata.mail_api_url : null;
-        const restoredAt = metadata.updated_at || new Date().toISOString();
-        const missingStoredCredentials = restoredMissingCredentials(metadata, storedCredentials);
-        const storedCredentialsMissing = missingStoredCredentials.length > 0;
-        const savedStatus = restoredTaskStatus(metadata);
-        const restartable = ["queued", "starting"].includes(savedStatus);
-        const interrupted = Boolean(savedStatus) && !isTerminalStatus(savedStatus) && !restartable;
-        const restoredStatus = storedCredentialsMissing && restartable
-          ? "reauth_required"
-          : restartable
-            ? "queued"
-            : interrupted || !savedStatus
-              ? "failed"
-              : savedStatus;
-        const restoredPrompt = storedCredentialsMissing && restartable
-          ? "登录资料需要重新确认"
-          : restartable
-            ? "服务重启后已恢复，等待任务槽位"
-            : interrupted || !savedStatus
-              ? "上次流程因服务重启中断，可以重新授权"
-              : metadata.prompt || "已恢复上次任务状态";
-        const restoredError = storedCredentialsMissing && restartable
-          ? `请重新导入或填写${missingStoredCredentials.join("、")}后重试，任务不会使用缺失的资料自动登录`
-          : interrupted || !savedStatus
-            ? metadata.last_error || `上次 ${savedStatus || "未知"} 阶段未完成`
-            : metadata.last_error || null;
-        jobs.set(entry.name, {
-          id: entry.name,
-          email: metadata.email,
-          status: restoredStatus,
-          prompt: restoredPrompt,
-          createdAt: metadata.created_at || restoredAt,
-          updatedAt: restoredAt,
-          lastOperationAt: metadata.last_operation_at || metadata.created_at || restoredAt,
-          lastOperationType: metadata.last_operation_type || "initial_authorization",
-          completedAt: metadata.completed_at || null,
-          outputPath,
-          checkpointPath,
-          totpResultPath,
-          passwordAddResultPath,
-          logs: storedCredentialsMissing && restartable
-            ? `[restore] 系统安全凭据存储中无法恢复${missingStoredCredentials.join("、")}，已停止自动启动。\n`
-            : restartable
-              ? "[restore] 已恢复排队任务，等待可用任务槽位。\n"
-              : interrupted || !savedStatus
-                ? "[restore] 上次任务在生成授权文件前中断，已恢复为可重试状态。\n"
-                : "[restore] 已恢复上次任务状态。\n",
-          lastError: restoredError,
-          child: null,
-          parserTail: "",
-          resultSaved: false,
-          accountInsights: await loadAccountInsights(accountInsightsPath({ outputPath, status: restoredStatus, accountInsightsSource: metadata.account_insights_source }), metadata.email),
-          loginMode: metadata.login_mode === "password" || storedCredentials.password ? "password" : (mailApiUrl ? "email_otp" : metadata.login_mode || "manual"),
-          password: storedCredentials.password,
-          totpSecret: storedCredentials.totpSecret,
-          ...restoredCredentialFlags(metadata, storedCredentials),
-          mailApiUrl,
-          mailRequestBody: typeof metadata.mail_request_body === "string" ? metadata.mail_request_body : "",
-          proxyUrl: storedCredentials.proxyUrl,
-          mailSeenCandidateKeys: new Set(),
-          mailCandidateCounts: new Map(),
-          mailStatus: mailApiUrl ? "baseline" : "manual",
-          mailApiError: null,
-          mailPollRunning: false,
-          mailPollToken: null,
-          currentPhone: metadata.sms_number || null,
-          phoneError: null,
-          restartRequired: restoredStatus === "reauth_required",
-          attempt: Math.max(1, Number(metadata.attempt || 1)),
-          runId: null,
-          runMode: null,
-          queuedMode: restoredStatus === "queued" && metadata.queued_mode === "refresh" ? "refresh" : "full",
-          queuedAt: restoredStatus === "queued" ? metadata.queued_at || restoredAt : null,
-          queuedStartPrompt: metadata.queued_mode === "refresh"
-            ? "正在使用已有刷新令牌直接生成新授权"
-            : "正在建立登录会话",
-          fallbackInProgress: false,
-          ...restoredTotpSetupState(metadata, storedCredentials),
-          ...restoredProxyRiskState(metadata),
-          ...restoredAutoRepairState(metadata),
-          passwordAddError: metadata.password_add_error || null,
-          passwordAddedAt: metadata.password_added_at || null,
-          pendingNewPassword: null,
-          totpSetupResumesAuthorization: false,
-          passwordAddResumesAuthorization: false,
-          loginCheckpointAvailable: Boolean(metadata.login_checkpoint_available),
-          securityCheckRequired: Boolean(metadata.security_check_required),
-          ...newSmsState(),
-        });
-      }
-    }));
-  })().finally(() => {
-    outputSyncPromise = null;
-  });
+  })().finally(() => { outputSyncPromise = null; });
   return outputSyncPromise;
 }
 
@@ -5553,7 +5362,7 @@ function escapeRegExp(value) {
 
 async function updateJobCredentials(job, credentials, options = {}) {
   assertMfaIdle(job.email);
-  if (credentials.preserveExistingCredentials) await reloadMissingJobCredentials(job);
+  await reloadMissingJobCredentials(job);
   const normalized = credentials.preserveExistingCredentials
     ? normalizeLoginCredentials({
         password: job.password,
@@ -5582,6 +5391,8 @@ async function updateJobCredentials(job, credentials, options = {}) {
   job.hasPasswordCredential = Boolean(normalized.password);
   job.hasTotpCredential = Boolean(normalized.totpSecret);
   job.proxyUrl = nextProxyUrl;
+  job.hasProxyCredential = Boolean(nextProxyUrl);
+  job.credentialsLoaded = true;
   job.phoneBindingEnabled = nextPhoneBinding;
   job.mailSeenCandidateKeys.clear();
   job.mailCandidateCounts.clear();
@@ -5599,8 +5410,10 @@ async function updateJobCredentials(job, credentials, options = {}) {
 
 async function updateJobProxy(job, proxyUrl) {
   assertMfaIdle(job.email);
+  await reloadMissingJobCredentials(job);
   if (job.proxyUrl === proxyUrl) return;
   job.proxyUrl = proxyUrl;
+  job.hasProxyCredential = Boolean(proxyUrl);
   await saveStoredLoginCredentials(job.email, job);
   recordJobOperation(job, "proxy_update");
   appendJobLog(job, "[proxy] 账号代理配置已更新。\n");
@@ -5677,10 +5490,12 @@ async function saveJobMetadata(job) {
         account_session_available: Boolean(job.accountSessionAvailable),
         account_insights_return_status: job.accountInsightsReturnStatus || null,
         account_insights_source: job.accountInsightsSource || null,
+        account_insights_snapshot: job.accountInsights || null,
+        task_metadata_version: 2,
         rebind_origin_item_id: job.rebindOriginItemId || null,
         mail_api_url: job.mailApiUrl || null,
         mail_request_body: job.mailRequestBody || null,
-        has_stored_credentials: Boolean(job.password || job.totpSecret),
+        has_stored_credentials: Boolean(job.password || job.totpSecret || job.hasPasswordCredential || job.hasTotpCredential),
         has_password: Boolean(job.password || job.hasPasswordCredential),
         has_totp_key: Boolean(job.totpSecret || job.hasTotpCredential),
         totp_known_enabled: Boolean(job.totpKnownEnabled || job.totpSecret || job.hasTotpCredential),
@@ -5689,7 +5504,7 @@ async function saveJobMetadata(job) {
         login_checkpoint_available: Boolean(job.loginCheckpointAvailable),
         proxy_risk_retry_count: Number(job.proxyRiskRetryCount || 0),
         proxy_connection_failure_count: Number(job.proxyConnectionFailureCount || 0),
-        proxy_configured: Boolean(job.proxyUrl),
+        proxy_configured: Boolean(job.proxyUrl || job.hasProxyCredential),
         sms_provider_id: job.smsProviderId || null,
         sms_provider_name: job.smsProviderName || null,
         sms_service_label: job.smsServiceLabel || null,
@@ -5738,16 +5553,50 @@ async function saveStoredLoginCredentials(email, credentials = {}) {
 }
 
 async function loadStoredLoginCredentials(email) {
-  try {
-    const data = await credentialStore.load(email);
-    return {
+  const key = email.toLowerCase();
+  if (credentialLoads.has(key)) return credentialLoads.get(key);
+  const loading = (async () => {
+    let data;
+    try { data = await credentialStore.load(email); } catch { data = {}; }
+    let credentials = {
       password: typeof data.password === "string" ? data.password : "",
       totpSecret: data.totpSecret ? normalizeTotpSecret(data.totpSecret) : "",
       proxyUrl: data.proxyUrl ? normalizeProxyUrl(data.proxyUrl) : null,
     };
-  } catch {
-    return { password: "", totpSecret: "", proxyUrl: null };
-  }
+    const matching = [...jobs.values()].filter((job) => job.email.toLowerCase() === key && !job.deleted);
+    for (const job of matching) {
+      let recoveredPassword = null; let recoveredTotp = null;
+      if (job.pendingPasswordRecovery) {
+        recoveredPassword = await recoverAddedPasswordCredential({ email, resultPath: job.passwordAddResultPath, credentials });
+        credentials = recoveredPassword.credentials;
+        job.pendingPasswordRecovery = Boolean(recoveredPassword.error);
+        job.passwordAddError = recoveredPassword.error || null;
+        if (recoveredPassword.recovered) job.passwordAddedAt = recoveredPassword.addedAt;
+      }
+      if (job.pendingTotpRecovery) {
+        recoveredTotp = await recoverActivatedTotpCredential({ email, resultPath: job.totpResultPath, credentials });
+        credentials = recoveredTotp.credentials;
+        job.pendingTotpRecovery = Boolean(recoveredTotp.error);
+        job.totpSetupError = recoveredTotp.error || null;
+      }
+      job.password = credentials.password; job.totpSecret = credentials.totpSecret; job.proxyUrl = credentials.proxyUrl;
+      job.hasPasswordCredential ||= Boolean(credentials.password); job.hasTotpCredential ||= Boolean(credentials.totpSecret);
+      job.totpKnownEnabled ||= Boolean(credentials.totpSecret); job.hasProxyCredential ||= Boolean(credentials.proxyUrl);
+      job.credentialsLoaded = true;
+      if (credentials.password) job.loginMode = "password";
+      if (recoveredPassword?.recovered || recoveredTotp?.recovered) {
+        if (!isActive(job.status)) {
+          job.status = job.resultSaved ? "completed" : "resume_available";
+          job.prompt = recoveredTotp?.recovered ? "已恢复成功激活的 2FA 密钥，可以继续原流程" : "已恢复成功添加的新密码，可以继续原流程";
+          job.lastError = null;
+        }
+        await saveJobMetadata(job);
+      }
+    }
+    return credentials;
+  })();
+  credentialLoads.set(key, loading);
+  try { return await loading; } finally { if (credentialLoads.get(key) === loading) credentialLoads.delete(key); }
 }
 
 async function deleteStoredLoginCredentials(email) {

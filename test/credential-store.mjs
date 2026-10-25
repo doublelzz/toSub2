@@ -50,6 +50,17 @@ try {
     const realStore = createCredentialStore({ windowsRoot: path.join(tempRoot, "real-dpapi") });
     await realStore.save(email, credentials);
     assert.deepEqual(await realStore.load(email), credentials);
+    const { createCdkVault } = await import("../src/cdk-vault.mjs");
+    const previousKey = process.env.TOSUB2_ENCRYPTION_KEY;
+    process.env.TOSUB2_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString("base64");
+    try {
+      const vault = await createCdkVault(path.join(tempRoot, "batch-vault"));
+      const batchStore = createCredentialStore({ windowsRoot: path.join(tempRoot, "real-dpapi"), vault });
+      await batchStore.migrate();
+      assert.deepEqual(await batchStore.load(email), credentials, "real DPAPI batch migration preserves credentials");
+    } finally {
+      if (previousKey === undefined) delete process.env.TOSUB2_ENCRYPTION_KEY; else process.env.TOSUB2_ENCRYPTION_KEY = previousKey;
+    }
     await realStore.delete(email);
     assert.deepEqual(await realStore.load(email), { password: "", totpSecret: "", proxyUrl: "" });
   }

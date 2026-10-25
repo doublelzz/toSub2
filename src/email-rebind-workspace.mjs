@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import fs from "node:fs/promises";
+import fs, { attachWorkspaceStorage, workspaceChildOptions } from "./workspace-storage.mjs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { protocolEnvironment } from "./cdk-security.mjs";
@@ -52,9 +52,10 @@ export function createRebindRunner(protocolScript, directory) {
       await onLog(`[process] 启动协议步骤 ${operation}`);
       const exit = await new Promise((resolve, reject) => {
         child = spawn(process.execPath, [protocolScript, "--rebind-operation", operation, "--rebind-result", resultPath], {
-          env: { ...protocolEnvironment(), CHATGPT_PROXY_URL: payload.proxyUrl || "", CHATGPT_LOGIN_PASSWORD: "", CHATGPT_TOTP_SECRET: "" },
-          stdio: ["pipe", "pipe", "pipe"], windowsHide: true,
+          env: { ...protocolEnvironment(), ...workspaceChildOptions(directory), CHATGPT_PROXY_URL: payload.proxyUrl || "", CHATGPT_LOGIN_PASSWORD: "", CHATGPT_TOTP_SECRET: "" },
+          stdio: ["pipe", "pipe", "pipe", "ipc"], windowsHide: true,
         });
+        attachWorkspaceStorage(child, directory);
         capture(child.stdout, "stdout"); capture(child.stderr, "stderr");
         aborted = () => child.kill("SIGTERM");
         signal?.addEventListener("abort", aborted, { once: true });
@@ -101,8 +102,14 @@ export async function createEmailRebindWorkspace({ root, vault, listSources, res
   };
   async function persist() {
     const temporary = `${statePath}.${crypto.randomUUID()}.tmp`;
-    try { await fs.writeFile(temporary, vault.seal({ version: 1, concurrency, items: [...items.values()] }, scope), { mode: 0o600 }); await fs.rename(temporary, statePath); }
+    const savedItems = [...items.values()].map((item) => ({ ...item, snapshot: undefined,
+      snapshotSealed: item.snapshot ? vault.seal(item.snapshot, `email-rebind-snapshot:${item.id}`) : item.snapshotSealed || null }));
+    try { await fs.writeFile(temporary, vault.seal({ version: 1, concurrency, items: savedItems }, scope), { mode: 0o600 }); await fs.rename(temporary, statePath); }
     finally { await fs.rm(temporary, { force: true }).catch(() => {}); }
+  }
+  function accountSnapshot(item) {
+    if (!item.snapshot && item.snapshotSealed) item.snapshot = vault.open(item.snapshotSealed, `email-rebind-snapshot:${item.id}`);
+    return item.snapshot;
   }
   function transition(item, status, message = "") {
     item.status = status; item.message = message; item.updatedAt = new Date(now()).toISOString();
@@ -178,7 +185,7 @@ export async function createEmailRebindWorkspace({ root, vault, listSources, res
     pump(); return { batchId, count: body.ids.length };
   }
   async function step(item, operation, code, signal) {
-    const snapshot = item.snapshot;
+    const snapshot = accountSnapshot(item);
     if (!snapshot?.session) throw rebindError("SESSION_EXPIRED");
     await journal.append(item, `[step:${operation}] 开始 ${item.oldEmail} -> ${item.newEmail}`);
     const result = await runStep(operation, { email: item.oldEmail, newEmail: item.newEmail, session: snapshot.session,
@@ -328,7 +335,7 @@ export async function createEmailRebindWorkspace({ root, vault, listSources, res
     available();
     return selected(ids).map((item) => {
       if (item.status !== "success" || !item.confirmedAt) throw error("只有确认换绑成功的记录才能同步");
-      return { id: item.id, oldEmail: item.oldEmail, newEmail: item.newEmail, mailboxUrl: item.mailboxUrl, credentials: { ...item.snapshot?.credentials } };
+      return { id: item.id, oldEmail: item.oldEmail, newEmail: item.newEmail, mailboxUrl: item.mailboxUrl, credentials: { ...accountSnapshot(item)?.credentials } };
     });
   }
   async function reconcile(id) {
@@ -337,7 +344,7 @@ export async function createEmailRebindWorkspace({ root, vault, listSources, res
     const candidate = listSources().find((source) => source.email === item.newEmail);
     if (!candidate) throw error("请先使用新邮箱登录到账号授权页，再核对换绑结果");
     const snapshot = await resolveSource(candidate.id, item.newEmail);
-    if (snapshot.session.accountId !== item.snapshot?.session?.accountId) throw error("新邮箱登录的账号 ID 与原账号不一致");
+    if (snapshot.session.accountId !== accountSnapshot(item)?.session?.accountId) throw error("新邮箱登录的账号 ID 与原账号不一致");
     await journal.append(item, `[reconcile] 使用新邮箱会话核对换绑结果 ${item.newEmail}`);
     let result;
     try { result = await runStep("inspect", { email: item.newEmail, session: snapshot.session, cookies: snapshot.cookies || [], proxyUrl: snapshot.credentials?.proxyUrl || "" }, undefined, (message) => journal.append(item, message)); }
@@ -362,6 +369,7 @@ export async function createEmailRebindWorkspace({ root, vault, listSources, res
       if (stored.version !== 1 || !Array.isArray(stored.items) || stored.items.length > 5000) throw error("换绑数据无效");
       concurrency = Number.isInteger(stored.concurrency) && stored.concurrency >= 1 && stored.concurrency <= 30 ? stored.concurrency : 1;
       for (const item of stored.items) {
+        if (item.snapshot) { item.snapshotSealed = vault.seal(item.snapshot, `email-rebind-snapshot:${item.id}`); delete item.snapshot; }
         if (!/^[a-f0-9-]{36}$/.test(item.id) || !validEmail(item.oldEmail) || !validEmail(item.newEmail) || !STATES.has(item.status)) throw error("换绑数据无效");
         if (["verifying", "beginning"].includes(item.status)) transition(item, "uncertain", REBIND_ERRORS.UNCERTAIN);
         else if (ACTIVE.has(item.status) && item.status !== "uncertain") transition(item, "interrupted", "服务重启，保留原映射，请手动重试或核对");

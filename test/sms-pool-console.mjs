@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
-import fs from "node:fs/promises";
+import fs from "../src/workspace-storage.mjs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -10,7 +10,7 @@ const { createConsoleWorkspace } = await import("../src/console-server.mjs");
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "tosub2-pool-console-"));
 const fixture = path.join(root, "protocol-fixture.mjs");
 const evidenceModule = pathToFileURL(path.resolve("src/phone-verification-evidence.mjs")).href;
-await fs.writeFile(fixture, `import fs from 'node:fs/promises';
+await fs.writeFile(fixture, `import fs from ${JSON.stringify(new URL("../src/workspace-storage.mjs", import.meta.url).href)};
 import readline from 'node:readline/promises';
 import {phoneEvidenceContext,persistPhoneOutcome} from ${JSON.stringify(evidenceModule)};
 const rl=readline.createInterface({input:process.stdin,output:process.stdout});

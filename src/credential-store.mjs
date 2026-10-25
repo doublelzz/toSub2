@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import fs from "node:fs/promises";
+import fs from "./workspace-storage.mjs";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
@@ -40,12 +40,31 @@ $plainBytes = [Security.Cryptography.ProtectedData]::Unprotect(
 [Console]::Out.Write([Text.Encoding]::UTF8.GetString($plainBytes))
 `;
 
+const WINDOWS_UNPROTECT_BATCH_SCRIPT = String.raw`
+$ErrorActionPreference = "Stop"
+Add-Type -AssemblyName System.Security
+[Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+$items = ConvertFrom-Json ([Console]::In.ReadToEnd())
+$entropy = [Text.Encoding]::UTF8.GetBytes("${WINDOWS_ENTROPY}")
+$results = @(
+  foreach ($item in $items) {
+    try {
+      $bytes = [Security.Cryptography.ProtectedData]::Unprotect([Convert]::FromBase64String($item.cipher), $entropy, [Security.Cryptography.DataProtectionScope]::CurrentUser)
+      @{ id = $item.id; payload = [Text.Encoding]::UTF8.GetString($bytes) }
+    } catch { @{ id = $item.id; failed = $true } }
+  }
+)
+[Console]::Out.Write((ConvertTo-Json -InputObject $results -Depth 4 -Compress))
+`;
+
 export function createCredentialStore(options = {}) {
   const platform = options.platform || process.platform;
   const windowsRoot = path.resolve(options.windowsRoot || defaultWindowsCredentialRoot());
   const macRoot = path.resolve(options.macRoot || process.env.TOSUB2_MAC_CREDENTIAL_ROOT || MAC_CREDENTIAL_ROOT);
   const securityRunner = options.securityRunner || runSecurity;
   const powerShellRunner = options.powerShellRunner || runPowerShell;
+  const vaultPath = (identity) => path.join(platform === "darwin" ? macRoot : windowsRoot, `${crypto.createHash("sha256").update(credentialAccount(identity)).digest("hex")}.vault`);
 
   return {
     async save(email, credentials) {
@@ -55,6 +74,11 @@ export function createCredentialStore(options = {}) {
         totpSecret: typeof credentials.totpSecret === "string" ? credentials.totpSecret : "",
         proxyUrl: typeof credentials.proxyUrl === "string" ? credentials.proxyUrl : "",
       });
+      if (options.vault) {
+        await fs.mkdir(path.dirname(vaultPath(email)), { recursive: true });
+        await fs.writeFile(vaultPath(email), options.vault.seal(JSON.parse(payload), path.basename(vaultPath(email))), { mode: 0o600 });
+        return;
+      }
       if (platform === "darwin") {
         await saveMacCredential(macRoot, email, payload, securityRunner);
         return;
@@ -78,8 +102,14 @@ export function createCredentialStore(options = {}) {
     },
 
     async load(email) {
+      if (options.vault) {
+        try { return parseCredentialPayload(JSON.stringify(options.vault.open(await fs.readFile(vaultPath(email), "utf8"), path.basename(vaultPath(email))))); }
+        catch (error) { if (error.code !== "ENOENT") throw error; }
+      }
       if (platform === "darwin") {
-        return loadMacCredential(macRoot, email, securityRunner);
+        const credentials = await loadMacCredential(macRoot, email, securityRunner);
+        if (options.vault && Object.values(credentials).some(Boolean)) await this.save(email, credentials);
+        return credentials;
       }
       if (platform === "win32") {
         let cipherText;
@@ -91,7 +121,9 @@ export function createCredentialStore(options = {}) {
         }
         try {
           const result = await powerShellRunner(WINDOWS_UNPROTECT_SCRIPT, cipherText);
-          return result.code === 0 ? parseCredentialPayload(result.stdout) : emptyCredentials();
+          const credentials = result.code === 0 ? parseCredentialPayload(result.stdout) : emptyCredentials();
+          if (options.vault && result.code === 0) await this.save(email, credentials);
+          return credentials;
         } catch {
           return emptyCredentials();
         }
@@ -100,6 +132,7 @@ export function createCredentialStore(options = {}) {
     },
 
     async delete(email) {
+      if (options.vault) await fs.rm(vaultPath(email), { force: true });
       if (platform === "darwin") {
         const result = await securityRunner([
           "delete-generic-password",
@@ -123,6 +156,49 @@ export function createCredentialStore(options = {}) {
           }
         }
       }
+    },
+
+    async migrate(legacyAliases = []) {
+      if (!options.vault || platform !== "win32") return [];
+      const copied = new Map();
+      for (const { identity, email } of legacyAliases) {
+        const id = crypto.createHash("sha256").update(credentialAccount(identity)).digest("hex");
+        try { await fs.access(path.join(windowsRoot, `${id}.vault`)); continue; } catch (error) { if (error.code !== "ENOENT") throw error; }
+        try { await fs.access(path.join(windowsRoot, `${id}.dpapi`)); continue; } catch (error) { if (error.code !== "ENOENT") throw error; }
+        let ciphertext;
+        try { ciphertext = await fs.readFile(windowsCredentialPath(defaultWindowsCredentialRoot(), email), "utf8"); }
+        catch (error) { if (error.code === "ENOENT") continue; throw error; }
+        await fs.mkdir(windowsRoot, { recursive: true });
+        await fs.writeFile(path.join(windowsRoot, `${id}.dpapi`), ciphertext, { mode: 0o600 });
+        copied.set(id, email);
+      }
+      const files = await fs.readdir(windowsRoot).catch((error) => { if (error.code === "ENOENT") return []; throw error; });
+      const items = [];
+      for (const filename of files.filter((value) => /^[a-f0-9]{64}\.dpapi$/.test(value))) {
+        const id = filename.slice(0, -6);
+        try { await fs.access(path.join(windowsRoot, `${id}.vault`)); continue; } catch (error) { if (error.code !== "ENOENT") throw error; }
+        items.push({ id, cipher: (await fs.readFile(path.join(windowsRoot, filename), "utf8")).trim() });
+      }
+      if (!items.length) return [];
+      // One DPAPI process converts the old per-account files. Later launches
+      // decrypt only SQLite vault records in this Node process.
+      const result = await powerShellRunner(WINDOWS_UNPROTECT_BATCH_SCRIPT, JSON.stringify(items), { maxOutputChars: 16 * 1024 * 1024 });
+      if (result.code !== 0) throw credentialError(500, "旧版凭据迁移失败，原始加密数据已保留");
+      let values;
+      try { values = JSON.parse(result.stdout); } catch { throw credentialError(500, "旧版凭据迁移响应不完整，原始加密数据已保留"); }
+      if (!Array.isArray(values) || values.length !== items.length) throw credentialError(500, "旧版凭据迁移响应不完整，原始加密数据已保留");
+      const allowed = new Set(items.map((value) => value.id));
+      const migratedLegacy = [];
+      for (const value of values) {
+        if (!allowed.delete(value.id)) throw credentialError(500, "旧版凭据迁移响应无效");
+        if (value.failed) continue;
+        if (typeof value.payload !== "string") throw credentialError(500, "旧版凭据迁移响应无效");
+        const filename = `${value.id}.vault`;
+        await fs.writeFile(path.join(windowsRoot, filename), options.vault.seal(parseCredentialPayload(value.payload), filename), { mode: 0o600 });
+        await fs.unlink(path.join(windowsRoot, `${value.id}.dpapi`));
+        if (copied.has(value.id)) migratedLegacy.push(copied.get(value.id));
+      }
+      return migratedLegacy;
     },
   };
 }
@@ -300,29 +376,40 @@ function credentialError(status, message) {
 }
 
 function runSecurity(args, input = "") {
-  return runChild("/usr/bin/security", args, input, { detached: true });
+  return runCredentialHelper("/usr/bin/security", args, input, { detached: true });
 }
 
-function runPowerShell(script, input = "") {
+let activeHelpers = 0;
+const helperWaiters = [];
+
+function runPowerShell(script, input = "", options = {}) {
   const encodedCommand = Buffer.from(script, "utf16le").toString("base64");
-  return runChild(
+  return runCredentialHelper(
     process.env.TOSUB2_POWERSHELL || "powershell.exe",
     ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encodedCommand],
     input,
-    { windowsHide: true },
+    { windowsHide: true, ...options },
   );
 }
 
+async function runCredentialHelper(command, args, input, options) {
+  if (activeHelpers >= 4) await new Promise((resolve) => helperWaiters.push(resolve));
+  else activeHelpers += 1;
+  try { return await runChild(command, args, input, options); }
+  finally { const next = helperWaiters.shift(); if (next) next(); else activeHelpers -= 1; }
+}
+
 function runChild(command, args, input, options = {}) {
+  const { maxOutputChars = 65_536, ...spawnOptions } = options;
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
-      ...options,
+      ...spawnOptions,
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (chunk) => {
-      stdout = `${stdout}${chunk}`.slice(-65_536);
+      stdout = `${stdout}${chunk}`.slice(-maxOutputChars);
     });
     child.stderr.on("data", (chunk) => {
       stderr = `${stderr}${chunk}`.slice(-16_384);

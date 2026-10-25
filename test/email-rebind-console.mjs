@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
-import fs from "node:fs/promises";
+import fs from "../src/workspace-storage.mjs";
+import nativeFs from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -17,7 +18,7 @@ await new Promise((resolve) => backend.listen(0, "127.0.0.1", resolve));
 const upstream = `http://127.0.0.1:${backend.address().port}`;
 const wrapper = path.join(root, "protocol-fixture.mjs");
 const callsFile = path.join(root, "process-calls.jsonl");
-await fs.writeFile(wrapper, `import fs from 'node:fs/promises';
+await fs.writeFile(wrapper, `import fs from ${JSON.stringify(new URL("../src/workspace-storage.mjs", import.meta.url).href)};
 await fs.appendFile(${JSON.stringify(callsFile)}, JSON.stringify(process.argv.slice(2))+'\\n');
 if (!process.argv.includes('--rebind-operation')) process.exit(97);
 process.argv.push('--native-http');
@@ -134,7 +135,7 @@ try {
   assert.equal(repeated.status, 200); assert.equal(repeated.data.created, 0);
   assert.equal(app.store.get(owner.id).balance, before - 2);
   assert.doesNotMatch(JSON.stringify((await state()).items), /fixture-password|synthetic-private-access|JBSWY3DPEHPK3PXP|001234|127\.0\.0\.1/);
-  const calls = (await fs.readFile(callsFile, "utf8")).trim().split("\n").map(JSON.parse);
+  const calls = (await nativeFs.readFile(callsFile, "utf8")).trim().split("\n").map(JSON.parse);
   assert.ok(calls.every((args) => args.includes("--rebind-operation") && !args.includes("--rotate-totp") && !args.includes("--logout-all")));
   assert.ok(requests.every((request) => !/oauth|login|phone|mfa/.test(request.path)));
   const originalRequestCount = requests.length;

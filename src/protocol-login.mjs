@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import crypto from "node:crypto";
-import fs from "node:fs/promises";
+import fs from "./workspace-storage.mjs";
 import path from "node:path";
 import { phoneEvidenceContext, persistPhoneOutcome } from "./phone-verification-evidence.mjs";
 import readline from "node:readline/promises";

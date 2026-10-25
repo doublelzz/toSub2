@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import fs from "node:fs/promises";
+import fs from "./workspace-storage.mjs";
 import path from "node:path";
 
 const identityFields = ["operationId", "allocationId", "jobId", "runId", "orderId", "providerId"];

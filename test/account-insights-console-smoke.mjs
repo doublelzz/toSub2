@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import "./console-auth.mjs";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
+import { storedFiles } from "./stored-files.mjs";
 import http from "node:http";
 import net from "node:net";
 import os from "node:os";
@@ -193,7 +194,7 @@ try {
   assert.equal(completed.accountInsights.status, "error", "automatic query errors must not fail a successful refresh");
   assert.equal(completed.canDownload, true);
   assert.equal(completed.lastError, null);
-  raw = await fs.readFile(exportPath, "utf8");
+  raw = await storedFiles(root).readFile(exportPath, "utf8");
   fail = false;
   hold = true;
   assert.equal((await post("account-insights")).status, 200);
@@ -211,7 +212,7 @@ try {
   completed = await jobWhen((job) => job.status === "completed");
   assert.equal(completed.canDownload, true, "restart during detection must preserve authorization state");
   assert.equal(completed.accountInsights.status, "error", "previous snapshot survives restart");
-  assert.equal(await fs.readFile(exportPath, "utf8"), raw);
+  assert.equal(await storedFiles(root).readFile(exportPath, "utf8"), raw);
   assert.equal(requests.filter((item) => item.path === "/oauth/token").length, 1, "only the explicit regenerate operation may refresh OAuth");
   assert.ok(requests.every((item) => ["/oauth/token", "/api/v1/admin/accounts/batch"].includes(item.path) || (item.method === "GET" && !/consume|authorize|oauth|signin|login/.test(item.path))), "manual checks must never log in or consume a reset");
   console.log("account insights console smoke passed (concurrency, failure isolation, cancellation, restart, no login)");

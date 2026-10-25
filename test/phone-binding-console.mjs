@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import "./console-auth.mjs";
 import fs from "node:fs/promises";
+import { storedFiles } from "./stored-files.mjs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -89,9 +90,9 @@ try {
   await stop(child);
   // Simulate a process interrupted during a recheck of an unfinished OAuth job.
   const metadataPath = path.join(root, "jobs", id, "job-meta.json");
-  const metadata = JSON.parse(await fs.readFile(metadataPath, "utf8"));
+  const metadata = JSON.parse(await storedFiles(path.join(root, "jobs")).readFile(metadataPath, "utf8"));
   Object.assign(metadata, { status: "checking_account", queued_mode: "account_insights", account_insights_return_status: "phone_skipped" });
-  await fs.writeFile(metadataPath, JSON.stringify(metadata));
+  await storedFiles(path.join(root, "jobs")).writeFile(metadataPath, JSON.stringify(metadata));
   await startConsole();
   job = await jobWhen(job => job.status === "phone_skipped");
   assert.equal(job.phoneBindingEnabled, false);

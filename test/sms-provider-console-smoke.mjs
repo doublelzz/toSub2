@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import "./console-auth.mjs";
 import fs from "node:fs/promises";
+import { storedFiles } from "./stored-files.mjs";
 import http from "node:http";
 import net from "node:net";
 import os from "node:os";
@@ -382,7 +383,7 @@ try {
   assert.ok(heroActions.some((item) => item.action === "getNumber" && item.country === "7" && item.maxPrice === "0.18" && item.fixedPrice === "true" && item.providerIds === null));
   assert.ok(!heroActions.some((item) => item.action === "setStatus" && item.status === "1"));
   assert.ok(heroActions.some((item) => item.action === "setStatus" && item.status === "6"));
-  const heroMetadata = await fs.readFile(path.join(outputRoot, hero.job.id, "job-meta.json"), "utf8");
+  const heroMetadata = await storedFiles(outputRoot).readFile(path.join(outputRoot, hero.job.id, "job-meta.json"), "utf8");
   assert.equal(heroMetadata.includes("test-hero-key"), false);
   assert.equal(logs.includes("test-hero-key"), false);
 

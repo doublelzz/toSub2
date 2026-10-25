@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import fs from "node:fs/promises";
+import fs, { attachWorkspaceStorage, workspaceChildOptions } from "./workspace-storage.mjs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { readMfaSession, writeMfaSession, invalidateMfaSession } from "./mfa-session.mjs";
@@ -150,7 +150,7 @@ function credentialsOnly(value = {}) {
   };
 }
 
-export async function createMfaWorkspace({ root, protocolScript, credentialStore, isAccountBusy = () => false, onSuccess = async () => {}, resolveAuthorization = async () => null, onLogout = async () => {}, onSyncAuthorization = async () => { throw requestError(409, "账号授权同步暂不可用"); } }) {
+export async function createMfaWorkspace({ root, protocolScript, credentialStore, deferCredentialRecovery = false, isAccountBusy = () => false, onSuccess = async () => {}, resolveAuthorization = async () => null, onLogout = async () => {}, onSyncAuthorization = async () => { throw requestError(409, "账号授权同步暂不可用"); } }) {
   const directory = path.join(path.resolve(root), "mfa");
   const metadataPath = path.join(directory, "accounts.json");
   const accounts = new Map();
@@ -260,9 +260,10 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
     return new Promise((resolve) => {
       const reuseOnly = args.includes("--mfa-session") || entry.operation === "logout_all";
       const child = spawn(process.execPath, [protocolScript, ...args, "--verbose"], {
-        env: { ...protocolEnvironment(), CHATGPT_LOGIN_PASSWORD: reuseOnly ? "" : credentials.password, CHATGPT_TOTP_SECRET: reuseOnly ? "" : credentials.totpSecret, CHATGPT_PROXY_URL: credentials.proxyUrl },
-        stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
+        env: { ...protocolEnvironment(), ...workspaceChildOptions(root), CHATGPT_LOGIN_PASSWORD: reuseOnly ? "" : credentials.password, CHATGPT_TOTP_SECRET: reuseOnly ? "" : credentials.totpSecret, CHATGPT_PROXY_URL: credentials.proxyUrl },
+        stdio: ["ignore", "pipe", "pipe", "ipc"], windowsHide: true,
       });
+      attachWorkspaceStorage(child, root);
       entry.child = child;
       const flushers = [];
       for (const [stream, source] of [[child.stdout, "protocol"], [child.stderr, "http/error"]]) {
@@ -862,7 +863,7 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
     for (const account of accounts.values()) {
       if (BUSY.has(account.logoutStatus)) { markLogout(account, "interrupted", "interrupted"); record(account, "logout_all"); await appendLog(account, "[restore] 服务重启，设备登出结果未确认，可重试登出"); }
       if (BUSY.has(account.status)) { mark(account, "interrupted", "interrupted", "interrupted"); record(account); await appendLog(account, "[restore] 服务重启，2FA 修改被中断，可继续恢复"); }
-      try {
+      if (!deferCredentialRecovery) try {
         const checkpoint = await readCheckpoint(account);
         if (checkpoint?.activation_succeeded === true) {
           if (isAccountBusy(account.email)) throw operationError("busy");

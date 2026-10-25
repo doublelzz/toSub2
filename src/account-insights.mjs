@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import fs from "node:fs/promises";
+import fs from "./workspace-storage.mjs";
 import path from "node:path";
 import { withSub2ApiExpiry, isFreePlan } from "./sub2api-export.mjs";
 

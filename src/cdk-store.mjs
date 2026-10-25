@@ -21,6 +21,7 @@ export async function createCdkStore(root, vault) {
   await fs.chmod(databasePath, 0o600);
   db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
     CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY,value TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS workspace_documents (cdk_id TEXT NOT NULL REFERENCES cdks(id),name TEXT NOT NULL,payload TEXT NOT NULL,mtime REAL NOT NULL,PRIMARY KEY(cdk_id,name));
     CREATE TABLE IF NOT EXISTS cdks (id TEXT PRIMARY KEY,secret_hash TEXT UNIQUE NOT NULL,label TEXT NOT NULL,role TEXT NOT NULL CHECK(role IN ('admin','user')),status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','disabled','merged')),balance INTEGER NOT NULL DEFAULT 0 CHECK(balance>=0),reserved INTEGER NOT NULL DEFAULT 0 CHECK(reserved>=0 AND reserved<=balance),consumed INTEGER NOT NULL DEFAULT 0 CHECK(consumed>=0),ever_consumed INTEGER NOT NULL DEFAULT 0,version INTEGER NOT NULL DEFAULT 1,note TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,last_login INTEGER,merged_into TEXT REFERENCES cdks(id));
     CREATE TABLE IF NOT EXISTS sessions (id_hash TEXT PRIMARY KEY,cdk_id TEXT NOT NULL REFERENCES cdks(id),workspace_id TEXT NOT NULL REFERENCES cdks(id),csrf TEXT NOT NULL,version INTEGER NOT NULL,created_at INTEGER NOT NULL,last_seen INTEGER NOT NULL,expires_at INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS accounts (cdk_id TEXT NOT NULL REFERENCES cdks(id),email TEXT NOT NULL,created_at INTEGER NOT NULL,deleted_at INTEGER,PRIMARY KEY(cdk_id,email));
@@ -163,6 +164,23 @@ export async function createCdkStore(root, vault) {
     get: (id) => publicCdk(get(id)),
     list: () => db.prepare("SELECT * FROM cdks ORDER BY role,created_at DESC").all().map(publicCdk),
     rawIds: () => db.prepare("SELECT id,role,status FROM cdks").all(),
+    workspaceMigrated: (id) => Boolean(db.prepare("SELECT 1 FROM meta WHERE key=?").get(`workspace-documents-v1:${id}`)),
+    workspaceDocuments: (id) => db.prepare("SELECT name,payload,mtime FROM workspace_documents WHERE cdk_id=?").all(id),
+    workspaceDocument: (id, name) => db.prepare("SELECT name,payload,mtime FROM workspace_documents WHERE cdk_id=? AND name=?").get(id, name),
+    workspaceDocumentInfo: (id, name) => db.prepare("SELECT name,mtime FROM workspace_documents WHERE cdk_id=? AND name=?").get(id, name),
+    workspaceDocumentNames: (id) => db.prepare("SELECT name,mtime FROM workspace_documents WHERE cdk_id=?").all(id),
+    workspaceTaskMetadata: (id) => db.prepare("SELECT name,payload,mtime FROM workspace_documents WHERE cdk_id=? AND name GLOB '*/job-meta.json'").all(id),
+    workspaceTaskIndexReady: (id) => Boolean(db.prepare("SELECT 1 FROM meta WHERE key=?").get(`workspace-task-index-v1:${id}`)),
+    indexWorkspaceTasks(id, rows) { transaction(() => {
+      for (const row of rows) db.prepare("INSERT INTO workspace_documents VALUES(?,?,?,?) ON CONFLICT(cdk_id,name) DO UPDATE SET payload=excluded.payload,mtime=excluded.mtime").run(id, row.name, row.payload, row.mtime);
+      db.prepare("INSERT INTO meta VALUES(?,?)").run(`workspace-task-index-v1:${id}`, "1");
+    }); },
+    writeWorkspaceDocuments(id, rows) { if (!rows.length) return; transaction(() => { for (const row of rows) {
+      if (row.deleted) db.prepare("DELETE FROM workspace_documents WHERE cdk_id=? AND name=?").run(id, row.name);
+      else db.prepare("INSERT INTO workspace_documents VALUES(?,?,?,?) ON CONFLICT(cdk_id,name) DO UPDATE SET payload=excluded.payload,mtime=excluded.mtime").run(id, row.name, row.payload, row.mtime);
+    } }); },
+    migrateWorkspace(id, rows) { transaction(() => { for (const row of rows) db.prepare("INSERT OR IGNORE INTO workspace_documents VALUES(?,?,?,?)").run(id, row.name, row.payload, row.mtime);
+      db.prepare("INSERT INTO meta VALUES(?,?)").run(`workspace-documents-v1:${id}`, "1"); }); },
     setting, saveSetting, audit,
     smsCostSummary() { if (!cachedCostSummary) cachedCostSummary = summarizePoolCosts(db.prepare("SELECT identity,payload FROM sms_pool_cost_orders").all().map((row) => vault.open(row.payload, `sms-cost:${row.identity}`))); return structuredClone(cachedCostSummary); },
     atPhoneTask(id, ownerId) { return db.prepare("SELECT * FROM at_phone_tasks WHERE id=? AND owner_id=?").get(id, ownerId) || null; },
@@ -348,6 +366,7 @@ export async function createCdkStore(root, vault) {
     },
     legacyUsed(id, email) { return Boolean(db.prepare("SELECT 1 FROM legacy_credentials WHERE cdk_id=? AND email=?").get(id, email.toLowerCase())); },
     markLegacyUsed(id, email) { db.prepare("INSERT INTO legacy_credentials VALUES(?,?,?) ON CONFLICT(cdk_id,email) DO NOTHING").run(id, email.toLowerCase(), Date.now()); },
+    markLegacyUsedMany(id, emails) { if (emails.length) transaction(() => { for (const email of emails) store.markLegacyUsed(id, email); }); },
     readInitialSecret() { return transaction(() => { const value = setting(adminId, "initial-secret"); db.prepare("DELETE FROM settings WHERE cdk_id=? AND name='initial-secret'").run(adminId); return value?.secret || null; }); },
     generate({ count, quota, note }, actor) {
       count = positiveInteger(count, "数量", 100); quota = positiveInteger(quota, "初始次数"); note = String(note || "").trim().slice(0, 160);

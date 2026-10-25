@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
-import fs from "node:fs/promises";
+import fs from "../src/workspace-storage.mjs";
+import nativeFs from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -29,7 +30,7 @@ const backend = http.createServer((req, res) => {
 await new Promise((resolve) => backend.listen(0, "127.0.0.1", resolve));
 const script = path.join(root, "insights-only.mjs");
 const callsPath = path.join(root, "process-calls.jsonl");
-await fs.writeFile(script, `import fs from 'node:fs/promises';
+await fs.writeFile(script, `import fs from ${JSON.stringify(new URL("../src/workspace-storage.mjs", import.meta.url).href)};
 await fs.appendFile(${JSON.stringify(callsPath)}, JSON.stringify(process.argv.slice(2))+'\\n');
 if (!process.argv.includes('--check-account-insights')) process.exit(90);
 process.argv.push('--native-http');
@@ -96,7 +97,7 @@ try {
   await waitFor(async () => workspace.publicJobs()[0]?.status === "phone_skipped");
   assert.equal(workspace.publicJobs().length, 1);
   assert.ok(requests.length >= 6);
-  const recordedCalls = (await fs.readFile(callsPath, "utf8")).trim().split("\n").map(JSON.parse);
+  const recordedCalls = (await nativeFs.readFile(callsPath, "utf8")).trim().split("\n").map(JSON.parse);
   assert.ok(recordedCalls.every((args) => args.includes("--check-account-insights") && !args.some((arg) => /--rotate|--logout|--refresh|--resume/.test(arg))));
   assert.ok(requests.every((request) => request.method === "GET" && !/oauth|login|phone/.test(request.path)));
   const source = await workspace.dispatch("POST", "/api/jobs/export-source", { ids: [job.id] });

@@ -1,4 +1,4 @@
-import fs from "node:fs/promises";
+import fs from "./workspace-storage.mjs";
 import path from "node:path";
 import { inspect } from "node:util";
 
