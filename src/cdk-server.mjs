@@ -7,6 +7,7 @@ import { createCdkStore } from "./cdk-store.mjs";
 import { createCdkVault } from "./cdk-vault.mjs";
 import { acquireCdkLock } from "./cdk-lock.mjs";
 import { cdkError, clientIp, normalizeClientIp, readRequestJson, requireSameOrigin } from "./cdk-security.mjs";
+import { assertOfferAccess } from "./offer-workspace.mjs";
 import { createSmsPool } from "./sms-pool.mjs";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -71,6 +72,7 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
   let scheduling = false;
   function scheduleAll() {
     const list = [...workspaces.values()]; if (!list.length || shuttingDown) return;
+    for (const workspace of list) workspace.checkOfferAccess?.();
     globalSlots = Math.max(0, 20 - list.reduce((total, workspace) => total + workspace.activeCount(), 0));
     cursor = (cursor + 1) % list.length;
     for (let round = 0; round < 20 && availableSlots() > 0; round += 1) {
@@ -93,6 +95,8 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
         root: workspaceRoot, cdkId: id, namespace, legacyEmails: id === store.adminId ? initialLegacyEmails : new Set(),
         smsPool: smsPool.forOwner(id),
         rebindVault: { seal: (value, scope) => vault.seal(value, `rebind:${id}:${scope}`), open: (value, scope) => vault.open(value, `rebind:${id}:${scope}`) },
+        offerVault: { seal: (value, scope) => vault.seal(value, `offers:${id}:${scope}`), open: (value, scope) => vault.open(value, `offers:${id}:${scope}`) },
+        offerCanUse: () => !shuttingDown && store.get(id)?.status === "active" && store.get(id).balance >= 1,
         legacyUsed: (email) => store.legacyUsed(id, email),
         markLegacyUsed: (email) => store.markLegacyUsed(id, email),
         isEnabled: () => acceptingWork && !shuttingDown && store.get(id)?.status === "active",
@@ -346,6 +350,7 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
       }
       throw cdkError(404, "管理接口不存在");
     }
+    if (url.pathname.startsWith("/api/offers/")) assertOfferAccess(() => store.get(owner)?.status === "active" && store.get(owner).balance >= 1);
     const workspace = await workspaceFor(owner);
     if (url.pathname === "/api/sub2api/bind" && req.method === "POST") {
       const body = await readRequestJson(req);

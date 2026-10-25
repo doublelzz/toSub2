@@ -19,6 +19,7 @@
     "check:mfa": "node test/mfa-session.mjs && node test/mfa-workspace.mjs && node test/mfa-rotation-protocol.mjs && node test/mfa-console-smoke.mjs && node test/mfa-authorization-ui.mjs",
     "check:mfa-sync": "node test/mfa-workspace.mjs && node test/mfa-authorization-sync.mjs && node test/mfa-sync-ui.mjs",
     "check:rebind": "node --check src/email-rebind-protocol.mjs && node --check src/email-rebind-workspace.mjs && node test/email-rebind-workspace.mjs && node test/email-rebind-console.mjs && node test/email-rebind-ui.mjs",
+    "check:offers": "node --check src/offer-workspace.mjs && node --check src/offer-runner.mjs && node test/offer-workspace.mjs && node test/offer-console.mjs && node test/offer-ui.mjs",
     "check:sms": "node --check src/hero-sms.mjs && node test/hero-sms.mjs && node test/sms-providers.mjs && node test/sms-provider-console-smoke.mjs && node test/sms-price-selector.mjs",
     "check:ui": "node test/task-query.mjs && node test/task-query-console.mjs && node test/workspace-settings-ui.mjs",
     "check:phone-binding": "node test/phone-binding-console.mjs",

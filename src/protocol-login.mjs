@@ -4,11 +4,13 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { phoneEvidenceContext, persistPhoneOutcome } from "./phone-verification-evidence.mjs";
 import readline from "node:readline/promises";
+import { createInterface as createLineReader } from "node:readline";
 import { stdin as input, stdout as output } from "node:process";
 import { ACCOUNT_SESSION_FILENAME, checkAccountInsights, sessionIdentity } from "./account-insights.mjs";
 import { normalizeOAuthCredentials, withSub2ApiExpiry, validateSub2ApiData } from "./sub2api-export.mjs";
 import { readMfaSession, writeMfaSession } from "./mfa-session.mjs";
 import { emailRebindStep } from "./email-rebind-protocol.mjs";
+import { checkOffer, offerError, offerIdentity } from "./offer-checker.mjs";
 import {
   browserIdentityForTlsProfile,
   DEFAULT_TLS_PROFILE,
@@ -315,11 +317,12 @@ async function run() {
       args.tlsProfile
       || process.env.TOSUB2_TLS_PROFILE
       || DEFAULT_TLS_PROFILE,
-    verbose: Boolean(args.verbose && !args.rotateTotp && !args.logoutAll && !args.rebindOperation),
+    verbose: Boolean(args.verbose && !args.rotateTotp && !args.logoutAll && !args.rebindOperation && !args.offerCheck),
     maxProxySessionAttempts: process.env.CHATGPT_PROXY_MAX_ATTEMPTS || 10,
     sameProxyRiskRetryDelayMs: process.env.CHATGPT_SAME_PROXY_RISK_RETRY_DELAY_MS,
   });
   try {
+    if (args.offerCheck) { await runOfferProtocol({ chatgptBase, authBase, transport, proxyTemplate }); return; }
     if (args.rebindOperation) {
       if (!args.rebindResult) throw new Error("Email rebind result path is required");
       let result;
@@ -733,6 +736,68 @@ async function run() {
   } finally {
     await transport.close();
   }
+}
+
+async function runOfferProtocol({ chatgptBase, authBase, transport, proxyTemplate }) {
+  const channel = createLineReader({ input, crlfDelay: Infinity });
+  const pending = new Map(); const attempts = {};
+  const send = (message) => output.write(`${JSON.stringify(message)}\n`);
+  let firstResolve;
+  const first = new Promise((resolve) => { firstResolve = resolve; });
+  channel.on("line", (line) => {
+    try {
+      if (line.length > 1_000_000) return;
+      const message = JSON.parse(line);
+      if (message.type === "start" && firstResolve) { firstResolve(message); firstResolve = null; }
+      else if (message.type === "input" && pending.has(message.id) && typeof message.value === "string") {
+        pending.get(message.id)(message.value); pending.delete(message.id);
+      }
+    } catch {}
+  });
+  const log = console.log;
+  console.log = (...values) => {
+    const match = /^\[email-otp-requested-at\] (.+)$/.exec(String(values[0]));
+    if (match && Number.isFinite(Date.parse(match[1]))) send({ type: "mail_sent", at: Date.parse(match[1]) });
+  };
+  try {
+    const payload = await first;
+    const email = String(payload.email || "").trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw offerError("identity_mismatch");
+    if (payload.session?.chatgptBase && payload.session.chatgptBase !== chatgptBase) throw offerError("identity_mismatch");
+    await transport.configure(proxyTemplate, { force: true });
+    const client = new ProtocolClient({ transport, verbose: false, hideUrlQuery: true });
+    const request = async (target, identity) => {
+      const result = await client.request("GET", `${chatgptBase}${target}`, {
+        headers: { ...chatgptMfaHeaders({ chatgptBase, accessToken: identity.accessToken, deviceId: payload.session?.deviceId || crypto.randomUUID() }, target),
+          "chatgpt-account-id": identity.accountId, accept: "application/json" }, referer: `${chatgptBase}/`,
+      });
+      return { status: result.res.status, body: result.text };
+    };
+    let result;
+    if (payload.session) {
+      try { result = await checkOffer(payload.session, email, request); }
+      catch (error) { if (!["unauthorized", "token_expired", "authorization_invalid"].includes(error.offerCode)) throw error; }
+    }
+    if (!result) {
+      if (!payload.credentials?.password && !payload.credentials?.mailApiUrl && !payload.allowManualLogin) throw offerError("authorization_invalid");
+      const rl = { question: async (prompt) => {
+        const kind = /^Password/.test(prompt) ? "password" : /^2FA/.test(prompt) ? "totp" : /^Email OTP/.test(prompt) ? "email" : "";
+        if (!kind || (attempts[kind] = (attempts[kind] || 0) + 1) > 5) throw offerError("login_failed");
+        const id = crypto.randomUUID();
+        return new Promise((resolve) => { pending.set(id, resolve); send({ type: "prompt", kind, id }); });
+      } };
+      const web = await loginChatgptWeb(client, { chatgptBase, authBase, email, rl, existingOnly: true,
+        password: payload.credentials?.password || "", totpSecret: payload.credentials?.totpSecret || "" });
+      const { data } = await client.getJson("GET", `${chatgptBase}/api/auth/session`, { referer: `${chatgptBase}/` });
+      const session = { type: "chatgpt-session", version: 1, email: data?.user?.email, accessToken: data?.accessToken,
+        expiresAt: data?.expires, deviceId: web.deviceId, chatgptBase };
+      session.accountId = offerIdentity(session, email).accountId;
+      result = await checkOffer(session, email, request);
+      send({ type: "session", session });
+    }
+    send({ type: "result", result });
+  } catch (error) { send({ type: "error", code: error.offerCode || "login_failed", retryable: error.retryable === true }); }
+  finally { console.log = log; channel.close(); }
 }
 
 async function detectLoginSession(client, { chatgptBase, transport, expectedEmail, sub2apiOutPath, deviceId }) {
@@ -2606,6 +2671,7 @@ function parseArgs(argv) {
     else if (item === "--setup-totp") args.setupTotp = true;
     else if (item === "--rotate-totp") args.rotateTotp = true;
     else if (item === "--logout-all") args.logoutAll = true;
+    else if (item === "--offer-check") args.offerCheck = true;
     else if (item === "--rebind-operation") args.rebindOperation = argv[++i];
     else if (item === "--rebind-result") args.rebindResult = argv[++i];
     else if (item.startsWith("--mfa-session=")) args.mfaSession = item.slice("--mfa-session=".length);
