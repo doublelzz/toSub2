@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowRight, Ban, Check, CheckCheck, ChevronLeft, ChevronRight, CircleAlert, Clock3, Inbox, LoaderCircle, Mail, RefreshCw, Search, Send, X } from "lucide-react";
+import { ArrowRight, Ban, Check, CheckCheck, ChevronLeft, ChevronRight, CircleAlert, Clock3, Copy, FileText, Inbox, LoaderCircle, Mail, RefreshCw, Search, Send, X } from "lucide-react";
 import { Drawer, useDialogFocus } from "./WorkspaceUi.jsx";
 import { cdkFetch } from "./cdk-api.mjs";
 import "./email-rebind.css";
@@ -21,6 +21,7 @@ export default function EmailRebindWorkspace({ token, onOpenAuthorization }) {
   const [recordIds, setRecordIds] = useState(() => new Set());
   const [mapping, setMapping] = useState(null);
   const [detailId, setDetailId] = useState(null);
+  const [detailTab, setDetailTab] = useState("details");
   const [concurrency, setConcurrency] = useState(1);
   const [timeout, setTimeoutSeconds] = useState(180);
   const [error, setError] = useState("");
@@ -115,12 +116,14 @@ export default function EmailRebindWorkspace({ token, onOpenAuthorization }) {
           <td data-label="账号资料"><span>{row.hasPassword ? "已有密码" : "未提供密码"}</span><small className="rebind-secondary">{row.hasTotpKey ? "已有 MFA 密钥" : "未记录 MFA 密钥"}</small></td>
           <td data-label="状态">{row.rebound ? "已完成换绑" : row.busy ? "其他任务处理中" : "执行时核验登录状态"}</td><td data-label="操作"><button type="button" className="text-action" disabled={row.busy || row.rebound} onClick={() => setMapping([row])}>换绑邮箱</button></td></>
           : <><td data-label="邮箱对应关系"><EmailPair oldEmail={row.oldEmail} newEmail={row.newEmail} /></td><td data-label="收码与进度"><RebindStatus item={row} /><small className="rebind-secondary">{row.mode === "auto" ? "自动收码" : "手动验证码"}</small><p className="rebind-row-message">{row.message}</p>{WAITING.has(row.status) && <CodeForm item={row} busy={busy.has(row.id)} onSubmit={(code) => itemAction(row, "code", { code, version: row.challengeVersion })} />}</td>
-            <td data-label="同步状态">{row.syncedJobId ? "已在账号授权中" : row.status === "success" ? "未同步；新邮箱登录待恢复" : "等待换绑确认"}</td><td data-label="更新时间" className="rebind-time">{time(row.updatedAt)}</td><td data-label="操作"><button type="button" className="text-action" onClick={() => setDetailId(row.id)}>查看详情</button></td></>}
+            <td data-label="同步状态">{row.syncedJobId ? "已在账号授权中" : row.status === "success" ? "未同步；新邮箱登录待恢复" : "等待换绑确认"}</td><td data-label="更新时间" className="rebind-time">{time(row.updatedAt)}</td><td data-label="操作"><div className="rebind-row-actions"><button type="button" className="text-action" onClick={() => { setDetailTab("details"); setDetailId(row.id); }}>查看详情</button><button type="button" className="text-action" aria-label={`查看 ${row.oldEmail} 的换绑执行日志`} onClick={() => { setDetailTab("logs"); setDetailId(row.id); }}><FileText size={14} />执行日志</button></div></td></>}
       </tr>)}
     </tbody></table></div>
     <div className="rebind-pagination"><span>匹配 {filtered.length} 条 · 每页 {PAGE_SIZE} 条</span><div><button type="button" className="icon-button" aria-label="换绑上一页" disabled={currentPage <= 1} onClick={() => setPage(currentPage - 1)}><ChevronLeft size={17} /></button><span>{currentPage} / {totalPages}</span><button type="button" className="icon-button" aria-label="换绑下一页" disabled={currentPage >= totalPages} onClick={() => setPage(currentPage + 1)}><ChevronRight size={17} /></button></div></div>
     {mapping && <MappingDialog sources={mapping} request={request} concurrency={concurrency} timeout={timeout} onClose={() => setMapping(null)} onStart={async (value) => { await post("start", value); setConcurrency(value.concurrency); setTimeoutSeconds(value.timeout); setMapping(null); setSourceIds(new Set()); switchTab("records"); await refresh(); }} />}
-    {detail && <Drawer title="邮箱换绑详情" onClose={() => setDetailId(null)} wide><EmailPair oldEmail={detail.oldEmail} newEmail={detail.newEmail} /><section className="detail-section"><h3>换绑结果</h3><RebindStatus item={detail} /><p className="prompt-line">{detail.message}</p></section>
+    {detail && <Drawer title="邮箱换绑详情" onClose={() => setDetailId(null)} wide><EmailPair oldEmail={detail.oldEmail} newEmail={detail.newEmail} />
+      <nav className="rebind-detail-tabs" aria-label="换绑详情视图"><button type="button" aria-pressed={detailTab === "details"} onClick={() => setDetailTab("details")}>详情</button><button type="button" aria-pressed={detailTab === "logs"} onClick={() => setDetailTab("logs")}><FileText size={14} />执行日志</button></nav>
+      {detailTab === "logs" ? <RebindLogs key={detail.id} id={detail.id} request={request} /> : <><section className="detail-section"><h3>换绑结果</h3><RebindStatus item={detail} /><p className="prompt-line">{detail.message}</p></section>
       {WAITING.has(detail.status) && <section className="detail-section"><h3>输入验证码</h3><p>仅用于 {detail.oldEmail} 换绑至 {detail.newEmail}。</p><CodeForm item={detail} busy={busy.has(detail.id)} onSubmit={(code) => itemAction(detail, "code", { code, version: detail.challengeVersion })} />
         <div className="rebind-detail-actions">{detail.status === "waiting_auto" && <button type="button" className="secondary-button" disabled={busy.has(detail.id)} onClick={() => void itemAction(detail, "manual")}>改为手动收码</button>}
           <ResendButton item={detail} busy={busy.has(detail.id)} onClick={() => void itemAction(detail, "resend")} /></div></section>}
@@ -130,9 +133,33 @@ export default function EmailRebindWorkspace({ token, onOpenAuthorization }) {
         {detail.status === "success" && !detail.syncedJobId && <button type="button" className="primary-button" disabled={busy.has("sync")} onClick={() => void sync([detail])}><Send size={15} />同步到账号授权</button>}
         {detail.syncedJobId && onOpenAuthorization && <button type="button" className="secondary-button" onClick={onOpenAuthorization}>查看账号授权</button>}
       </div><p className="rebind-secondary">同步按新邮箱首次导入计次，不覆盖原账号。旧登录信息不能作为新邮箱授权。</p></section>
-      <section className="detail-section"><h3>执行历史</h3><ol className="rebind-events">{detail.events.map((event, index) => <li key={index}><time>{time(event.at)}</time><strong>{LABELS[event.status]}</strong><span>{event.message}</span></li>)}</ol></section>
+      <section className="detail-section"><h3>执行历史</h3><ol className="rebind-events">{detail.events.map((event, index) => <li key={index}><time>{time(event.at)}</time><strong>{LABELS[event.status]}</strong><span>{event.message}</span></li>)}</ol></section></>}
     </Drawer>}
   </section>;
+}
+
+export function RebindLogs({ id, request }) {
+  const [logs, setLogs] = useState(""); const [error, setError] = useState(""); const [loading, setLoading] = useState(true);
+  const [following, setFollowing] = useState(true); const [revision, setRevision] = useState(0); const [notice, setNotice] = useState("");
+  const panel = useRef(null);
+  useEffect(() => {
+    let stopped = false; let timer; let offset = 0; const controller = new AbortController();
+    setLogs(""); setLoading(true); setError(""); setNotice("");
+    const poll = async () => {
+      let more = false;
+      try {
+        const value = await request(`${id}/logs?offset=${offset}&limit=128000`, { signal: controller.signal });
+        if (stopped) return;
+        if (!Number.isSafeInteger(value.nextOffset) || value.nextOffset < 0 || value.hasMore && value.nextOffset <= offset && !value.reset) throw new Error("日志读取进度异常，请刷新重试");
+        setLogs((current) => value.reset || value.offset === 0 ? value.logs : current + value.logs);
+        offset = value.nextOffset; more = value.hasMore; setError("");
+      } catch (failure) { if (!stopped) setError(failure.message); }
+      finally { if (!stopped) { setLoading(more); timer = window.setTimeout(poll, more ? 0 : 1200); } }
+    };
+    void poll(); return () => { stopped = true; controller.abort(); window.clearTimeout(timer); };
+  }, [id, request, revision]);
+  useEffect(() => { if (following && panel.current) panel.current.scrollTop = panel.current.scrollHeight; }, [logs, following]);
+  return <section className="rebind-log-view" aria-label="邮箱换绑执行日志"><div className="rebind-log-toolbar"><label><input type="checkbox" checked={following} onChange={(event) => setFollowing(event.target.checked)} />自动滚动</label><div><button type="button" className="text-action" onClick={() => setRevision((value) => value + 1)}><RefreshCw size={14} />刷新日志</button><button type="button" className="text-action" disabled={!logs || loading} onClick={async () => { try { await navigator.clipboard.writeText(logs); setNotice("已复制执行日志"); } catch { setNotice("复制失败，可在日志中选择文本后复制"); } }}><Copy size={14} />复制日志</button></div></div><div className="log-panel rebind-log-panel"><div className="log-title"><FileText size={15} />协议日志</div><pre ref={panel} tabIndex={0} aria-label="换绑协议日志内容" onScroll={(event) => { const element = event.currentTarget; setFollowing(element.scrollHeight - element.scrollTop - element.clientHeight < 36); }}>{logs || (loading ? "正在读取日志..." : "暂无执行日志")}</pre></div><p className={error ? "rebind-log-message error" : "rebind-log-message"} role="status">{error ? `日志读取失败：${error}` : notice || "实时更新，重试记录会继续追加；历史日志保留在当前账号下。"}</p></section>;
 }
 
 export function EmailPair({ oldEmail, newEmail }) {

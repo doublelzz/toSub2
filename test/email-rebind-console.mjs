@@ -11,7 +11,7 @@ import { startCdkServer } from "../src/cdk-server.mjs";
 if (!["win32", "darwin"].includes(process.platform)) { console.log("rebind encrypted credential integration skipped on unsupported OS"); process.exit(0); }
 const project = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "tosub2-rebind-http-"));
-const requests = []; const begun = new Set(); const rebound = new Map();
+const requests = []; const begun = new Set(); const rebound = new Map(); let rejectedLimitedBegin = false;
 const backend = http.createServer((req, res) => handle(req, res).catch(() => { res.writeHead(500); res.end('{}'); }));
 await new Promise((resolve) => backend.listen(0, "127.0.0.1", resolve));
 const upstream = `http://127.0.0.1:${backend.address().port}`;
@@ -88,6 +88,18 @@ try {
   assert.equal((await call(`/api/rebind/${manual.id}/code`, "POST", { code: "999999", version: manual.challengeVersion })).data.item.status, "waiting_manual");
   manual = (await state()).items.find((row) => row.id === manual.id);
   assert.equal((await call(`/api/rebind/${manual.id}/code`, "POST", { code: "001234", version: manual.challengeVersion })).data.item.status, "success");
+  const logResult = await call(`/api/rebind/${manual.id}/logs`);
+  assert.equal(logResult.status, 200);
+  assert.match(logResult.data.logs, /HTTP 400/);
+  assert.match(logResult.data.logs, /HTTP 200/);
+  assert.match(logResult.data.logs, /private response text cannot leak/, "the diagnostic response retains its original wording");
+  assert.match(logResult.data.logs, /invalid_code/);
+  assert.match(logResult.data.logs, /change_email\/eligibility/);
+  assert.match(logResult.data.logs, /change_email\/begin/);
+  assert.match(logResult.data.logs, /change_email\/verify/);
+  const logSlice = await call(`/api/rebind/${manual.id}/logs?offset=17&limit=31`);
+  assert.equal(logSlice.data.logs, logResult.data.logs.slice(17, 48));
+  assert.equal((await call(`/api/rebind/${manual.id}/logs?offset=-1`)).status, 400);
   assert.equal(rebound.get("source-a@example.com"), "target-a@example.com");
   assert.equal(rebound.get("source-b@example.com"), "target-b@example.com");
   assert.equal(await fs.readFile(path.join(ownRoot, "mfa/accounts.json"), "utf8"), originalMfa, "email changes cannot modify MFA records");
@@ -100,6 +112,7 @@ try {
   await login(other.secret);
   assert.equal((await call("/api/rebind/state")).data.items.length, 0);
   assert.equal((await call(`/api/rebind/${manual.id}/retry`, "POST", {})).status, 404);
+  assert.equal((await call(`/api/rebind/${manual.id}/logs`)).status, 404, "execution logs remain isolated by CDK");
   assert.equal((await call("/api/imports/preview", "POST", { mode: "rebind", payload: { ids: [auto.id] } })).status, 404);
   cookie = currentCookie; token = currentToken;
   const payload = { ids: [auto.id, manual.id] };
@@ -127,6 +140,7 @@ try {
   const originalRequestCount = requests.length;
   await app.close(); await start(); await login(owner.secret);
   assert.equal((await call("/api/rebind/state")).data.items.filter((row) => row.status === "success").length, 2);
+  assert.match((await call(`/api/rebind/${manual.id}/logs`)).data.logs, /private response text cannot leak/, "detailed logs survive server restart");
   assert.equal(requests.length, originalRequestCount, "restart cannot replay upstream email changes");
   assert.equal(app.store.get(owner.id).balance, before - 2);
   const [limited] = app.store.generate({ count: 1, quota: 1, note: "zero balance rebind fixture" }, app.store.adminId);
@@ -142,6 +156,12 @@ try {
   const limitedBody = { ids: (await limitedState()).sources.map((row) => row.id), text: "limited-target@example.com" };
   const limitedPreview = await call("/api/rebind/preview", "POST", limitedBody);
   assert.equal((await call("/api/rebind/start", "POST", { ...limitedBody, digest: limitedPreview.data.digest })).status, 200, "zero balance allows operations on existing source accounts");
+  const refusedBegin = await waitFor(async () => (await limitedState()).items.find((row) => row.status === "failed"));
+  assert.match(refusedBegin.message, /HTTP 400/);
+  const refusedLogs = (await call(`/api/rebind/${refusedBegin.id}/logs`)).data.logs;
+  assert.match(refusedLogs, /target_email_denied/); assert.match(refusedLogs, /fixture-begin-request/);
+  assert.match(refusedLogs, /original begin rejection detail/);
+  assert.equal((await call(`/api/rebind/${refusedBegin.id}/retry`, "POST", {})).status, 200);
   const limitedItem = await waitFor(async () => (await limitedState()).items.find((row) => row.status === "waiting_manual"));
   assert.equal((await call(`/api/rebind/${limitedItem.id}/code`, "POST", { code: "001234", version: limitedItem.challengeVersion })).status, 200);
   const limitedQuote = await call("/api/imports/preview", "POST", { mode: "rebind", payload: { ids: [limitedItem.id] } });
@@ -150,6 +170,8 @@ try {
   assert.equal(deniedImport.status, 409);
   assert.equal(limitedWorkspace.publicJobs().length, 0, "insufficient quota cannot create an uncharged account");
   assert.equal((await limitedState()).items[0].status, "success", "failed account import cannot undo confirmed email rebind");
+  const retryLogs = (await call(`/api/rebind/${limitedItem.id}/logs`)).data.logs;
+  assert.match(retryLogs, /attempt:1/); assert.match(retryLogs, /attempt:2/); assert.match(retryLogs, /original begin rejection detail/);
   assert.equal(app.store.get(limited.id).balance, 0);
   console.log("email rebind console passed (real protocol fixture, mixed OTP, cookie context, original-data preservation, CDK charging/isolation, idempotency and restart)");
 } finally {
@@ -172,7 +194,10 @@ async function handle(req, res) {
   const body = chunks.length ? JSON.parse(Buffer.concat(chunks)) : null;
   if (url.pathname.endsWith("/eligibility")) { res.setHeader("set-cookie", "rebind-context=synthetic-cookie; Path=/"); return send(200, { eligible: true }); }
   assert.match(req.headers.cookie || "", /rebind-context=synthetic-cookie/, "cookies returned by eligibility must carry across protocol processes");
-  if (url.pathname.endsWith("/begin")) { begun.add(body.email); return send(200, { success: true }); }
+  if (url.pathname.endsWith("/begin")) {
+    if (body.email === "limited-target@example.com" && !rejectedLimitedBegin) { rejectedLimitedBegin = true; res.setHeader("x-request-id", "fixture-begin-request"); return send(400, { error: { code: "target_email_denied", message: "original begin rejection detail" } }); }
+    begun.add(body.email); return send(200, { success: true });
+  }
   if (url.pathname.endsWith("/verify")) {
     if (body.code !== "001234") return send(400, { error: { code: "invalid_code", message: "private response text cannot leak" } });
     rebound.set(claims.email, body.email); return send(200, { success: true });

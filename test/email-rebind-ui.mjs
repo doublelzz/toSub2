@@ -11,7 +11,7 @@ const compiled = await transformWithEsbuild(code, "EmailRebindWorkspace.jsx", { 
 const usedIcons = Object.fromEntries([...code.matchAll(/<([A-Z]\w*)/g)].map((match) => match[1]).filter((name) => icons[name]).map((name) => [name, icons[name]]));
 const bindings = { React, useCallback, useEffect, useMemo, useRef, useState, ...usedIcons, useDialogFocus: () => {},
   Drawer: ({ children }) => React.createElement("section", null, children), cdkFetch: () => { throw new Error("Unexpected external request"); } };
-const { MappingDialog, CodeForm } = new Function(...Object.keys(bindings), `${compiled.code};return {MappingDialog,CodeForm};`)(...Object.values(bindings));
+const { MappingDialog, CodeForm, RebindLogs } = new Function(...Object.keys(bindings), `${compiled.code};return {MappingDialog,CodeForm,RebindLogs};`)(...Object.values(bindings));
 const dom = new JSDOM('<div id="root"></div>', { url: "http://localhost" });
 globalThis.window = dom.window; globalThis.document = dom.window.document; globalThis.HTMLElement = dom.window.HTMLElement;
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
@@ -74,5 +74,29 @@ try {
     assert.ok(importCalls.at(-1).options.headers.get("idempotency-key"));
     setImportConfirmation(null);
   } finally { globalThis.fetch = originalFetch; globalThis.Event = originalEvent; }
-  console.log("email rebind UI passed (exact cardinality, immutable mapping, mixed input, OTP generation and charged import confirmation)");
+  const logParts = ["HTTP 400\n<script>原始响应</script>\n", "request-id: fixture-request\noriginal diagnostic detail\n"];
+  const logCalls = []; const fullLog = logParts.join("");
+  const logRequest = async (route) => {
+    logCalls.push(route); const offset = Number(new URL(route, "http://fixture").searchParams.get("offset"));
+    const content = offset === 0 ? logParts[0] : offset === logParts[0].length ? logParts[1] : "";
+    return { logs: content, offset, nextOffset: offset + content.length, hasMore: offset === 0 };
+  };
+  await act(async () => { root.render(React.createElement(RebindLogs, { id: "fixture-rebind", request: logRequest })); });
+  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); });
+  assert.equal(container.querySelector("pre").textContent, fullLog, "incremental reads preserve the entire response");
+  assert.equal(container.querySelector("script"), null, "raw diagnostic HTML must display as text");
+  assert.equal(logCalls[0].includes("offset=0"), true);
+  assert.equal(logCalls[1].includes(`offset=${logParts[0].length}`), true);
+  const previousNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator"); const copiedLogs = [];
+  Object.defineProperty(globalThis, "navigator", { configurable: true, value: { clipboard: { writeText: async (value) => copiedLogs.push(value) } } });
+  try {
+    await act(async () => { button("复制日志").click(); });
+    assert.deepEqual(copiedLogs, [fullLog]); assert.match(container.textContent, /已复制执行日志/);
+  } finally { if (previousNavigator) Object.defineProperty(globalThis, "navigator", previousNavigator); else delete globalThis.navigator; }
+  await act(async () => { button("刷新日志").click(); });
+  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); });
+  assert.equal(container.querySelector("pre").textContent, fullLog, "refresh cannot duplicate previously loaded logs");
+  await act(async () => { root.render(React.createElement(RebindLogs, { id: "different-rebind", request: async () => ({ logs: "another record", offset: 0, nextOffset: 14, hasMore: false }) })); });
+  assert.equal(container.querySelector("pre").textContent, "another record", "switching accounts clears the previous journal");
+  console.log("email rebind UI passed (mapping, OTP, charged import, complete paged logs, safe text rendering, copy and record isolation)");
 } finally { await act(() => root.unmount()); dom.window.close(); }

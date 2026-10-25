@@ -866,6 +866,11 @@ async function handleRebindApi(req, res, url) {
   res.setHeader("cache-control", "no-store");
   const action = url.pathname.slice("/api/rebind/".length);
   if (req.method === "GET" && action === "state") { sendJson(res, 200, rebindWorkspace.list()); return; }
+  const logMatch = /^([a-f0-9-]{36})\/logs$/.exec(action);
+  if (req.method === "GET" && logMatch) {
+    const result = await rebindWorkspace.logs(logMatch[1], { offset: url.searchParams.get("offset") || 0, limit: url.searchParams.get("limit") || 128_000 });
+    sendJson(res, 200, result); return;
+  }
   if (req.method !== "POST") throw httpError(404, "换绑接口不存在");
   if (shuttingDown) throw httpError(503, "服务正在关闭");
   const body = await readJson(req);

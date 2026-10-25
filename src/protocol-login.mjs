@@ -10,6 +10,7 @@ import { ACCOUNT_SESSION_FILENAME, checkAccountInsights, sessionIdentity } from 
 import { normalizeOAuthCredentials, withSub2ApiExpiry, validateSub2ApiData } from "./sub2api-export.mjs";
 import { readMfaSession, writeMfaSession } from "./mfa-session.mjs";
 import { emailRebindStep } from "./email-rebind-protocol.mjs";
+import { describeRebindError, formatRebindDiagnostic, traceRebindTransport } from "./email-rebind-logs.mjs";
 import { checkOffer, offerError, offerIdentity } from "./offer-checker.mjs";
 import {
   browserIdentityForTlsProfile,
@@ -167,6 +168,7 @@ class ProtocolClient {
     this.hideUrlQuery = Boolean(options.hideUrlQuery);
     this.debugAuth = Boolean(options.debugAuth);
     this.transport = options.transport || null;
+    this.onDiagnostic = options.onDiagnostic || null;
   }
 
   async rawFetch(url, options = {}) {
@@ -217,6 +219,7 @@ class ProtocolClient {
     }
 
     const controller = new AbortController();
+    this.onDiagnostic?.({ phase: "request", method, url, body });
     const timeout = setTimeout(() => controller.abort(), options.timeoutMs || DEFAULT_TIMEOUT_MS);
     let res;
     let text;
@@ -233,6 +236,7 @@ class ProtocolClient {
       this.jar.merge(res.headers.transportCookies);
       text = await res.text();
     } catch (error) {
+      this.onDiagnostic?.({ phase: "error", method, url, error: describeRebindError(error) });
       if (error?.name === "AbortError") {
         throw new Error(`${method} ${safeUrl(url)} timed out after ${options.timeoutMs || DEFAULT_TIMEOUT_MS}ms`);
       }
@@ -242,6 +246,7 @@ class ProtocolClient {
     }
 
     const location = res.headers.get("location");
+    this.onDiagnostic?.({ phase: "response", method, url, status: res.status, headers: Object.fromEntries(res.headers.entries()), body: text });
     if (this.verbose) {
       const suffix = location ? ` -> ${safeUrl(new URL(location, url).toString(), this.hideUrlQuery)}` : "";
       console.error(`< ${method} ${safeUrl(url, this.hideUrlQuery)} ${res.status}${suffix}`);
@@ -326,13 +331,17 @@ async function run() {
     if (args.rebindOperation) {
       if (!args.rebindResult) throw new Error("Email rebind result path is required");
       let result;
+      console.log(`[rebind:${args.rebindOperation}] 开始执行，读取已有会话`);
+      traceRebindTransport(transport, (message) => console.log(message));
       try {
         const chunks = [];
         for await (const chunk of input) chunks.push(chunk);
         const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
         if (payload.session?.chatgptBase && payload.session.chatgptBase !== chatgptBase) throw new Error("SESSION_INVALID");
+        console.log(`[transport] 初始化请求传输，代理${proxyTemplate ? "已配置" : "未配置"}`);
         await transport.configure(proxyTemplate, { force: true });
-        const client = new ProtocolClient({ transport, verbose: false, hideUrlQuery: true, jar: CookieJar.fromJSON(payload.cookies) });
+        const client = new ProtocolClient({ transport, verbose: false, hideUrlQuery: true, jar: CookieJar.fromJSON(payload.cookies),
+          onDiagnostic: (record) => { if (record.phase !== "response" || !transport.enabled) console.log(formatRebindDiagnostic(record)); } });
         const deviceId = payload.session?.deviceId || crypto.randomUUID();
         const data = await emailRebindStep({ ...payload, operation: args.rebindOperation }, async (target, options) => {
           const response = await client.request(options.method, `${chatgptBase}${target}`, {
@@ -342,8 +351,12 @@ async function run() {
           });
           return { status: response.res.status, body: response.text };
         });
+        console.log(`[rebind:${args.rebindOperation}] 完成\n${JSON.stringify(data, null, 2)}`);
         result = { ok: true, data, cookies: client.jar.toJSON() };
-      } catch (error) { result = { ok: false, code: error.rebindCode || "REQUEST_FAILED" }; }
+      } catch (error) {
+        console.error(`[rebind:${args.rebindOperation}] 失败\n${describeRebindError(error)}`);
+        result = { ok: false, code: error.rebindCode || "REQUEST_FAILED", diagnostic: error.diagnostic || { operation: args.rebindOperation } };
+      }
       await writePrivateJson(path.resolve(args.rebindResult), result);
       return;
     }
