@@ -270,3 +270,9 @@ MFA 导出使用居中预览弹窗，宽度上限（760px），内边距（24px�
 - **Don't** 把样式示例和测试账号当作真实业务结果。
 
 <!-- Source of truth: web/src/styles.css; web/src/workspace.css; web/src/WorkspaceUi.jsx; web/src/main.jsx; web/src/MfaWorkspace.jsx. Date semantics: web/src/task-filters.mjs. Approved direction: tosub2-ui-plan.md. -->
+
+### 接码池工作区
+
+继承石墨蓝调色、IBM Plex Sans / Noto Sans SC、既有导航与浅深主题。国家报价表为主体，右侧放置扣次与冷却规则，窄屏按阅读顺序叠放。报价可多选同国不同价格档位；凭据编辑不回显密钥。冷却、停用、待核实使用文字表达原因，不仅靠颜色。普通 CDK 配置显示每成功一次的费用，开始前核对费率与批量上限。次数视图分开显示可用、预留和累计消耗；读取中或失败不补造默认费用与可用状态。`web/sms-pool-preview.html` 为隔离的交互设计预览，显示演示数据，不触发真实取号或扣次。
+
+“号码缓冲”作为管理员页签显示脱敏号码、库存状态、有效期来源、取消与退款。缓冲规则放在右侧折叠分组；补货、回收与核实都有明确按钮，未保存配置不触发购号。手机库存改为带字段标签的行，不增加装饰卡片。普通 CDK 使用电话图标与简单可用状态，只展示号码供应情况和费用，隐藏国家及内部库存数量。

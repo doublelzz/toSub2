@@ -13,7 +13,7 @@
     "daemon:restart": "pm2 restart tosub2 --update-env",
     "daemon:stop": "pm2 stop tosub2",
     "daemon:logs": "pm2 logs tosub2",
-    "check": "node --check src/console-server.mjs && node --check src/protocol-login.mjs && node --check src/tls-transport.mjs && node --check src/mail-otp.mjs && node --check src/luban-sms.mjs && node --check src/smsbower.mjs && node --check src/hero-sms.mjs && node --check src/custom-sms.mjs && node --check src/sms-providers.mjs && node --check src/credential-store.mjs && node test/tls-transport.mjs && node test/credential-store.mjs && node test/sms-providers.mjs && node test/hero-sms.mjs && node test/console-job-lock-smoke.mjs && node test/console-smoke.mjs && node test/console-restore-shutdown-smoke.mjs && node test/sms-provider-console-smoke.mjs && node test/protocol-smoke.mjs && node test/password-mfa-workspace-smoke.mjs && node --check src/mfa-workspace.mjs && node test/mfa-workspace.mjs && node test/mfa-rotation-protocol.mjs && node test/mfa-console-smoke.mjs && npm run check:account-insights",
+    "check": "node --check src/console-server.mjs && node --check src/protocol-login.mjs && node --check src/tls-transport.mjs && node --check src/mail-otp.mjs && node --check src/luban-sms.mjs && node --check src/smsbower.mjs && node --check src/hero-sms.mjs && node --check src/custom-sms.mjs && node --check src/sms-providers.mjs && node --check src/credential-store.mjs && node test/tls-transport.mjs && node test/credential-store.mjs && node test/sms-providers.mjs && node test/hero-sms.mjs && node test/console-job-lock-smoke.mjs && node test/console-smoke.mjs && node test/console-restore-shutdown-smoke.mjs && node test/sms-provider-console-smoke.mjs && node test/protocol-smoke.mjs && node test/password-mfa-workspace-smoke.mjs && node --check src/mfa-workspace.mjs && node test/mfa-workspace.mjs && node test/mfa-rotation-protocol.mjs && node test/mfa-console-smoke.mjs && npm run check:account-insights && npm run check:sms-pool",
     "check:account-insights": "node --check src/account-insights.mjs && node --check src/sub2api-export.mjs && node test/sub2api-export.mjs && node test/account-insights.mjs && node test/account-insights-console-smoke.mjs",
     "check:sub2api": "node test/sub2api-export.mjs && node test/account-insights.mjs && node test/account-insights-console-smoke.mjs && node test/sub2api-ui.mjs",
     "check:mfa": "node test/mfa-session.mjs && node test/mfa-workspace.mjs && node test/mfa-rotation-protocol.mjs && node test/mfa-console-smoke.mjs && node test/mfa-authorization-ui.mjs",
@@ -23,7 +23,8 @@
     "check:ui": "node test/task-query.mjs && node test/task-query-console.mjs && node test/workspace-settings-ui.mjs",
     "check:phone-binding": "node test/phone-binding-console.mjs",
     "check:sms-orders": "node test/sms-orders.mjs",
-    "check:cdk": "node test/cdk-store.mjs && node test/cdk-console.mjs && node test/cdk-sub2api-context.mjs"
+    "check:cdk": "node test/cdk-store.mjs && node test/cdk-console.mjs && node test/cdk-sub2api-context.mjs",
+    "check:sms-pool": "node test/sms-pool.mjs && node test/sms-pool-api.mjs && node test/sms-pool-console.mjs && node test/phone-verification-evidence.mjs && node test/sms-pool-ui.mjs && node test/cdk-billing-ui.mjs && node test/sms-pool-actions-ui.mjs && node test/sms-pool-e2e.mjs && node test/cdk-quota-events.mjs && node test/sms-pool-production-ui.mjs && node test/sms-order-lifecycle.mjs && node test/sms-buffer.mjs && node test/sms-buffer-e2e.mjs && node test/sms-pool-buffer-ui.mjs"
   },
   "keywords": [
     "chatgpt",

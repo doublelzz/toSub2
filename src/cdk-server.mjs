@@ -7,6 +7,7 @@ import { createCdkStore } from "./cdk-store.mjs";
 import { createCdkVault } from "./cdk-vault.mjs";
 import { acquireCdkLock } from "./cdk-lock.mjs";
 import { cdkError, clientIp, normalizeClientIp, readRequestJson, requireSameOrigin } from "./cdk-security.mjs";
+import { createSmsPool } from "./sms-pool.mjs";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cookieName = "tosub2_session";
@@ -46,12 +47,13 @@ async function legacyEmails(root) {
   return emails;
 }
 
-export async function startCdkServer({ createWorkspace, root = process.env.ONBOARDING_OUTPUT_ROOT || path.join(projectRoot, "tmp", "chatgpt-onboarding-console"), listen = true } = {}) {
+export async function startCdkServer({ createWorkspace, root = process.env.ONBOARDING_OUTPUT_ROOT || path.join(projectRoot, "tmp", "chatgpt-onboarding-console"), listen = true, smsPoolOptions = {} } = {}) {
   root = path.resolve(root); await fs.mkdir(root, { recursive: true });
   const processLock = await acquireCdkLock(root);
   let cleanupFailedStart = async () => {};
   try {
   const vault = await createCdkVault(root); const store = await createCdkStore(root, vault);
+  const smsPool = createSmsPool({ store, ...smsPoolOptions });
   const namespace = crypto.createHash("sha256").update(root).digest("hex");
   const workspaces = new Map(); const creating = new Map(); const importing = new Map();
   const recoveryLocked = new Set();
@@ -61,7 +63,7 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
   cleanupFailedStart = async () => {
     shuttingDown = true; clearInterval(queueTimer); clearInterval(cleanupTimer);
     if (server?.listening) await new Promise((resolve) => { server.close(resolve); server.closeIdleConnections?.(); });
-    await Promise.allSettled([...creating.values()]); await Promise.allSettled([...workspaces.values()].map((workspace) => workspace.shutdown())); store.close();
+    await Promise.allSettled([...creating.values()]); await Promise.allSettled([...workspaces.values()].map((workspace) => workspace.shutdown())); await smsPool.close(); store.close();
   };
   const initialLegacyEmails = await legacyEmails(root);
   let globalSlots = 20;
@@ -89,6 +91,7 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
       const workspaceRoot = id === store.adminId ? root : path.join(root, "cdk", id);
       const workspace = await createWorkspace({
         root: workspaceRoot, cdkId: id, namespace, legacyEmails: id === store.adminId ? initialLegacyEmails : new Set(),
+        smsPool: smsPool.forOwner(id),
         rebindVault: { seal: (value, scope) => vault.seal(value, `rebind:${id}:${scope}`), open: (value, scope) => vault.open(value, `rebind:${id}:${scope}`) },
         legacyUsed: (email) => store.legacyUsed(id, email),
         markLegacyUsed: (email) => store.markLegacyUsed(id, email),
@@ -133,9 +136,9 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
         throw cdkError(409, "工作区有待恢复的导入，请先完成原导入，不能提交新的导入");
       }
       const emails = workspace.planImport(mode, body);
-      record = store.prepareImport(id, mode, emails, body, requestKey);
+      record = store.prepareImport(id, mode, emails, body, requestKey, actor);
       if (record.status === "completed") return JSON.parse(record.result);
-      const response = await workspace.applyImport(mode, body);
+      const response = await workspace.applyImport(mode, body, record.actor_id || actor);
       applied = true;
       const completed = store.finishImport(record, response, actor);
       if (!store.pendingImports().some((item) => item.cdk_id === id)) recoveryLocked.delete(id);
@@ -155,7 +158,7 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
     const workspace = await workspaceFor(record.cdk_id); workspace.pause();
     if (store.get(record.cdk_id)?.status !== "active") continue;
     try {
-      const result = await workspace.applyImport(record.mode, store.importPayload(record));
+      const result = await workspace.applyImport(record.mode, store.importPayload(record), record.actor_id || "recovery");
       store.finishImport(record, result, "recovery"); workspace.resume();
     } catch {
       recoveryLocked.add(record.cdk_id);
@@ -208,6 +211,14 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
       const session = store.session(cookie(req)); send(res, 200, session ? await bootstrap(session) : { authenticated: false, features: { cdk: true } }); return;
     }
     const session = authenticated(req); const actor = session.actor.id; const owner = session.workspace.id;
+    req.actorId = actor;
+    const writeScopedHead = res.writeHead;
+    res.writeHead = function (...args) {
+      const cdk = store.get(owner);
+      if (cdk) { this.setHeader("x-cdk-id", owner); this.setHeader("x-cdk-balance", String(cdk.balance)); this.setHeader("x-cdk-reserved", String(cdk.reserved)); }
+      return writeScopedHead.apply(this, args);
+    };
+    if (url.pathname === "/api/sms-pool" && req.method === "GET") { send(res, 200, smsPool.publicSummary()); return; }
     if (url.pathname === "/api/auth/me" && req.method === "GET") { send(res, 200, await bootstrap(session)); return; }
     if (url.pathname === "/api/auth/logout" && req.method === "POST") { store.logout(session); res.setHeader("set-cookie", sessionCookie(req, "", true)); send(res, 200, { ok: true }); return; }
     if (url.pathname === "/api/auth/workspace" && req.method === "POST") {
@@ -250,6 +261,44 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
     }
     if (url.pathname.startsWith("/api/admin/")) {
       if (session.actor.role !== "admin") throw cdkError(403, "需要管理员权限");
+      if (url.pathname === "/api/admin/sms-pool" && req.method === "GET") { send(res, 200, smsPool.adminSnapshot()); return; }
+      if (url.pathname === "/api/admin/sms-pool/rules" && req.method === "PUT") { send(res, 200, smsPool.saveRules(await readRequestJson(req), actor)); return; }
+      if (url.pathname === "/api/admin/sms-pool/buffer/warmup" && req.method === "POST") {
+        send(res, 200, await smsPool.warmup(actor));
+        return;
+      }
+      if (url.pathname === "/api/admin/sms-pool/buffer/drain" && req.method === "POST") {
+        send(res, 200, await smsPool.drain(actor));
+        return;
+      }
+      const inventoryReconcileMatch = /^\/api\/admin\/sms-pool\/inventory\/([a-f0-9-]+)\/reconcile$/.exec(url.pathname);
+      if (inventoryReconcileMatch && req.method === "POST") {
+        send(res, 200, smsPool.reconcileInventory(inventoryReconcileMatch[1], await readRequestJson(req), actor));
+        return;
+      }
+      if (url.pathname === "/api/admin/sms-pool/credentials" && req.method === "POST") { send(res, 200, smsPool.saveCredential(await readRequestJson(req), actor)); return; }
+      const poolCredentialMatch = /^\/api\/admin\/sms-pool\/credentials\/([a-f0-9-]+)(?:\/(options))?$/.exec(url.pathname);
+      if (poolCredentialMatch && req.method === "POST" && poolCredentialMatch[2] === "options") { send(res, 200, await smsPool.credentialOptions(poolCredentialMatch[1], await readRequestJson(req), actor)); return; }
+      if (poolCredentialMatch && req.method === "PATCH" && !poolCredentialMatch[2]) { send(res, 200, smsPool.saveCredential({ ...await readRequestJson(req), id: poolCredentialMatch[1] }, actor)); return; }
+      if (url.pathname === "/api/admin/sms-pool/entries" && req.method === "POST") { send(res, 200, smsPool.saveEntries(await readRequestJson(req), actor)); return; }
+      if (url.pathname === "/api/admin/sms-pool/operations" && req.method === "GET") {
+        send(res, 200, smsPool.operationsPage(Object.fromEntries(url.searchParams)));
+        return;
+      }
+      const poolEntryMatch = /^\/api\/admin\/sms-pool\/entries\/([a-f0-9-]+)$/.exec(url.pathname);
+      if (poolEntryMatch && req.method === "PATCH") { send(res, 200, smsPool.patchEntry(poolEntryMatch[1], await readRequestJson(req), actor)); return; }
+      const poolReconcileMatch = /^\/api\/admin\/sms-pool\/operations\/([a-zA-Z0-9_-]+)\/reconcile$/.exec(url.pathname);
+      if (poolReconcileMatch && req.method === "POST") {
+        const body = await readRequestJson(req);
+        const result = smsPool.reconcile(poolReconcileMatch[1], body, actor);
+        const ownerId = body.cdkId || result.operations.find((item) => item.operationId === poolReconcileMatch[1])?.cdkId;
+        if (ownerId) {
+          try { await workspaces.get(ownerId)?.refreshPoolStatus?.(); }
+          catch { console.warn("[sms-pool] Settlement was saved; workspace status will refresh on its next request."); }
+        }
+        send(res, 200, result);
+        return;
+      }
       const body = ["POST", "PATCH", "PUT"].includes(req.method) ? await readRequestJson(req) : {};
       if (url.pathname === "/api/admin/cdks") {
         if (req.method === "GET") send(res, 200, { items: store.list() });
@@ -317,7 +366,7 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
     if (!["GET", "HEAD"].includes(req.method)) req.jsonBody = await readRequestJson(req);
     if (!["GET", "HEAD"].includes(req.method) && (importing.has(owner) || recoveryLocked.has(owner))) throw cdkError(409, "此工作区正在导入或恢复，请稍后再操作");
     if (url.pathname === "/api/jobs/delete-batch") {
-      const response = await workspace.dispatch(req.method, url.pathname, req.jsonBody);
+      const response = await workspace.dispatch(req.method, url.pathname, req.jsonBody, actor);
       if (response.status < 400) store.syncInventory(owner, workspace.inventory());
       res.writeHead(response.status, response.headers); res.end(response.body); return;
     }
@@ -357,13 +406,15 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
     await new Promise((resolve, reject) => { server.once("error", reject); server.listen(port, host, resolve); });
     console.log(`[ok] CDK console listening on ${host}:${port}`); console.log("[info] Initial administrator CDK: node src/cdk-admin.mjs initial (local operator only)");
   }
-  acceptingWork = true; requestSchedule();
+  acceptingWork = true; smsPool.start?.(); requestSchedule();
   let closing;
   const close = () => closing ||= (async () => {
     shuttingDown = true; clearInterval(queueTimer); clearInterval(cleanupTimer);
+    smsPool.pause?.();
     const closed = server.listening ? new Promise((resolve) => { server.close(resolve); server.closeIdleConnections?.(); }) : Promise.resolve();
     await Promise.allSettled([...creating.values(), ...importing.values()]);
     await Promise.allSettled([...workspaces.values()].map((workspace) => workspace.shutdown()));
+    await smsPool.close();
     let timer; await Promise.race([closed, new Promise((resolve) => { timer = setTimeout(() => { server.closeAllConnections?.(); resolve(); }, 3000); })]); clearTimeout(timer);
     store.close(); await processLock.close();
   })();
@@ -373,6 +424,6 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
       if (message === "shutdown" || message?.type === "tosub2:shutdown") void close().then(() => { if (process.connected) process.disconnect(); }).catch(() => { process.exitCode = 1; if (process.connected) process.disconnect(); });
     });
   }
-  return { server, store, workspaceFor, close, importFor };
+  return { server, store, workspaceFor, close, importFor, smsPool };
   } catch (error) { await cleanupFailedStart(); await processLock.close(); throw error; }
 }

@@ -105,7 +105,7 @@ export function createSmsProvider(providerIdValue, configValue = {}, options = {
     if (providerIds && !/^\d{1,12}(?:,\d{1,12}){0,99}$/.test(providerIds)) {
       throw new Error("请重新查询 SMSBower 供应商价格");
     }
-    const client = createSmsBowerClient({ apiKey, apiBase: options.smsBowerApiBase, fetchImpl: options.fetchImpl });
+    const client = createSmsBowerClient({ apiKey, apiBase: options.smsBowerApiBase, fetchImpl: options.fetchImpl, now: options.now });
     return {
       id: "smsbower",
       name: "SMSBower",
@@ -118,6 +118,10 @@ export function createSmsProvider(providerIdValue, configValue = {}, options = {
       listNumberOptions: () => client.getPriceOptions(service),
       getSms: (requestId) => client.getSms(requestId),
       markReady: (requestId) => client.markReady(requestId),
+      activationPolicy: client.activationPolicy,
+      inspect: (requestId) => client.inspect(requestId),
+      cancelStrict: (requestId) => client.cancelStrict(requestId),
+      cancelReceipt: (requestId) => client.cancelStrict(requestId),
       complete: (requestId) => client.complete(requestId),
       release: (requestId) => client.release(requestId),
     };
@@ -133,7 +137,7 @@ export function createSmsProvider(providerIdValue, configValue = {}, options = {
     if (maxPrice && (!/^\d+(?:\.\d{1,6})?$/.test(maxPrice) || Number(maxPrice) <= 0)) {
       throw new Error("请重新查询 Hero SMS 国家价格");
     }
-    const client = createHeroSmsClient({ apiKey, apiBase: options.heroSmsApiBase, fetchImpl: options.fetchImpl });
+    const client = createHeroSmsClient({ apiKey, apiBase: options.heroSmsApiBase, fetchImpl: options.fetchImpl, now: options.now });
     return {
       id: "herosms",
       name: "Hero SMS",
@@ -145,6 +149,10 @@ export function createSmsProvider(providerIdValue, configValue = {}, options = {
       },
       listNumberOptions: () => client.getPriceOptions(service),
       getSms: (requestId) => client.getSms(requestId),
+      activationPolicy: client.activationPolicy,
+      inspect: (requestId) => client.inspect(requestId),
+      cancelStrict: (requestId) => client.cancelStrict(requestId),
+      cancelReceipt: (requestId) => client.cancelStrict(requestId),
       complete: (requestId) => client.complete(requestId),
       release: (requestId) => client.release(requestId),
     };

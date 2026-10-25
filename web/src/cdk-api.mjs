@@ -16,7 +16,7 @@ export function requestId() {
 
 export function hydrateWorkspaceSettings(bootstrap) {
   clearTimeout(saveTimer);
-  workspace = { id: bootstrap.workspace.id, token: bootstrap.token, values: { ...(bootstrap.settings || {}) }, dirty: false, legacyValues: {} };
+  workspace = { id: bootstrap.workspace.id, token: bootstrap.token, quota: `${bootstrap.workspace.balance}:${bootstrap.workspace.reserved || 0}`, values: { ...(bootstrap.settings || {}) }, dirty: false, legacyValues: {} };
   if (bootstrap.account.role === "admin" && bootstrap.workspace.id === bootstrap.account.id && !Object.keys(workspace.values).length) {
     for (const key of workspaceKeys) {
       try {
@@ -77,8 +77,16 @@ export async function cdkFetch(url, options = {}) {
     if (!headers.has("idempotency-key")) headers.set("idempotency-key", requestId());
   }
   const response = await fetch(url, { ...options, headers });
+  const quotaOwner = response.headers.get("x-cdk-id");
+  const balance = response.headers.get("x-cdk-balance");
+  const reserved = response.headers.get("x-cdk-reserved");
+  let quotaNotified = false;
+  if (workspace && quotaOwner === workspace.id && balance !== null && reserved !== null) {
+    const quota = `${balance}:${reserved}`;
+    if (quota !== workspace.quota) { workspace.quota = quota; quotaNotified = true; window.dispatchEvent(new Event("cdk-balance-changed")); }
+  }
   if ([401, 403].includes(response.status)) handleSessionStatus(response, await response.clone().json().catch(() => ({})));
-  if (mode && response.ok) window.dispatchEvent(new Event("cdk-balance-changed"));
+  if (mode && response.ok && !quotaNotified) window.dispatchEvent(new Event("cdk-balance-changed"));
   return response;
 }
 

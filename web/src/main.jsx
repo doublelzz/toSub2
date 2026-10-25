@@ -35,6 +35,7 @@ import "./styles.css";
 import "./workspace.css";
 import MfaWorkspace from "./MfaWorkspace.jsx";
 import EmailRebindWorkspace from "./EmailRebindWorkspace.jsx";
+import SmsPoolWorkspace, { SmsPoolChoice, SmsPoolChargeDialog } from "./SmsPoolWorkspace.jsx";
 import CdkGate from "./CdkGate.jsx";
 import CdkWorkspace from "./CdkWorkspace.jsx";
 import CurrentCdk from "./CurrentCdk.jsx";
@@ -118,6 +119,7 @@ function App({ auth }) {
   const [smsSettingsOpen, setSmsSettingsOpen] = useState(false);
   const [smsSettingsDraft, setSmsSettingsDraft] = useState(readSmsProviderSettings);
   const [smsSettingsError, setSmsSettingsError] = useState("");
+  const [smsChargeQuote, setSmsChargeQuote] = useState(null);
   const [smsNumberOptionsState, setSmsNumberOptionsState] = useState(null);
   const [smsOptionsLoading, setSmsOptionsLoading] = useState(false);
   const [mailRequestSettings, setMailRequestSettings] = useState(readMailRequestSettings);
@@ -543,6 +545,12 @@ function App({ auth }) {
         return;
       }
     }
+    if (resolved.id === "pool") {
+      setSmsSettings(withSmsProviderDefaults(smsProviderDefinitions, smsSettingsDraft));
+      setSmsSettingsOpen(false);
+      setSmsSettingsError("");
+      return;
+    }
     const maxRotationAttempts = Number(resolved.config.maxRotationAttempts);
     const rotationIntervalSeconds = Number(resolved.config.rotationIntervalSeconds);
     if (!Number.isSafeInteger(maxRotationAttempts) || maxRotationAttempts < 1 || maxRotationAttempts > 20) {
@@ -588,7 +596,8 @@ function App({ auth }) {
     if (!email.trim() || busy) return;
     setBusy(true);
     try {
-      const smsProvider = phoneBindingEnabled && activeSmsProvider.ready ? { id: activeSmsProvider.id, config: activeSmsProvider.config } : undefined;
+      const smsProvider = phoneBindingEnabled && activeSmsProvider.ready ? await prepareSmsProvider(1) : undefined;
+      if (phoneBindingEnabled && activeSmsProvider.id === "pool" && !smsProvider) return;
       await apiFetch(token, "/api/jobs", {
         method: "POST",
         body: JSON.stringify({ email: email.trim(), proxyUrl: accountProxyUrl.trim(), phoneBindingMode: phoneBindingEnabled ? "automatic" : "manual", phoneBindingEnabled, ...(smsProvider ? { smsProvider } : {}) }),
@@ -611,7 +620,8 @@ function App({ auth }) {
     if (!batchText.trim() || batchBusy) return;
     setBatchBusy(true);
     try {
-      const smsProvider = phoneBindingEnabled && activeSmsProvider.ready ? { id: activeSmsProvider.id, config: activeSmsProvider.config } : undefined;
+      const smsProvider = phoneBindingEnabled && activeSmsProvider.ready ? await prepareSmsProvider(batchText.split(/\r?\n/).filter((line) => line.trim()).length) : undefined;
+      if (phoneBindingEnabled && activeSmsProvider.id === "pool" && !smsProvider) return;
       await apiFetch(token, "/api/jobs/batch", {
         method: "POST",
         body: JSON.stringify({ text: batchText, proxyUrl: accountProxyUrl.trim(), phoneBindingMode: phoneBindingEnabled ? "automatic" : "manual", phoneBindingEnabled, ...(smsProvider ? { smsProvider } : {}) }),
@@ -717,9 +727,11 @@ function App({ auth }) {
     if (!canStartPhoneSelected || !activeSmsProvider.ready || batchAction) return;
     setBatchAction("start-phone");
     try {
+      const smsProvider = await prepareSmsProvider(phoneBindingSelectedCount);
+      if (!smsProvider) return;
       const data = await apiFetch(token, "/api/jobs/start-phone-batch", {
         method: "POST",
-        body: JSON.stringify({ ids: [...selectedJobIds], smsProvider: { id: activeSmsProvider.id, config: activeSmsProvider.config } }),
+        body: JSON.stringify({ ids: [...selectedJobIds], smsProvider }),
       });
       setUploadNotice(`已开始为 ${data.started} 个账号接码${data.skipped ? `，跳过 ${data.skipped} 个` : ""}${data.failed ? `，失败 ${data.failed} 个` : ""}`);
       setSelectedJobIds(new Set());
@@ -734,6 +746,15 @@ function App({ auth }) {
     } finally {
       setBatchAction("");
     }
+  }
+
+  async function prepareSmsProvider(count = 1) {
+    if (activeSmsProvider.id !== "pool") return { id: activeSmsProvider.id, config: activeSmsProvider.config };
+    const summary = await apiFetch(token, "/api/sms-pool");
+    if (!summary.enabled || !summary.available) throw new Error("接码池暂时无法取号，请稍后重试或选择自己的接码平台");
+    const admin = auth.workspace.role === "admin";
+    if (!admin && auth.workspace.balance < summary.fee) throw new Error(`接码池需要预留 ${summary.fee} 次，当前可用 ${auth.workspace.balance} 次`);
+    return new Promise((resolve) => setSmsChargeQuote({ fee: summary.fee, count, admin, resolve }));
   }
 
   async function setupTotpSelected() {
@@ -863,6 +884,7 @@ function App({ auth }) {
           <button type="button" className={activeWorkspace === "rebind" ? "active" : ""} aria-pressed={activeWorkspace === "rebind"} onClick={() => setActiveWorkspace("rebind")}><MailCheck size={17} />邮箱换绑</button>
           <button type="button" className={activeWorkspace === "cdk-mine" ? "active" : ""} aria-pressed={activeWorkspace === "cdk-mine"} onClick={() => setActiveWorkspace("cdk-mine")}><KeyRound size={17} />我的 CDK</button>
           {adminView && auth.account.role === "admin" && <>
+            <button type="button" className={activeWorkspace === "sms-pool" ? "active" : ""} aria-pressed={activeWorkspace === "sms-pool"} onClick={() => setActiveWorkspace("sms-pool")}><Globe2 size={17} />接码池</button>
             <button type="button" className={activeWorkspace === "cdk-management" ? "active" : ""} aria-pressed={activeWorkspace === "cdk-management"} onClick={() => setActiveWorkspace("cdk-management")}><KeyRound size={17} />CDK 管理</button>
             <button type="button" className={activeWorkspace === "cdk-security" ? "active" : ""} aria-pressed={activeWorkspace === "cdk-security"} onClick={() => setActiveWorkspace("cdk-security")}><ShieldCheck size={17} />安全中心</button>
           </>}
@@ -872,7 +894,7 @@ function App({ auth }) {
       </aside>
       <div className="workspace-content">
       <header className="topbar">
-        <div className="workspace-path"><span>工作区</span><ChevronRight size={14} /><strong>{({ authorization: "账号授权", mfa: "MFA 修改", rebind: "邮箱换绑", "cdk-mine": "我的 CDK", "cdk-management": "CDK 管理", "cdk-security": "安全中心" })[activeWorkspace]}</strong></div>
+        <div className="workspace-path"><span>工作区</span><ChevronRight size={14} /><strong>{({ authorization: "账号授权", mfa: "MFA 修改", rebind: "邮箱换绑", "sms-pool": "接码池", "cdk-mine": "我的 CDK", "cdk-management": "CDK 管理", "cdk-security": "安全中心" })[activeWorkspace]}</strong></div>
         <div className="topbar-actions cdk-session-actions">
           <CurrentCdk auth={auth} onOpen={() => setActiveWorkspace("cdk-mine")} />
           {auth.account.role === "admin" && <button className="secondary-button" onClick={async () => {
@@ -888,6 +910,7 @@ function App({ auth }) {
       </header>
       {auth.workspace.id !== auth.account.id && <p className="cdk-scope-note">管理员正在查看 {auth.workspace.note || auth.workspace.label} 的工作区。此处操作和新增导入属于该 CDK。</p>}
       {activeWorkspace.startsWith("cdk-") && <CdkWorkspace auth={auth} section={activeWorkspace.slice(4)} onNavigate={(section) => setActiveWorkspace(`cdk-${section}`)} />}
+      {activeWorkspace === "sms-pool" && auth.account.role === "admin" && <SmsPoolWorkspace token={token} />}
       {activeWorkspace === "rebind" && <EmailRebindWorkspace token={token} onOpenAuthorization={() => { setPhoneTab("disabled"); setFilters(DEFAULT_FILTERS); setPage(1); setSelectedJobIds(new Set()); setExpandedJobId(null); setEmailFilter([]); setActiveWorkspace("authorization"); }} />}
       {activeWorkspace === "mfa" && <MfaWorkspace token={token} defaultProxyUrl={accountProxyUrl} focusAccountId={mfaFocusAccountId} onReconnect={() => setConnectionAttempt((current) => current + 1)} onOpenAuthorization={() => {
         setPhoneTab("disabled"); setFilters(DEFAULT_FILTERS); setEmailFilter([]); setSelectedJobIds(new Set()); setExpandedJobId(null); setPage(1); setActiveWorkspace("authorization");
@@ -1038,6 +1061,7 @@ function App({ auth }) {
                     selectionSupported={Boolean(features.bulkActions)}
                     smsProviderAvailable={smsProviderDefinitions.length > 0}
                     smsProvider={activeSmsProvider}
+                    prepareSmsProvider={prepareSmsProvider}
                     onUpload={() => uploadSelected([job.id])}
                     sub2apiUploadAvailable={Boolean(features.sub2apiUpload && sub2apiSettings.baseUrl && sub2apiSettings.adminApiKey)}
                     totpSetupAvailable={Boolean(features.totpSetup)}
@@ -1064,6 +1088,7 @@ function App({ auth }) {
                     selectionSupported={Boolean(features.bulkActions)}
                     smsProviderAvailable={smsProviderDefinitions.length > 0}
                     smsProvider={activeSmsProvider}
+                    prepareSmsProvider={prepareSmsProvider}
                     onUpload={() => uploadSelected([job.id])}
                     sub2apiUploadAvailable={Boolean(features.sub2apiUpload && sub2apiSettings.baseUrl && sub2apiSettings.adminApiKey)}
                     totpSetupAvailable={Boolean(features.totpSetup)}
@@ -1076,6 +1101,7 @@ function App({ auth }) {
         </div>
       </section>
       </>}
+      {smsChargeQuote && <SmsPoolChargeDialog quote={smsChargeQuote} onClose={(value) => { const resolve = smsChargeQuote.resolve; setSmsChargeQuote(null); resolve(value); }} />}
       {smsSettingsOpen && (
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
           if (event.target === event.currentTarget) setSmsSettingsOpen(false);
@@ -1084,7 +1110,7 @@ function App({ auth }) {
             <div className="dialog-header">
               <div>
                 <h2 id="sms-settings-title">接码平台配置</h2>
-                <span>配置保存在当前浏览器</span>
+                <span>配置保存在当前 CDK 的工作区</span>
               </div>
               <button type="button" className="icon-button" onClick={() => setSmsSettingsOpen(false)} title="关闭">
                 <X size={18} />
@@ -1112,7 +1138,8 @@ function App({ auth }) {
               ))}
             </div>
 
-            {draftSmsProvider.definition && (
+            {draftSmsProvider.id === "pool" && <SmsPoolChoice token={token} onManage={auth.account.role === "admin" ? () => { setSmsSettingsOpen(false); setActiveWorkspace("sms-pool"); } : undefined} />}
+            {draftSmsProvider.definition && draftSmsProvider.id !== "pool" && (
               <div className="provider-config-section">
                 <div className="provider-description-row">
                   <div className="provider-description">{draftSmsProvider.definition.description}</div>
@@ -1684,7 +1711,14 @@ function SubscriptionInfo({ insights }) {
   </div>;
 }
 
-function SmsSummary({ summary }) {
+function SmsSummary({ summary, billing }) {
+  if (billing) {
+    const completed = billing.state === "verified";
+    const released = billing.state === "released";
+    const unknown = billing.state === "unknown";
+    const queued = billing.state === "queued";
+    return <div className="sms-summary"><strong>{completed ? "已接码" : released ? "接码已结束" : unknown ? "接码待核实" : queued ? "等待池名额" : "池接码中"}</strong><span>管理员接码池</span><span>{completed ? billing.fee ? `已扣 ${billing.fee} 次` : "管理员工作区，不扣次" : released ? "未扣次，预留已释放" : queued ? "尚未取号，未预留次数" : `预留 ${billing.reserved} 次`}</span>{unknown && <small>结果未确认，等待核实</small>}{summary?.historyCount > 1 && <small>{summary.historyCount} 次取号记录</small>}</div>;
+  }
   if (!summary || summary.verificationStatus === "not_started") return <div className="sms-summary"><span className="insight-note">未接码</span></div>;
   const latest = summary.latest;
   const status = { verified: "已接码", processing: "接码中", canceled: "已取消", failed: "接码失败", not_required: "无需接码" }[summary.verificationStatus] || "未接码";
@@ -1696,7 +1730,7 @@ function smsOrderStatusText(status) {
   return ({ acquired: "已取号", submitted: "已提交", complete_pending: "等待完成确认", completed: "已完成", cancel_pending: "等待取消确认", cancel_requested: "已请求取消", cancel_failed: "取消失败", complete_failed: "完成确认失败", error: "失败" })[status] || status || "未知";
 }
 
-function JobRow({ job, token, expanded, onToggleLogs, onError, onPreviewExport, onDownloadNotice, onMfaStarted, mfaChangeAvailable, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, detail = false }) {
+function JobRow({ prepareSmsProvider, job, token, expanded, onToggleLogs, onError, onPreviewExport, onDownloadNotice, onMfaStarted, mfaChangeAvailable, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, detail = false }) {
   const [value, setValue] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
@@ -1838,9 +1872,11 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, onPreviewExport, 
     if (!smsProvider.ready) return;
     setSubmitting(true);
     try {
+      const setup = prepareSmsProvider ? await prepareSmsProvider(1) : { id: smsProvider.id, config: smsProvider.config };
+      if (!setup) return;
       await apiFetch(token, `/api/jobs/${job.id}/sms-number`, {
         method: "POST",
-        body: JSON.stringify({ providerId: smsProvider.id, config: smsProvider.config }),
+        body: JSON.stringify({ providerId: setup.id, config: setup.config }),
       });
       onError("");
     } catch (requestError) {
@@ -1854,9 +1890,11 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, onPreviewExport, 
     if (!smsProvider.ready || !job.canStartPhoneBinding) return;
     setSubmitting(true);
     try {
+      const setup = prepareSmsProvider ? await prepareSmsProvider(1) : { id: smsProvider.id, config: smsProvider.config };
+      if (!setup) return;
       await apiFetch(token, `/api/jobs/${job.id}/start-phone`, {
         method: "POST",
-        body: JSON.stringify({ smsProvider: { id: smsProvider.id, config: smsProvider.config } }),
+        body: JSON.stringify({ smsProvider: setup }),
       });
       onError("");
     } catch (requestError) { onError(requestError.message); }
@@ -2047,13 +2085,13 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, onPreviewExport, 
               <Ban size={17} />取消任务
             </button>
           )}</>;
-  if (detail) return <div className="job-detail-content"><p className="detail-email">{job.email}</p><section className="detail-section"><h3>状态与当前操作</h3><StatusBadge status={job.status} />{stepContent}</section><section className="detail-section"><h3>额度与订阅</h3>{quotaContent}</section><section className="detail-section"><h3>接码与费用</h3><SmsSummary summary={job.smsSummary} />{job.smsSummary?.orders?.length > 0 && <div className="sms-order-history">{job.smsSummary.orders.map(order => <div key={order.id}><span>{order.providerName || "接码平台"}</span><span>{smsOrderStatusText(order.status)}</span><span>{order.amount && order.currency ? `${order.amount} ${order.currency}` : order.quote ? `报价 ${order.quote}` : "金额待确认"}</span></div>)}</div>}</section><section className="detail-section"><h3>时间</h3><dl className="detail-dates"><div><dt>创建时间</dt><dd>{formatInsightDate(job.createdAt)}</dd></div><div><dt>最近操作</dt><dd>{formatInsightDate(job.lastOperationAt || job.createdAt)}</dd></div></dl></section><section className="detail-section"><h3>任务操作</h3><div className="detail-actions">{actionContent}</div></section><section className="detail-section"><h3>执行日志</h3><JobLogs token={token} jobId={job.id} /></section></div>;
+  if (detail) return <div className="job-detail-content"><p className="detail-email">{job.email}</p><section className="detail-section"><h3>状态与当前操作</h3><StatusBadge status={job.status} />{stepContent}</section><section className="detail-section"><h3>额度与订阅</h3>{quotaContent}</section><section className="detail-section"><h3>接码与费用</h3><SmsSummary summary={job.smsSummary} billing={job.smsPoolBilling} />{job.smsSummary?.orders?.length > 0 && <div className="sms-order-history">{job.smsSummary.orders.map(order => <div key={order.id}><span>{order.providerName || "接码平台"}</span><span>{smsOrderStatusText(order.status)}</span><span>{order.amount && order.currency ? `${order.amount} ${order.currency}` : order.quote ? `报价 ${order.quote}` : "金额待确认"}</span></div>)}</div>}</section><section className="detail-section"><h3>时间</h3><dl className="detail-dates"><div><dt>创建时间</dt><dd>{formatInsightDate(job.createdAt)}</dd></div><div><dt>最近操作</dt><dd>{formatInsightDate(job.lastOperationAt || job.createdAt)}</dd></div></dl></section><section className="detail-section"><h3>任务操作</h3><div className="detail-actions">{actionContent}</div></section><section className="detail-section"><h3>执行日志</h3><JobLogs token={token} jobId={job.id} /></section></div>;
   return <tr className={`job-row status-${job.status} ${selected ? "selected-row" : ""}`}>
     <td className="select-cell"><input type="checkbox" checked={selected} onChange={onToggleSelected} disabled={!selectionSupported} aria-label={`选择 ${job.email}`} /></td>
     <td className="account-column"><div className="account-details"><strong title={job.email}>{job.email}</strong><span>{shortId(job.id)}</span></div><LoginMethodBadge job={job} /><div className="mobile-task-meta">{formatDateTime(job.createdAt)}</div></td>
     <td className="status-step-cell"><StatusBadge status={job.status} />{inputConfig ? <div className="task-inline-step">{stepContent}</div> : <><div className="prompt-line">{job.prompt}</div>{job.lastError && <div className="row-error">{extractResponseMessage(job.lastError)}</div>}</>}</td>
     <td className="insight-cell quota-column">{quotaContent}</td>
-    <td className="sms-column"><SmsSummary summary={job.smsSummary} /></td>
+    <td className="sms-column"><SmsSummary summary={job.smsSummary} billing={job.smsPoolBilling} /></td>
     <td className="task-time-cell"><div><span>创建</span><time dateTime={job.createdAt} title={formatInsightDate(job.createdAt)}>{formatDateTime(job.createdAt)}</time></div><div><span>操作</span><time dateTime={job.lastOperationAt || job.createdAt} title={formatInsightDate(job.lastOperationAt || job.createdAt)}>{formatDateTime(job.lastOperationAt || job.createdAt)}</time></div><small>{operationLabel(job.lastOperationType)}</small></td>
     <td className="actions-cell"><div className="row-actions"><button type="button" className="text-action" onClick={onToggleLogs} aria-label={`查看 ${job.email} 的任务详情`}>查看</button>{job.canDownload && <button type="button" className="text-action" onClick={download}><Download size={14} />下载</button>}{mfaChangeAvailable && (job.canChangeMfa || job.mfaBusy) && <button type="button" className="text-action" onClick={changeMfa} disabled={submitting || job.mfaBusy} title="复用已有授权，成功后同步账号资料"><ShieldCheck size={14} />{job.mfaBusy ? "MFA 处理中" : "修改 MFA"}</button>}{job.canRetry && !job.canDownload && <button type="button" className="text-action" onClick={retry} disabled={submitting}>{job.canResume ? "继续" : "重试"}</button>}<MoreActions label="更多">{actionContent}</MoreActions></div></td>
   </tr>;
@@ -2523,7 +2561,7 @@ function resolveSmsProvider(definitions, settings) {
   ));
   const customEntries = definition?.id === "custom" ? inspectCustomSmsEntries(config.entries) : null;
   const ready = requiredFieldsReady && !customEntries?.error;
-  const summary = definition?.id === "custom"
+  const summary = definition?.id === "pool" ? "验证成功后按池规则扣次" : definition?.id === "custom"
     ? (customEntries?.count ? `${customEntries.count} 个号码` : "")
     : definition
     ? definition.fields

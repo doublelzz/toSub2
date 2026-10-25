@@ -62,7 +62,9 @@ const fetchImpl = async (url) => {
 
 const client = createSmsBowerClient({ apiKey: "test-api-key", fetchImpl });
 const order = await client.getNumber("dr", "1001", "0.42", "3301,3302");
-assert.deepEqual(order, { requestId: "activation-1", number: "+60123456789" });
+assert.deepEqual({ requestId: order.requestId, number: order.number }, { requestId: "activation-1", number: "+60123456789" });
+assert.equal(order.expiresAtSource, "provider_policy");
+assert.equal(Date.parse(order.expiresAt) - Date.parse(order.createdAt), 25 * 60_000);
 assert.equal((await client.getSms(order.requestId)).status, "waiting");
 assert.deepEqual(await client.getSms(order.requestId), { status: "received", code: "654321" });
 assert.equal(await client.markReady(order.requestId), true);
@@ -121,7 +123,9 @@ const provider = createSmsProvider("smsbower", {
 }, { fetchImpl });
 assert.equal(provider.name, "SMSBower");
 assert.equal(provider.serviceLabel, "日本");
-assert.deepEqual(await provider.getNumber(), { requestId: "activation-1", number: "+60123456789" });
+const providerOrder = await provider.getNumber();
+assert.deepEqual({ requestId: providerOrder.requestId, number: providerOrder.number }, { requestId: "activation-1", number: "+60123456789" });
+assert.equal(providerOrder.expiresAtSource, "provider_policy");
 assert.equal((await provider.listNumberOptions())[0].country, "12");
 assert.throws(() => createSmsProvider("smsbower", { apiKey: "short", service: "dr", country: "1001" }), /API Key/);
 assert.throws(

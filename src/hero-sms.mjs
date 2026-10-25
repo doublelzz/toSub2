@@ -1,4 +1,5 @@
 import { parseNumberOrder } from "./sms-orders.mjs";
+import { SHORT_ACTIVATION_POLICIES, withShortActivationLifecycle, inspectActivationStatus, cancellationReceipt } from "./sms-order-lifecycle.mjs";
 const DEFAULT_API_BASE = "https://hero-sms.com/stubs/handler_api.php";
 const DEFAULT_TIMEOUT_MS = 12_000;
 
@@ -16,6 +17,7 @@ export function createHeroSmsClient(options = {}) {
   const apiBase = new URL(options.apiBase || DEFAULT_API_BASE);
   const fetchImpl = options.fetchImpl || fetch;
   const timeoutMs = options.timeoutMs || DEFAULT_TIMEOUT_MS;
+  const now = options.now || Date.now;
 
   if (!apiKey) return null;
   if (!/^https?:$/.test(apiBase.protocol)) throw new Error("Hero SMS API 地址必须使用 HTTP 或 HTTPS");
@@ -71,10 +73,16 @@ export function createHeroSmsClient(options = {}) {
     if (text === expected) return true;
     throw responseError(text, "更新号码状态失败", apiKey);
   }
+  const cancelStrict = async (activationId) => {
+    await setStatus(activationId, 8, "ACCESS_CANCEL");
+    return cancellationReceipt(activationId);
+  };
 
   return {
+    activationPolicy: SHORT_ACTIVATION_POLICIES.herosms,
     async getNumber(service, country, maxPrice) {
       const params = { service, country, maxPrice, fixedPrice: "true" };
+      const requestedAt = now();
       const text = await request("getNumber", params);
       const order = parseNumberOrder(text);
       if (!order) throw responseError(text, "获取手机号失败", apiKey);
@@ -82,7 +90,7 @@ export function createHeroSmsClient(options = {}) {
       if (!/^\+[1-9]\d{6,14}$/.test(number)) {
         throw new HeroSmsError("Hero SMS 返回的手机号不是有效的国际格式", { terminal: true });
       }
-      return { ...order, number };
+      return withShortActivationLifecycle({ ...order, number }, "herosms", requestedAt, now());
     },
 
     async getPriceOptions(service) {
@@ -141,6 +149,9 @@ export function createHeroSmsClient(options = {}) {
 
     complete: (activationId) => setStatus(activationId, 6, "ACCESS_ACTIVATION"),
     release: (activationId) => setStatus(activationId, 8, "ACCESS_CANCEL"),
+    inspect: async (activationId) => inspectActivationStatus(await request("getStatus", { id: activationId })),
+    cancelStrict,
+    cancelReceipt: cancelStrict,
   };
 }
 

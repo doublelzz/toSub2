@@ -63,7 +63,9 @@ assert.deepEqual(await client.getPriceOptions("dr"), [
   { country: "0", title: "俄罗斯", iso: "", prefix: "", price: 0.5, count: 5 },
 ]);
 const order = await client.getNumber("dr", "7", "0.18");
-assert.deepEqual(order, { requestId: "123456789", number: "+60123456789" });
+assert.deepEqual({ requestId: order.requestId, number: order.number }, { requestId: "123456789", number: "+60123456789" });
+assert.equal(order.expiresAtSource, "provider_policy");
+assert.equal(Date.parse(order.expiresAt) - Date.parse(order.createdAt), 20 * 60_000);
 const numberRequest = requests.find((url) => url.searchParams.get("action") === "getNumber");
 assert.equal(numberRequest.searchParams.get("service"), "dr");
 assert.equal(numberRequest.searchParams.get("country"), "7");
@@ -82,7 +84,9 @@ assert.deepEqual(requests.filter((url) => url.searchParams.get("action") === "se
 const provider = createSmsProvider("herosms", { apiKey: "test-hero-key", country: "7", maxPrice: "0.18", countryLabel: "马来西亚" }, { fetchImpl });
 assert.equal(provider.name, "Hero SMS");
 assert.equal(provider.serviceLabel, "马来西亚");
-assert.deepEqual(await provider.getNumber(), order);
+const providerOrder = await provider.getNumber();
+assert.deepEqual({ requestId: providerOrder.requestId, number: providerOrder.number }, { requestId: order.requestId, number: order.number });
+assert.equal(providerOrder.expiresAtSource, "provider_policy");
 assert.equal((await createSmsProvider("herosms", { apiKey: "test-hero-key" }, { fetchImpl }).listNumberOptions()).length, 4);
 assert.equal(provider.markReady, undefined);
 assert.throws(() => createSmsProvider("herosms", { apiKey: "short" }), /API Key/);

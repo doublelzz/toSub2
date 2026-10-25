@@ -2,6 +2,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { phoneEvidenceContext, persistPhoneOutcome } from "./phone-verification-evidence.mjs";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { ACCOUNT_SESSION_FILENAME, checkAccountInsights, sessionIdentity } from "./account-insights.mjs";
@@ -1998,11 +1999,18 @@ async function bindPhoneIfNeeded(client, options, current, addPhoneUrl) {
         continue;
       }
 
+      const phoneContext = await phoneEvidenceContext(phone);
+      const pendingEvidence = await persistPhoneOutcome(phoneContext, "pending");
       const validated = await tryValidatePhoneOtp(client, options.authBase, phoneCode, phoneReferer);
       if (validated.ok) {
+        await persistPhoneOutcome(phoneContext, "verified", pendingEvidence);
+        if (phoneContext) console.log("[phone-verification-evidence] verified");
         console.log("[ok] Phone OTP validated");
         return validated.data;
       }
+      await persistPhoneOutcome(phoneContext, validated.uncertain ? "unknown" : "rejected", pendingEvidence);
+      if (phoneContext) console.log(`[phone-verification-evidence] ${validated.uncertain ? "unknown" : "rejected"}`);
+      if (phoneContext && validated.uncertain) throw new Error("PHONE_VALIDATION_UNCERTAIN: Phone verification must be reconciled before another number is requested");
       if (isExpiredCheckpointError(new Error(validated.message))) {
         throw new Error(validated.message);
       }
@@ -2055,7 +2063,7 @@ async function tryValidatePhoneOtp(client, authBase, code, referer) {
     return { ok: true, data };
   } catch (error) {
     if (isProxyRiskControlError(error)) throw error;
-    return { ok: false, message: error.message };
+    return { ok: false, message: error.message, uncertain: !Number.isInteger(error.httpStatus) || error.httpStatus >= 500 };
   }
 }
 
@@ -2417,7 +2425,7 @@ function assertOk(result, label) {
   const { res, text } = result;
   if (res.status >= 200 && res.status < 300) return;
   const body = text.replace(/\s+/g, " ").slice(0, 220);
-  throw new Error(`${label} failed with HTTP ${res.status}: ${body}`);
+  throw Object.assign(new Error(`${label} failed with HTTP ${res.status}: ${body}`), { httpStatus: res.status });
 }
 
 function isRiskControlResponse(res, text) {

@@ -20,6 +20,8 @@
 .cdk-save-error button { background: transparent; color: inherit; text-decoration: underline; }
 .cdk-session-identity { display: flex; align-items: center; gap: 8px; padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px; font-size: 12px; color: var(--muted); background: var(--surface); }
 .cdk-session-identity strong { color: var(--green); font-weight: 500; white-space: nowrap; }
+.cdk-session-balance { display: grid; gap: 2px; text-align: right; flex-shrink: 0; }
+.cdk-session-balance small { font-size: 11px; color: var(--muted); }
 .cdk-session-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .cdk-current { position: relative; min-width: 0; }
 .cdk-current-heading { display: flex; align-items: center; gap: 5px; }

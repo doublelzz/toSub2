@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { providerOrderLifecycle } from "./sms-order-lifecycle.mjs";
 
 export const moneyAmount = value => /^(?:0|[1-9]\d{0,11})(?:\.\d{1,8})?$/.test(String(value ?? "")) ? String(value) : null;
 export function moneyCurrency(value) {
@@ -15,6 +16,7 @@ export function parseNumberOrder(text) {
   if (!data?.activationId || !/^\+?\d+$/.test(String(data.phoneNumber))) return null;
   const amount = moneyAmount(data.activationCost);
   return { requestId: String(data.activationId), number: String(data.phoneNumber).startsWith("+") ? String(data.phoneNumber) : `+${data.phoneNumber}`,
+    ...providerOrderLifecycle(data),
     ...(amount !== null ? { cost: { amount, currency: moneyCurrency(data.activationCurrency ?? data.currency), source: "order" } } : {}) };
 }
 

@@ -116,7 +116,7 @@ const childExit = new Promise((resolve) => child.once("exit", resolve));
 
 try {
   const bootstrap = await waitForJson(`${baseUrl}/api/bootstrap`);
-  assert.deepEqual(bootstrap.features.smsProviders.map((provider) => provider.id), ["luban", "smsbower", "herosms", "custom"]);
+  assert.deepEqual(bootstrap.features.smsProviders.map((provider) => provider.id), ["luban", "smsbower", "herosms", "custom", "pool"]);
   const headers = { "content-type": "application/json", "x-console-token": bootstrap.token };
   const optionsResponse = await fetch(`${baseUrl}/api/sms-providers/smsbower/options`, {
     method: "POST",

@@ -16,6 +16,7 @@ import { matchesTaskQuery, normalizeTaskQuery, summarizeTasks } from "./task-que
 import { ACCOUNT_SESSION_FILENAME, loadAccountInsights, publicAccountInsights } from "./account-insights.mjs";
 import { withSub2ApiExpiry, validateSub2ApiData, summarizeSub2ApiTokens, summarizeSub2ApiUpload, mergeSub2ApiCredentials } from "./sub2api-export.mjs";
 import { phoneVerificationStatus, recordSmsOrder, publicSmsSummary } from "./sms-orders.mjs";
+import { readPhoneEvidence, writePhoneEvidence } from "./phone-verification-evidence.mjs";
 import {
   fetchMailboxOtpCandidates,
   filterMailboxOtpCandidatesByRequestTime,
@@ -62,6 +63,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const TOOL_ROOT = path.resolve(__dirname, "..");
 const WORKSPACE_ROOT = TOOL_ROOT;
 export async function createConsoleWorkspace(options) {
+const smsPool = options.smsPool || null;
 const PROTOCOL_SCRIPT = path.resolve(options.protocolScript || process.env.ONBOARDING_PROTOCOL_SCRIPT || path.join(__dirname, "protocol-login.mjs"));
 const SUB2API_MONITOR_INTERVAL_MS = readDurationEnv("SUB2API_MONITOR_INTERVAL_MS", 5 * 60_000, 1_000);
 const SUB2API_AUTO_REPAIR_COOLDOWN_MS = readDurationEnv("SUB2API_AUTO_REPAIR_COOLDOWN_MS", 5 * 60_000, 0);
@@ -118,6 +120,7 @@ const sub2ApiMonitorState = {
 await fs.mkdir(OUTPUT_ROOT, { recursive: true, mode: 0o700 });
 await loadSub2ApiMonitorConfiguration();
 await syncCompletedOutputs(true);
+await recoverSmsPoolJobs();
 const mfaCredentialStore = createCredentialStore({
   windowsRoot: path.join(OUTPUT_ROOT, "mfa", "credentials"),
   macRoot: path.join(OUTPUT_ROOT, "mfa", "credentials"),
@@ -179,7 +182,8 @@ async function handleApi(req, res, requestUrl) {
         batchPhoneBinding: true,
         pagination: true,
         uniqueEmail: true,
-        smsProviders: publicSmsProviderDefinitions(),
+        smsProviders: [...publicSmsProviderDefinitions(), ...(smsPool ? [{ id: "pool", name: "接码池", description: "自动获取可用号码，验证成功后扣次", fields: [] }] : [])],
+        ...(smsPool ? { smsPool: await smsPool.summary() } : {}),
         queue: true,
         sourceExport: true,
         cancelAll: true,
@@ -244,7 +248,7 @@ async function handleApi(req, res, requestUrl) {
     const credentials = normalizeLoginCredentials(body);
     const hasProxyUpdate = Object.hasOwn(body, "proxyUrl");
     const hasPhoneBindingUpdate = Object.hasOwn(body, "phoneBindingEnabled") || Object.hasOwn(body, "phoneBindingMode");
-    const phoneOptions = normalizePhoneOptions(body);
+    const phoneOptions = normalizePhoneOptions(body, req.actorId);
     const { phoneBindingEnabled } = phoneOptions;
     const proxyUrl = hasProxyUpdate ? normalizeProxyUrl(body.proxyUrl) : null;
     const result = await withEmailJobLock(email, async () => {
@@ -265,7 +269,7 @@ async function handleApi(req, res, requestUrl) {
     const body = await readJson(req);
     const entries = parseBatchEntries(body.text, mailRequestConfig);
     const proxyUrl = normalizeProxyUrl(body.proxyUrl);
-    const phoneOptions = normalizePhoneOptions(body);
+    const phoneOptions = normalizePhoneOptions(body, req.actorId);
     const { phoneBindingEnabled } = phoneOptions;
     const settled = await Promise.allSettled(entries.map((entry) => withEmailJobLock(entry.email, async () => {
       const existing = findJobByEmail(entry.email);
@@ -317,6 +321,7 @@ async function handleApi(req, res, requestUrl) {
     );
     if (unsupported) throw httpError(409, `${unsupported.email} 当前仍在进行中，不能重新授权`);
     await Promise.all(selected.map((job) => withEmailJobLock(job.email, async () => {
+      captureSmsPoolActor(job, req.actorId);
       if (job.status === "completed") await regenerateJob(job, body);
       else await retryJob(job, body);
     })));
@@ -331,7 +336,7 @@ async function handleApi(req, res, requestUrl) {
     const outcomes = await Promise.all(selected.map((job) => withEmailJobLock(job.email, async () => {
       if (!canStartPhoneBinding(job)) return { skipped: true };
       try {
-        await startPhoneBinding(job, setup);
+        await startPhoneBinding(job, setup, req.actorId);
         return { job };
       } catch (error) {
         return { failure: { id: job.id, email: job.email, error: safeSmsProviderError(error, setup.config?.apiKey) } };
@@ -353,6 +358,7 @@ async function handleApi(req, res, requestUrl) {
     const selected = resolveSelectedJobs(body.ids);
     const started = await Promise.all(selected.map((job) => withEmailJobLock(job.email, async () => {
       if (!canForceRelogin(job)) return null;
+      captureSmsPoolActor(job, req.actorId);
       await forceReloginJob(job, body);
       return job;
     })));
@@ -594,7 +600,7 @@ async function handleApi(req, res, requestUrl) {
     const body = await readJson(req);
     await withEmailJobLock(job.email, async () => {
       const setup = validatedSmsSetup(body.smsProvider);
-      await startPhoneBinding(job, setup);
+      await startPhoneBinding(job, setup, req.actorId);
     });
     sendJson(res, 200, { job: publicJob(job) });
     return;
@@ -629,7 +635,7 @@ async function handleApi(req, res, requestUrl) {
     const config = action === "luban-number"
       ? { apiKey: body.apiKey, serviceId: body.serviceId }
       : body.config;
-    await withEmailJobLock(job.email, () => acquireSmsNumber(job, providerId, config));
+    await withEmailJobLock(job.email, () => { captureSmsPoolActor(job, req.actorId); return acquireSmsNumber(job, providerId, config); });
     sendJson(res, 200, { job: publicJob(job) });
     return;
   }
@@ -640,19 +646,19 @@ async function handleApi(req, res, requestUrl) {
   }
   if (req.method === "POST" && action === "retry") {
     const body = await readJson(req);
-    await withEmailJobLock(job.email, () => retryJob(job, body));
+    await withEmailJobLock(job.email, () => { captureSmsPoolActor(job, req.actorId); return retryJob(job, body); });
     sendJson(res, 200, { job: publicJob(job) });
     return;
   }
   if (req.method === "POST" && action === "regenerate") {
     const body = await readJson(req);
-    await withEmailJobLock(job.email, () => regenerateJob(job, body));
+    await withEmailJobLock(job.email, () => { captureSmsPoolActor(job, req.actorId); return regenerateJob(job, body); });
     sendJson(res, 200, { job: publicJob(job) });
     return;
   }
   if (req.method === "POST" && action === "relogin") {
     const body = await readJson(req);
-    await withEmailJobLock(job.email, () => forceReloginJob(job, body));
+    await withEmailJobLock(job.email, () => { captureSmsPoolActor(job, req.actorId); return forceReloginJob(job, body); });
     sendJson(res, 200, { job: publicJob(job) });
     return;
   }
@@ -681,6 +687,7 @@ async function handleApi(req, res, requestUrl) {
 async function sendJobsPage(res, requestedPage, emailFilter = null, filters = {}) {
   const query = normalizeTaskQuery(filters);
   await syncCompletedOutputs();
+  await refreshSmsPoolStates();
   const allJobs = listUniqueJobs();
   const emailSet = emailFilter?.length ? new Set(emailFilter) : null;
   const visibleJobs = allJobs.filter((job) => (!emailSet || emailSet.has(job.email.toLowerCase())) && matchesTaskQuery(job, query));
@@ -946,6 +953,13 @@ function normalizePhoneBinding(value) {
 
 function validatedSmsSetup(value) {
   if (!value || typeof value !== "object") throw httpError(400, "请先完成接码平台配置");
+  if (value.id === "pool") {
+    if (!smsPool) throw httpError(409, "当前接码池不可用");
+    const config = value.config || {};
+    if (typeof config !== "object" || Array.isArray(config) || Object.keys(config).some(key => key !== "quotedFee")) throw httpError(400, "接码池配置由管理员管理");
+    if (Object.hasOwn(config, "quotedFee") && (!Number.isSafeInteger(config.quotedFee) || config.quotedFee < 1)) throw httpError(400, "请重新确认接码池扣次");
+    return { id: "pool", config: Object.hasOwn(config, "quotedFee") ? { quotedFee: config.quotedFee } : {} };
+  }
   try {
     const client = createSmsProvider(value.id, value.config, { acquireCustomSmsEntry });
     if (!client) throw new Error("接码平台配置无效");
@@ -954,7 +968,12 @@ function validatedSmsSetup(value) {
   } catch (error) { throw httpError(400, safeSmsProviderError(error, value.config?.apiKey)); }
 }
 
-function normalizePhoneOptions(body) {
+function captureSmsPoolActor(job, actorId) {
+  if (typeof actorId === "string" && /^[a-zA-Z0-9_-]{1,120}$/.test(actorId)) job.smsPoolActorId = actorId;
+  else job.smsPoolActorId ||= options.cdkId;
+}
+
+function normalizePhoneOptions(body, actorId = options.cdkId) {
   const hasMode = Object.hasOwn(body, "phoneBindingMode");
   const hasLegacyFlag = Object.hasOwn(body, "phoneBindingEnabled");
   const legacyEnabled = hasLegacyFlag ? normalizePhoneBinding(body.phoneBindingEnabled) : true;
@@ -962,6 +981,7 @@ function normalizePhoneOptions(body) {
   const phoneBindingMode = body.phoneBindingMode ?? (hasLegacyFlag ? (legacyEnabled ? "automatic" : "manual") : "automatic");
   if (!["manual", "automatic"].includes(phoneBindingMode)) throw httpError(400, "接码策略无效");
   return { phoneBindingMode,
+    smsPoolActorId: actorId,
     phoneBindingEnabled: hasMode ? phoneBindingMode === "automatic" : legacyEnabled,
     smsSetup: phoneBindingMode === "automatic" && body.smsProvider ? validatedSmsSetup(body.smsProvider) : null };
 }
@@ -972,6 +992,7 @@ async function writeSmsSetup(job, setup) {
 }
 
 async function savePhoneOptions(job, options) {
+  captureSmsPoolActor(job, options.smsPoolActorId);
   job.phoneBindingMode = options.phoneBindingMode;
   job.phoneBindingRequested = false;
   await writeSmsSetup(job, options.smsSetup);
@@ -984,9 +1005,10 @@ function canStartPhoneBinding(job) {
     && (job.loginCheckpointAvailable || job.accountSessionAvailable || job.status === "phone_skipped");
 }
 
-async function startPhoneBinding(job, setup) {
+async function startPhoneBinding(job, setup, actorId) {
   assertMfaIdle(job.email);
   if (!canStartPhoneBinding(job)) throw httpError(409, "请等待登录完成；正在接码或手机已验证的任务无需重复取号");
+  captureSmsPoolActor(job, actorId);
   await writeSmsSetup(job, setup);
   job.phoneBindingEnabled = true;
   job.phoneBindingRequested = true;
@@ -1051,6 +1073,7 @@ async function createJobRecord(email, credentials = {}, proxyUrl = null, phoneBi
     loginMode,
     phoneBindingEnabled,
     phoneBindingMode: phoneOptions.phoneBindingMode || "manual",
+    smsPoolActorId: phoneOptions.smsPoolActorId || options.cdkId,
     phoneBindingRequested: false,
     phoneBindingStartedAt: null,
     phoneVerifiedAt: null,
@@ -1169,6 +1192,7 @@ function scheduleQueuedJobs(coordinator = false) {
 
 async function prepareAndLaunchJob(job, mode, queueRunId) {
   try {
+    await job.smsPoolTask;
     if (mode === "full" && (job.phoneBindingRequested || job.phoneBindingMode === "automatic")) {
       try { job.pendingSmsSetup = JSON.parse(await fs.readFile(path.join(path.dirname(job.outputPath), "sms-provider.json"), "utf8")); } catch { job.pendingSmsSetup = null; }
     }
@@ -1270,6 +1294,10 @@ function launchJob(job, options = {}) {
       CHATGPT_LOGIN_PASSWORD: job.password || "",
       CHATGPT_TOTP_SECRET: job.totpSecret || "",
       CHATGPT_NEW_PASSWORD: mode === "password_add" ? job.pendingNewPassword || "" : "",
+      TOSUB2_PHONE_CONTEXT_PATH: phonePoolPaths(job, runId).context,
+      TOSUB2_PHONE_RESULT_PATH: phonePoolPaths(job, runId).result,
+      TOSUB2_PHONE_JOB_ID: job.id,
+      TOSUB2_PHONE_RUN_ID: runId,
       CHATGPT_PROXY_URL: job.proxyUrl || "",
       CHATGPT_PROXY_MAX_ATTEMPTS: String(Math.max(0, MAX_PROXY_RISK_RETRIES - (job.proxyRiskRetryCount || 0))),
       TOSUB2_TLS_PROFILE:
@@ -1305,6 +1333,7 @@ function launchJob(job, options = {}) {
 
 async function handleChildClose(job, { code, signal, mode, runId }) {
   if (job.runId !== runId) return;
+  await queueSmsPoolTask(job, () => reconcileSmsPool(job, { finish: true, reason: "流程结束" }));
   job.accountInsightsDetecting = false;
   stopMailPolling(job);
   job.child = null;
@@ -2130,9 +2159,13 @@ function consumeOutput(job, rawText) {
     }
   }
   if (scan.includes("[ok] Phone OTP validated")) {
-    job.phoneVerifiedAt ||= new Date().toISOString();
-    completeSmsNumber(job);
+    if (job.smsPoolMode && job.smsPoolContext) void queueSmsPoolTask(job, () => reconcileSmsPool(job)).catch(() => {});
+    else {
+      job.phoneVerifiedAt ||= new Date().toISOString();
+      completeSmsNumber(job);
+    }
   }
+  if (scan.includes("[phone-verification-evidence]")) void queueSmsPoolTask(job, () => reconcileSmsPool(job)).catch(() => {});
   if (scan.includes("[5/5] Select workspace") || scan.includes("[6/6] Convert OAuth callback")) {
     setStage(job, "finalizing", "正在完成授权并生成文件");
   }
@@ -2411,12 +2444,285 @@ function acquireCustomSmsEntry(entries) {
   return entries[nextIndex];
 }
 
+function phonePoolPaths(job, runId = job.smsPoolContext?.runId || job.runId) {
+  const suffix = /^[a-f0-9-]{36}$/i.test(String(runId || "")) ? runId : "unavailable";
+  const directory = path.dirname(job.outputPath);
+  return { context: path.join(directory, `phone-pool-context-${suffix}.json`), result: path.join(directory, `phone-pool-result-${suffix}.json`) };
+}
+
+function publicPoolBilling(job) {
+  const value = job.smsPoolBilling;
+  if (!value || !job.smsPoolOperationId) return null;
+  return { state: String(value.state || "reserved"), fee: Number(value.fee) || 0, reserved: Number(value.reserved) || 0,
+    operationId: job.smsPoolOperationId };
+}
+
+function updatePoolBilling(job, value) {
+  if (value) job.smsPoolBilling = { state: value.state, fee: Number(value.fee) || 0, reserved: Number(value.reserved) || 0, maxAttempts: Number(value.maxAttempts) || MAX_SMS_NUMBER_MAX_ATTEMPTS };
+  touch(job);
+}
+
+function queueSmsPoolTask(job, callback) {
+  const task = (job.smsPoolTask || Promise.resolve()).catch(() => {}).then(callback);
+  job.smsPoolTask = task.catch(async () => {
+    if (job.smsPoolOperationId && !["verified", "released"].includes(job.smsPoolBilling?.state)) {
+      updatePoolBilling(job, { ...job.smsPoolBilling, state: "unknown" });
+      job.smsError = "接码结算结果待核实，请稍后检查";
+      await saveJobMetadata(job).catch(() => {});
+    }
+  });
+  return task;
+}
+
+async function reconcileSmsPool(job, { finish = false, reason = "" } = {}) {
+  if (!smsPool || !job.smsPoolOperationId) return;
+  if (job.smsPoolBilling?.state === "queued") {
+    if (finish) updatePoolBilling(job, { ...job.smsPoolBilling, state: "released", reserved: 0 });
+    await saveJobMetadata(job);
+    return;
+  }
+  if (job.smsPoolBilling?.state === "unknown") {
+    const recovered = await smsPool.recover(job.smsPoolOperationId);
+    updatePoolBilling(job, recovered);
+    if (["verified", "released"].includes(recovered.state)) {
+      job.smsPoolSubmissionPending = false;
+      job.smsError = null;
+      if (recovered.state === "verified") {
+        job.phoneVerifiedAt ||= recovered.settledAt ? new Date(recovered.settledAt).toISOString() : new Date().toISOString();
+        const context = job.smsPoolContext;
+        const history = job.smsOrders?.find(row => row.orderId === context?.orderId && row.providerId === context?.providerId);
+        if (history) history.verifiedAt = job.phoneVerifiedAt;
+        if (context && job.smsOrderId === context.orderId && job.smsClient) completeSmsNumber(job);
+        else job.smsStatus = "completed";
+      } else job.smsStatus = "idle";
+      await saveJobMetadata(job);
+      return;
+    }
+  }
+  if (job.smsPoolBilling?.state === "released") { job.smsPoolSubmissionPending = false; await saveJobMetadata(job); return; }
+  let evidence = null;
+  if (job.smsPoolContext) {
+    try { evidence = await readPhoneEvidence(phonePoolPaths(job).result, job.smsPoolContext); }
+    catch { job.smsPoolSubmissionPending = true; }
+  }
+  if (evidence?.state === "verified") {
+    const context = job.smsPoolContext;
+    if (job.smsPoolBilling?.state !== "verified") {
+      const billing = await smsPool.verified({ operationId: job.smsPoolOperationId, allocationId: context.allocationId,
+        providerId: context.providerId, orderId: context.orderId, jobId: context.jobId, runId: context.runId, evidence });
+      updatePoolBilling(job, billing);
+    }
+    job.smsPoolSubmissionPending = false;
+    job.phoneVerifiedAt ||= evidence.verifiedAt || evidence.at;
+    const history = job.smsOrders?.find(row => row.orderId === context.orderId && row.providerId === context.providerId);
+    if (history) history.verifiedAt = job.phoneVerifiedAt;
+    if (job.smsOrderId === context.orderId && job.smsClient) completeSmsNumber(job);
+  } else if (evidence?.state === "rejected") job.smsPoolSubmissionPending = false;
+  else if (["pending", "unknown"].includes(evidence?.state)) job.smsPoolSubmissionPending = true;
+  if (finish && !["verified", "released"].includes(job.smsPoolBilling?.state)) {
+    if (evidence?.state === "rejected" && job.smsPoolContext) await smsPool.abandon({ operationId: job.smsPoolOperationId,
+      allocationId: job.smsPoolContext.allocationId, reason: "手机验证码已被明确拒绝", confirmedFailure: true });
+    const value = await smsPool.release({ operationId: job.smsPoolOperationId, reason,
+      uncertain: Boolean(job.smsPoolSubmissionPending || job.smsPoolBilling?.state === "unknown") });
+    updatePoolBilling(job, value);
+  }
+  await saveJobMetadata(job);
+}
+
+async function refreshSmsPoolStates() {
+  if (!smsPool) return;
+  await Promise.allSettled([...jobs.values()].filter(job => job.smsPoolOperationId && job.smsPoolBilling?.state === "unknown")
+    .map(job => queueSmsPoolTask(job, () => reconcileSmsPool(job))));
+}
+
+async function abandonPoolAllocation(job, reason) {
+  if (!smsPool || !job.smsPoolOperationId || !job.smsPoolContext) return;
+  await reconcileSmsPool(job);
+  if (job.smsPoolSubmissionPending || job.smsPoolBilling?.state === "unknown") throw httpError(409, "上次手机验证结果待核实，暂不能更换号码");
+  if (job.smsPoolBilling?.state === "verified") return;
+  const context = job.smsPoolContext;
+  const evidence = await readPhoneEvidence(phonePoolPaths(job).result, context);
+  await smsPool.abandon({ operationId: job.smsPoolOperationId, allocationId: context.allocationId, reason,
+    confirmedFailure: evidence?.state === "rejected" });
+  job.smsPoolContext = null;
+  await fs.rm(phonePoolPaths(job, context.runId).context, { force: true });
+  await fs.rm(phonePoolPaths(job, context.runId).result, { force: true });
+  await saveJobMetadata(job);
+}
+
+async function recoverSmsPoolJobs() {
+  if (!smsPool) return;
+  for (const job of jobs.values()) {
+    if (!job.smsPoolOperationId) continue;
+    try {
+      const recovered = await smsPool.recover(job.smsPoolOperationId);
+      updatePoolBilling(job, recovered);
+      if (recovered?.allocation) {
+        const allocation = recovered.allocation;
+        job.smsPoolContext ||= { operationId: job.smsPoolOperationId, allocationId: allocation.allocationId,
+          jobId: job.id, runId: allocation.runId || recovered.runId, orderId: allocation.order?.requestId, providerId: allocation.providerId };
+        if (allocation.config) {
+          job.smsProviderConfig = allocation.config;
+          job.smsProviderId = allocation.providerId;
+          job.smsClient = allocation.client || poolProviderClient(allocation.providerId, allocation.config);
+          job.smsOrderId = allocation.order?.requestId || job.smsOrderId;
+        }
+      }
+      await reconcileSmsPool(job, { finish: true, reason: "重启恢复" });
+    } catch (error) {
+      if (error.status === 404) {
+        job.smsPoolOperationId = null;
+        job.smsPoolBilling = null;
+        job.smsPoolContext = null;
+        job.smsPoolSubmissionPending = false;
+      } else {
+        updatePoolBilling(job, { ...job.smsPoolBilling, state: "unknown" });
+        job.smsPoolSubmissionPending = true;
+      }
+      await saveJobMetadata(job).catch(() => {});
+    }
+  }
+}
+
+function poolProviderClient(providerId, config) {
+  return createSmsProvider(providerId, config, { lubanApiBase: process.env.LUBAN_SMS_API_BASE,
+    smsBowerApiBase: process.env.SMSBOWER_API_BASE, heroSmsApiBase: process.env.HERO_SMS_API_BASE });
+}
+
+async function acquirePoolSmsNumber(job, config) {
+  validatedSmsSetup({ id: "pool", config });
+  await job.smsPoolTask;
+  if (job.smsPoolBilling?.state === "unknown" || job.smsPoolSubmissionPending) {
+    await queueSmsPoolTask(job, () => reconcileSmsPool(job));
+    if (job.smsPoolBilling?.state === "unknown" || job.smsPoolSubmissionPending) throw httpError(409, "上次接码结果待核实，暂不能再次取号");
+  }
+  if (job.smsPoolContext && !["verified", "released"].includes(job.smsPoolBilling?.state)) {
+    await queueSmsPoolTask(job, () => abandonPoolAllocation(job, "更换号码"));
+  }
+  if (!job.smsPoolOperationId || ["verified", "released"].includes(job.smsPoolBilling?.state)) {
+    job.smsPoolOperationId = crypto.randomUUID();
+    job.smsPoolContext = null;
+    job.smsPoolSubmissionPending = false;
+    job.smsNumberAttempt = 0;
+    job.smsPoolExpectedFee = config?.quotedFee ?? (await smsPool.summary()).fee;
+    updatePoolBilling(job, { state: "queued", fee: job.smsPoolExpectedFee, reserved: 0 });
+    await saveJobMetadata(job);
+  }
+  job.smsPoolMode = true;
+  job.phoneBindingStartedAt ||= new Date().toISOString();
+  job.phoneBindingRequested = true;
+  job.smsNumberMaxAttempts = job.smsPoolBilling?.maxAttempts || MAX_SMS_NUMBER_MAX_ATTEMPTS;
+  job.smsNumberRetryIntervalMs = DEFAULT_SMS_NUMBER_RETRY_INTERVAL_MS;
+  startPoolSmsNumberAcquisition(job);
+}
+
+function startPoolSmsNumberAcquisition(job) {
+  const token = crypto.randomUUID();
+  const runId = job.runId;
+  const operationId = job.smsPoolOperationId;
+  job.smsNumberAcquisitionToken = token;
+  job.smsStatus = "requesting";
+  job.smsError = null;
+  job.smsRetryPending = false;
+  touch(job);
+  const operation = (async () => {
+    await job.smsPoolTask;
+    const canContinue = () => !shuttingDown && options.isEnabled() && job.smsNumberAcquisitionToken === token
+      && job.runId === runId && job.status === "phone" && Boolean(job.child);
+    if (!canContinue() && ["queued", "released"].includes(job.smsPoolBilling?.state)) {
+      updatePoolBilling(job, { ...job.smsPoolBilling, state: "released", reserved: 0 });
+      job.smsStatus = "idle";
+      return;
+    }
+    let reserved = job.smsPoolBilling?.state !== "queued";
+    while (!reserved) {
+      if (!canContinue()) {
+        updatePoolBilling(job, { ...job.smsPoolBilling, state: "released", reserved: 0 });
+        job.smsStatus = "idle";
+        return;
+      }
+      try {
+        const billing = await smsPool.begin({ operationId, jobId: job.id, email: job.email, runId,
+          expectedFee: job.smsPoolExpectedFee, actorId: job.smsPoolActorId || options.cdkId });
+        updatePoolBilling(job, billing);
+        job.smsNumberMaxAttempts = billing.maxAttempts || MAX_SMS_NUMBER_MAX_ATTEMPTS;
+        reserved = true;
+        await saveJobMetadata(job);
+      } catch (error) {
+        if (error.code !== "SMS_POOL_BUSY") throw error;
+        updatePoolBilling(job, { state: "queued", fee: job.smsPoolExpectedFee, reserved: 0 });
+        job.smsError = "等待接码池空闲名额，尚未预留或扣除次数";
+        await saveJobMetadata(job);
+        await delay(500);
+      }
+    }
+    if (!canContinue()) {
+      updatePoolBilling(job, await smsPool.release({ operationId, reason: "排队任务已停止" }));
+      return;
+    }
+    job.smsError = null;
+    const allocation = await smsPool.getNumber({ operationId });
+    const client = allocation.client || poolProviderClient(allocation.providerId, allocation.config);
+    await withEmailJobLock(job.email, async () => {
+      if (job.smsNumberAcquisitionToken !== token || job.runId !== runId || job.status !== "phone" || !job.child) {
+        await client.release(allocation.order.requestId).catch(() => {});
+        await smsPool.abandon({ operationId, allocationId: allocation.allocationId, reason: "取号后任务已停止" });
+        updatePoolBilling(job, await smsPool.release({ operationId, reason: "取号后任务已停止" }));
+        return;
+      }
+      job.smsNumberAttempt += 1;
+      job.smsClient = client;
+      job.smsProviderId = allocation.providerId;
+      job.smsProviderName = "接码池";
+      job.smsServiceLabel = "管理员接码池";
+      job.smsProviderConfig = allocation.config;
+      job.smsOrderId = String(allocation.order.requestId);
+      job.smsNumber = allocation.order.number;
+      job.smsStatus = "number_acquired";
+      job.smsPoolContext = { operationId, allocationId: allocation.allocationId, jobId: job.id, runId,
+        orderId: job.smsOrderId, providerId: allocation.providerId };
+      job.smsPoolSubmissionPending = false;
+      const history = recordSmsOrder(job, allocation.order);
+      history.poolEntryId = allocation.poolEntryId || allocation.entryId;
+      history.poolOperationId = operationId;
+      await writePhoneEvidence(phonePoolPaths(job, runId).context, { version: 1, ...job.smsPoolContext, phone: allocation.order.number });
+      await saveJobMetadata(job);
+      await submitJobInput(job, { action: "phone", value: allocation.order.number }, { source: "sms-provider" });
+    });
+  })();
+  job.smsNumberAcquisitionPromise = operation;
+  void operation.catch(async error => {
+    if (job.smsPoolOperationId !== operationId) return;
+    job.smsStatus = "error";
+    job.smsError = error.code === "SMS_POOL_FEE_CHANGED" ? "接码池收费已变更，请重新确认后开始"
+      : error.code === "INSUFFICIENT_QUOTA" ? "可用次数不足以使用接码池，请补充次数后重试"
+      : "接码池暂未取得可用号码，请稍后重试";
+    if (job.smsPoolBilling?.state === "queued") updatePoolBilling(job, { ...job.smsPoolBilling, state: "released", reserved: 0 });
+    else {
+      try { updatePoolBilling(job, await smsPool.release({ operationId, reason: error.code || "取号失败", uncertain: Boolean(error.uncertain) })); }
+      catch { updatePoolBilling(job, { ...job.smsPoolBilling, state: "unknown" }); }
+    }
+    touch(job);
+    await saveJobMetadata(job);
+  }).finally(async () => {
+    if (job.smsNumberAcquisitionPromise === operation) job.smsNumberAcquisitionPromise = null;
+    touch(job);
+    await saveJobMetadata(job).catch(() => {});
+  });
+}
+
 async function acquireSmsNumber(job, providerId, config) {
   if (job.phoneBindingEnabled === false) throw httpError(409, "该任务已关闭接码，不会申请手机号");
   requireStage(job, "phone");
   if (job.smsStatus === "requesting" || job.smsNumberAcquisitionPromise) {
     throw httpError(409, "正在获取手机号，请不要重复提交");
   }
+  if (providerId === "pool") return acquirePoolSmsNumber(job, config);
+  if (job.smsPoolOperationId && !["verified", "released"].includes(job.smsPoolBilling?.state)) {
+    await queueSmsPoolTask(job, () => reconcileSmsPool(job, { finish: true, reason: "切换接码方式" }));
+    if (job.smsPoolBilling?.state === "unknown") throw httpError(409, "上次接码结果待核实，请先核对结果");
+  }
+  job.smsPoolMode = false;
 
   let smsClient;
   try {
@@ -2471,6 +2777,7 @@ function normalizeSmsNumberRetryConfig(config = {}) {
 }
 
 function startSmsNumberAcquisition(job, { resetAttempts = true } = {}) {
+  if (job.smsPoolMode) { startPoolSmsNumberAcquisition(job); return; }
   if (!job.smsProviderConfig || !job.smsProviderId) return;
   if (resetAttempts) job.smsNumberAttempt = 0;
   const token = crypto.randomUUID();
@@ -2751,6 +3058,17 @@ function stopSmsPolling(job) {
 }
 
 function releaseSmsNumber(job, nextStatus = "idle", errorMessage = null, options = {}) {
+  if (job.smsPoolOperationId && !options.poolHandled && !["verified", "released"].includes(job.smsPoolBilling?.state)) {
+    job.smsNumberAcquisitionToken = null;
+    job.smsRetryPending = false;
+    void queueSmsPoolTask(job, async () => {
+      await reconcileSmsPool(job, { finish: !options.automaticRotation, reason: errorMessage || "接码结束" });
+      if (job.smsPoolSubmissionPending || job.smsPoolBilling?.state === "unknown") return;
+      if (options.automaticRotation) await abandonPoolAllocation(job, errorMessage || "更换号码");
+      releaseSmsNumber(job, nextStatus, errorMessage, { ...options, poolHandled: true });
+    }).catch(() => {});
+    return;
+  }
   const preserveProvider = options.automaticRotation === true;
   job.smsNumberAcquisitionToken = null;
   job.smsRetryPending = false;
@@ -2769,6 +3087,9 @@ function releaseSmsOrder(job, nextStatus = "idle", errorMessage = null) {
   const requestId = job.smsOrderId;
   const smsClient = job.smsClient;
   const history = job.smsOrders?.find(order => order.orderId === requestId && order.providerId === job.smsProviderId);
+  if (job.smsPoolContext && requestId === job.smsPoolContext.orderId && !job.smsPoolSubmissionPending && !["verified", "released"].includes(job.smsPoolBilling?.state)) {
+    void queueSmsPoolTask(job, () => abandonPoolAllocation(job, errorMessage || "号码释放")).catch(() => {});
+  }
   if (history && !history.verifiedAt) {
     history.status = "cancel_pending";
     history.endedAt = new Date().toISOString();
@@ -2946,7 +3267,16 @@ async function submitJobInput(job, body, options = {}) {
   } else if (action === "phone") {
     requireStage(job, "phone");
     if (!/^\+[1-9]\d{6,14}$/.test(value)) throw httpError(400, "Phone number must use E.164 format, for example +60123456789");
-    if (options.source !== "sms-provider") releaseSmsNumber(job, "idle");
+    if (options.source !== "sms-provider") {
+      if (job.smsPoolOperationId) {
+        await queueSmsPoolTask(job, () => reconcileSmsPool(job, { finish: true, reason: "手动输入其他手机号" }));
+        if (job.smsPoolSubmissionPending || job.smsPoolBilling?.state === "unknown") throw httpError(409, "上次接码结果待核实，暂不能改用其他手机号");
+        if (job.smsPoolContext) await fs.rm(phonePoolPaths(job).context, { force: true });
+        job.smsPoolContext = null;
+        job.smsPoolMode = false;
+      }
+      releaseSmsNumber(job, "idle");
+    }
     job.currentPhone = value;
     job.phoneError = null;
     inputValue = value;
@@ -2954,6 +3284,15 @@ async function submitJobInput(job, body, options = {}) {
   } else if (action === "phone_otp") {
     requireStage(job, "phone_otp");
     if (!/^\d{4,8}$/.test(value)) throw httpError(400, "Phone code must be 4 to 8 digits");
+    if (job.smsPoolContext && job.smsOrderId === job.smsPoolContext.orderId) {
+      await queueSmsPoolTask(job, () => reconcileSmsPool(job));
+      if (job.smsPoolBilling?.state === "unknown" || job.smsPoolContext.runId !== job.runId || ["verified", "released"].includes(job.smsPoolBilling?.state)) {
+        throw httpError(409, "原接码会话已结束或结果待核实，请核对结果后重新取号");
+      }
+      await smsPool.noteSubmitted({ operationId: job.smsPoolOperationId, allocationId: job.smsPoolContext.allocationId, orderId: job.smsOrderId });
+      job.smsPoolSubmissionPending = true;
+      await saveJobMetadata(job);
+    }
     stopSmsPolling(job);
     if (job.smsOrderId) job.smsStatus = options.source === "sms-provider" ? "submitted" : "manual_submitted";
     job.phoneError = null;
@@ -2968,6 +3307,7 @@ async function submitJobInput(job, body, options = {}) {
     setStage(job, "working", job.currentPhone ? `正在向 ${job.currentPhone} 重新发送验证码` : "正在重新发送手机验证码");
   } else if (action === "change_phone") {
     requireStage(job, "phone_otp");
+    if (job.smsPoolContext) await queueSmsPoolTask(job, () => abandonPoolAllocation(job, "返回换号步骤"));
     const preservedPhoneError = options.preservePhoneError ? job.phoneError : null;
     releaseSmsNumber(
       job,
@@ -3036,6 +3376,11 @@ async function cancelJob(job) {
     return;
   }
   stopMailPolling(job);
+  if (job.smsPoolOperationId) {
+    const child = job.child;
+    if (child) { child.kill("SIGTERM"); await waitForChildExit(child, 3_000); }
+    await queueSmsPoolTask(job, () => reconcileSmsPool(job, { finish: true, reason: "取消接码" }));
+  }
   job.runId = crypto.randomUUID();
   job.queueRunId = null;
   job.pendingSmsSetup = null;
@@ -3791,6 +4136,24 @@ async function exportSourceAccounts(res, ids) {
   res.end(payload);
 }
 
+function publicJobSmsSummary(job) {
+  const summary = publicSmsSummary(job);
+  if (!summary.orders.some(order => order.poolOperationId)) return summary;
+  const redactCost = order => {
+    if (!order?.poolOperationId) return order;
+    const row = { ...order, costHidden: true };
+    for (const field of ["amount", "currency", "amountSource", "quote", "maxPrice", "quoteCurrency", "country", "poolEntryId", "inventoryId"]) delete row[field];
+    row.providerId = "pool";
+    row.providerName = "接码池";
+    return row;
+  };
+  summary.orders = summary.orders.map(redactCost);
+  summary.latest = redactCost(summary.latest);
+  summary.totals = publicSmsSummary({ ...job, smsOrders: (job.smsOrders || []).filter(order => !order.poolOperationId) }).totals;
+  summary.poolCostHidden = true;
+  return summary;
+}
+
 function publicJob(job) {
   const autoRepair = getAutoRepairEligibility(job);
   return {
@@ -3801,7 +4164,8 @@ function publicJob(job) {
     phoneBindingMode: job.phoneBindingMode || "manual",
     phoneVerificationStatus: phoneVerificationStatus(job),
     canStartPhoneBinding: canStartPhoneBinding(job),
-    smsSummary: publicSmsSummary(job),
+    smsSummary: publicJobSmsSummary(job),
+    smsPoolBilling: publicPoolBilling(job),
     prompt: job.status === "queued"
       ? `排队中，前方还有 ${Math.max(0, getQueuePosition(job) - 1)} 条任务`
       : job.prompt,
@@ -3828,9 +4192,9 @@ function publicJob(job) {
     totpSetupError: job.totpSetupError || null,
     passwordAddError: job.passwordAddError || null,
     passwordAddedAt: job.passwordAddedAt || null,
-    smsProviderId: job.smsProviderId,
-    smsProviderName: job.smsProviderName,
-    smsServiceLabel: job.smsServiceLabel,
+    smsProviderId: job.smsPoolMode ? "pool" : job.smsProviderId,
+    smsProviderName: job.smsPoolMode ? "接码池" : job.smsProviderName,
+    smsServiceLabel: job.smsPoolMode ? "接码池" : job.smsServiceLabel,
     smsStatus: job.smsStatus,
     smsError: job.smsError,
     smsNumberAttempt: Number(job.smsNumberAttempt || 0),
@@ -4638,6 +5002,13 @@ function restoredCredentialFlags(metadata = {}, credentials = {}) {
     phoneBindingRequested: metadata.phone_binding_requested === true,
     phoneBindingStartedAt: metadata.phone_binding_started_at || null,
     phoneVerifiedAt: metadata.phone_verified_at || (metadata.sms_status === "completed" ? metadata.updated_at : null),
+    smsPoolOperationId: metadata.sms_pool_operation_id || null,
+    smsPoolBilling: metadata.sms_pool_billing || null,
+    smsPoolContext: metadata.sms_pool_context || null,
+    smsPoolSubmissionPending: metadata.sms_pool_submission_pending === true,
+    smsPoolMode: metadata.sms_pool_mode === true,
+    smsPoolExpectedFee: Number.isSafeInteger(metadata.sms_pool_expected_fee) ? metadata.sms_pool_expected_fee : null,
+    smsPoolActorId: typeof metadata.sms_pool_actor_id === "string" ? metadata.sms_pool_actor_id : options.cdkId,
     smsOrders: Array.isArray(metadata.sms_orders) ? metadata.sms_orders : [],
     accountSessionAvailable: metadata.account_session_available === true || metadata.status === "phone_skipped",
     accountInsightsSource: metadata.account_insights_source === "session" ? "session" : null,
@@ -5243,6 +5614,13 @@ async function saveJobMetadata(job) {
         phone_binding_started_at: job.phoneBindingStartedAt || null,
         phone_verified_at: job.phoneVerifiedAt || null,
         sms_orders: job.smsOrders || [],
+        sms_pool_operation_id: job.smsPoolOperationId || null,
+        sms_pool_billing: publicPoolBilling(job),
+        sms_pool_context: job.smsPoolContext || null,
+        sms_pool_submission_pending: Boolean(job.smsPoolSubmissionPending),
+        sms_pool_mode: Boolean(job.smsPoolMode),
+        sms_pool_expected_fee: job.smsPoolExpectedFee ?? null,
+        sms_pool_actor_id: job.smsPoolActorId || options.cdkId,
         account_session_available: Boolean(job.accountSessionAvailable),
         account_insights_return_status: job.accountInsightsReturnStatus || null,
         account_insights_source: job.accountInsightsSource || null,
@@ -5549,8 +5927,10 @@ async function shutdown() {
     await Promise.allSettled(activeJobs.map((job) => cancelJob(job)));
     await Promise.allSettled([
       ...childWaits,
+      ...[...jobs.values()].flatMap((job) => [job.smsPoolTask, job.smsNumberAcquisitionPromise]).filter(Boolean),
       ...[...jobs.values()].map((job) => job.metadataWritePromise).filter(Boolean),
     ]);
+    await Promise.allSettled([...jobs.values()].map(job => job.metadataWritePromise).filter(Boolean));
   })();
   return shutdownPromise;
 }
@@ -5571,9 +5951,9 @@ function waitForChildExit(child, timeoutMs) {
   });
 }
 
-async function dispatch(method, pathname, body = {}) {
+async function dispatch(method, pathname, body = {}, actorId = options.cdkId) {
   let response;
-  const req = Readable.from([]); req.method = method; req.headers = { "x-console-token": consoleToken }; req.jsonBody = body;
+  const req = Readable.from([]); req.method = method; req.headers = { "x-console-token": consoleToken }; req.jsonBody = body; req.actorId = actorId;
   const res = { headersSent: false, headers: {}, setHeader(name, value) { this.headers[name] = value; }, writeHead(status, headers) { this.headersSent = true; response = { status, headers: { ...this.headers, ...headers } }; }, end(value) { response = { ...response, body: Buffer.from(value || "") }; } };
   await handleApi(req, res, new URL(pathname, "http://workspace.internal"));
   return response || { status: 204, headers: {}, body: Buffer.alloc(0) };
@@ -5597,14 +5977,14 @@ function planImport(mode, body) {
   return [...new Set(emails)];
 }
 
-async function applyImport(mode, body) {
+async function applyImport(mode, body, actorId = options.cdkId) {
   const emails = planImport(mode, body);
   const route = mode === "rebind" ? "/api/rebind/sync" : mode === "mfa" ? "/api/mfa/import" : mode === "single" ? "/api/jobs" : "/api/jobs/batch";
   const activeUpdate = mode !== "mfa" && emails.some((email) => { const job = findJobByEmail(email); return job && isActive(job.status) && job.status !== "queued"; });
   if (activeUpdate) {
     if (emails.some((email) => !findJobByEmail(email))) { const error = httpError(409, "请将新增账号与进行中的账号更新分别导入"); error.importRolledBack = true; throw error; }
     try {
-      const response = await dispatch("POST", route, body);
+      const response = await dispatch("POST", route, body, actorId);
       if (response.status >= 400) throw httpError(response.status, JSON.parse(response.body.toString()).error || "账号更新失败");
       return { status: response.status, data: JSON.parse(response.body.toString()) };
     } catch (error) { error.importUpdateOnly = true; throw error; }
@@ -5624,7 +6004,7 @@ async function applyImport(mode, body) {
   }
   const pausedBefore = queueSchedulingPaused; queueSchedulingPaused = true;
   try {
-    const response = await dispatch("POST", route, body);
+    const response = await dispatch("POST", route, body, actorId);
     if (response.status >= 400) throw httpError(response.status, JSON.parse(response.body.toString()).error || "导入失败");
     return { status: response.status, data: JSON.parse(response.body.toString()) };
   } catch (error) {
@@ -5654,6 +6034,7 @@ return {
   },
   inventory() { return [...new Set([...listUniqueJobs().map((job) => job.email.toLowerCase()), ...mfaWorkspace.list().accounts.map((account) => account.email.toLowerCase())])]; },
   publicJobs: () => listUniqueJobs().map(publicJob),
+  refreshPoolStatus: refreshSmsPoolStates,
   activeCount: () => [...jobs.values()].filter(occupiesActiveSlot).length,
   pendingCount: () => [...jobs.values()].filter((job) => job.status === "queued").length,
   resume() { queueSchedulingPaused = false; scheduleQueuedJobs(); },

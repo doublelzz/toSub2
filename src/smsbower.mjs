@@ -1,4 +1,5 @@
 import { parseNumberOrder } from "./sms-orders.mjs";
+import { SHORT_ACTIVATION_POLICIES, withShortActivationLifecycle, inspectActivationStatus, cancellationReceipt } from "./sms-order-lifecycle.mjs";
 const DEFAULT_API_BASE = "https://smsbower.page/stubs/handler_api.php";
 const DEFAULT_TIMEOUT_MS = 12_000;
 
@@ -16,6 +17,7 @@ export function createSmsBowerClient(options = {}) {
   const apiBase = new URL(options.apiBase || DEFAULT_API_BASE);
   const fetchImpl = options.fetchImpl || fetch;
   const timeoutMs = options.timeoutMs || DEFAULT_TIMEOUT_MS;
+  const now = options.now || Date.now;
 
   if (!apiKey) return null;
   if (!/^https?:$/.test(apiBase.protocol)) throw new Error("SMSBower API 地址必须使用 HTTP 或 HTTPS");
@@ -48,21 +50,27 @@ export function createSmsBowerClient(options = {}) {
     }
   }
 
-  async function setStatus(activationId, status) {
+  async function setStatus(activationId, status, expected) {
     const text = await request("setStatus", { id: activationId, status });
-    if (["ACCESS_READY", "ACCESS_RETRY_GET", "ACCESS_ACTIVATION", "ACCESS_CANCEL"].includes(text)) return true;
+    if (text === expected) return true;
     throw responseError(text, "更新号码状态失败");
   }
+  const cancelStrict = async (activationId) => {
+    await setStatus(activationId, 8, "ACCESS_CANCEL");
+    return cancellationReceipt(activationId);
+  };
 
   return {
+    activationPolicy: SHORT_ACTIVATION_POLICIES.smsbower,
     async getNumber(service, country, maxPrice = "", providerIds = "") {
       const params = { service, country };
       if (maxPrice !== "") params.maxPrice = maxPrice;
       if (providerIds !== "") params.providerIds = providerIds;
+      const requestedAt = now();
       const text = await request("getNumber", params);
       const order = parseNumberOrder(text);
       if (!order) throw responseError(text, "获取手机号失败");
-      return { ...order, number: normalizePhoneNumber(order.number) };
+      return withShortActivationLifecycle({ ...order, number: normalizePhoneNumber(order.number) }, "smsbower", requestedAt, now());
     },
 
     async getPriceOptions(service) {
@@ -96,16 +104,19 @@ export function createSmsBowerClient(options = {}) {
     },
 
     markReady(activationId) {
-      return setStatus(activationId, 1);
+      return setStatus(activationId, 1, "ACCESS_READY");
     },
 
     complete(activationId) {
-      return setStatus(activationId, 6);
+      return setStatus(activationId, 6, "ACCESS_ACTIVATION");
     },
 
     release(activationId) {
-      return setStatus(activationId, 8);
+      return setStatus(activationId, 8, "ACCESS_CANCEL");
     },
+    inspect: async (activationId) => inspectActivationStatus(await request("getStatus", { id: activationId })),
+    cancelStrict,
+    cancelReceipt: cancelStrict,
   };
 }
 

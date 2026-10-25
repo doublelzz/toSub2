@@ -30,6 +30,7 @@ const page = (name) => () => React.createElement("section", { "data-fixture-page
 const { App } = await loadComponents("../web/src/main.jsx", ["App"], {
   ...filters, ...smsOptions, ...ui,
   MfaWorkspace: page("mfa"), EmailRebindWorkspace: page("rebind"),
+  SmsPoolWorkspace: page("sms-pool"), SmsPoolChoice: () => null, SmsPoolChargeDialog: () => null,
   CdkWorkspace: ({ section }) => React.createElement("section", { "data-fixture-page": `cdk-${section}` }),
   CurrentCdk: () => null, SmsPriceSelector: () => null,
   readWorkspaceValue: () => null, writeWorkspaceValue: () => {}, flushWorkspaceSettings: async () => {},
@@ -65,7 +66,7 @@ async function close() {
 
 try {
   await act(async () => root.render(React.createElement(App, { auth })));
-  for (const label of ["CDK 管理", "安全中心", "我的 CDK", "MFA 修改", "邮箱换绑", "账号授权"]) {
+  for (const label of ["CDK 管理", "安全中心", "我的 CDK", "MFA 修改", "邮箱换绑", "接码池", "账号授权"]) {
     await act(() => button(container.querySelector(".workspace-tabs"), label).click());
     const currentPage = container.querySelector(".workspace-path strong").textContent;
     for (const [selector, title] of [[".sub2api-toolbar", "Sub2API 配置"], [".mail-request-toolbar", "邮件 API 请求配置"], [".sms-provider-toolbar", "接码平台配置"]]) {
@@ -82,7 +83,7 @@ try {
   }
   assert.equal(container.querySelector(".global-error"), null);
   assert.equal(requests.some((request) => /sub2api|sms/.test(request.url)), false, "opening configuration must not contact remote account services");
-  console.log("workspace settings UI passed (all six workspaces, three shared configurations, Escape and scroll restoration)");
+  console.log("workspace settings UI passed (all seven workspaces, three shared configurations, Escape and scroll restoration)");
 } finally {
   await act(() => root.unmount());
   dom.window.close();
