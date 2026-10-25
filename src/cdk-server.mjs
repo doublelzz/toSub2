@@ -9,6 +9,7 @@ import { acquireCdkLock } from "./cdk-lock.mjs";
 import { cdkError, clientIp, normalizeClientIp, readRequestJson, requireSameOrigin } from "./cdk-security.mjs";
 import { assertOfferAccess } from "./offer-workspace.mjs";
 import { createSmsPool } from "./sms-pool.mjs";
+import { createAtPhoneWorkspace } from "./at-phone-workspace.mjs";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cookieName = "tosub2_session";
@@ -56,7 +57,7 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
   const vault = await createCdkVault(root); const store = await createCdkStore(root, vault);
   const smsPool = createSmsPool({ store, ...smsPoolOptions });
   const namespace = crypto.createHash("sha256").update(root).digest("hex");
-  const workspaces = new Map(); const creating = new Map(); const importing = new Map();
+  const workspaces = new Map(); const creating = new Map(); const importing = new Map(); const atPhoneWorkspaces = new Map();
   const recoveryLocked = new Set();
   const trustedProxies = String(process.env.TOSUB2_TRUSTED_PROXIES || "").split(",").map((value) => value.trim()).filter(Boolean);
   if (trustedProxies.some((address) => !normalizeClientIp(address))) throw new Error("TOSUB2_TRUSTED_PROXIES 需要有效的明确 IP 地址列表");
@@ -117,6 +118,7 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
         fingerprint: vault.fingerprint,
       });
       workspaces.set(id, workspace);
+      atPhoneWorkspaces.set(id, createAtPhoneWorkspace({ store, vault, ownerId: id, feeProvider: () => smsPool.publicSummary().fee }));
       const pending = store.pendingImports().some((record) => record.cdk_id === id);
       if (!pending) { store.inventory(id, workspace.inventory()); if (cdk.status === "active") workspace.resume(); }
       return workspace;
@@ -223,6 +225,22 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
       return writeScopedHead.apply(this, args);
     };
     if (url.pathname === "/api/sms-pool" && req.method === "GET") { send(res, 200, smsPool.publicSummary()); return; }
+    const atWorkspace = atPhoneWorkspaces.get(owner) || (await workspaceFor(owner), atPhoneWorkspaces.get(owner));
+    if (url.pathname === "/api/at-phone" && req.method === "GET") { send(res, 200, atWorkspace.list(Object.fromEntries(url.searchParams))); return; }
+    if (url.pathname === "/api/at-phone/import" && req.method === "POST") {
+      const body = await readRequestJson(req); const tokens = Array.isArray(body.tokens) ? body.tokens : String(body.text || "").split(/\r?\n/);
+      send(res, 201, atWorkspace.importTokens(tokens, actor)); return;
+    }
+    const atTaskMatch = /^\/api\/at-phone\/([a-f0-9-]+)(?:\/(retry|cancel))?$/.exec(url.pathname);
+    if (atTaskMatch && req.method === "POST") {
+      const workspace = atWorkspace; const id = atTaskMatch[1]; const action = atTaskMatch[2];
+      if (action === "retry") { const body = await readRequestJson(req); send(res, 200, workspace.retry(id, body.token || body.at, actor)); return; }
+      if (action === "cancel") { send(res, 200, workspace.cancel(id, actor)); return; }
+      throw cdkError(405, "请求方法不支持");
+    }
+    if (url.pathname === "/api/at-phone/export" && req.method === "GET") {
+      const emails = atWorkspace.exportSuccess(Object.fromEntries(url.searchParams)); send(res, 200, { emails, count: emails.length }); return;
+    }
     if (url.pathname === "/api/auth/me" && req.method === "GET") { send(res, 200, await bootstrap(session)); return; }
     if (url.pathname === "/api/auth/logout" && req.method === "POST") { store.logout(session); res.setHeader("set-cookie", sessionCookie(req, "", true)); send(res, 200, { ok: true }); return; }
     if (url.pathname === "/api/auth/workspace" && req.method === "POST") {
