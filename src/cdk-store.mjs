@@ -43,8 +43,6 @@ export async function createCdkStore(root, vault) {
     CREATE INDEX IF NOT EXISTS sms_inventory_state_expiry ON sms_pool_inventory(state,expires_at,created_at);
     CREATE TABLE IF NOT EXISTS sms_pool_order_bindings (order_key TEXT PRIMARY KEY,provider_id TEXT NOT NULL,inventory_id TEXT,cdk_id TEXT,operation_id TEXT,created_at INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS sms_pool_cost_orders (identity TEXT PRIMARY KEY,payload TEXT NOT NULL,created_at INTEGER NOT NULL);
-    CREATE TABLE IF NOT EXISTS at_phone_tasks (id TEXT PRIMARY KEY,owner_id TEXT NOT NULL REFERENCES cdks(id),payload TEXT NOT NULL,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
-    CREATE INDEX IF NOT EXISTS at_phone_owner_time ON at_phone_tasks(owner_id,created_at DESC);
     CREATE INDEX IF NOT EXISTS ledger_owner_time ON ledger(cdk_id,created_at DESC);
     CREATE INDEX IF NOT EXISTS attempts_ip_time ON verification_attempts(ip,created_at);
     CREATE INDEX IF NOT EXISTS security_time ON security_events(last_at DESC);
@@ -183,10 +181,6 @@ export async function createCdkStore(root, vault) {
       db.prepare("INSERT INTO meta VALUES(?,?)").run(`workspace-documents-v1:${id}`, "1"); }); },
     setting, saveSetting, audit,
     smsCostSummary() { if (!cachedCostSummary) cachedCostSummary = summarizePoolCosts(db.prepare("SELECT identity,payload FROM sms_pool_cost_orders").all().map((row) => vault.open(row.payload, `sms-cost:${row.identity}`))); return structuredClone(cachedCostSummary); },
-    atPhoneTask(id, ownerId) { return db.prepare("SELECT * FROM at_phone_tasks WHERE id=? AND owner_id=?").get(id, ownerId) || null; },
-    atPhoneTasks(ownerId) { return db.prepare("SELECT * FROM at_phone_tasks WHERE owner_id=? ORDER BY created_at DESC").all(ownerId); },
-    insertAtPhoneTask({ id, ownerId, payload, createdAt, updatedAt }) { return transaction(() => { requireActive(ownerId); db.prepare("INSERT INTO at_phone_tasks(id,owner_id,payload,created_at,updated_at) VALUES(?,?,?,?,?)").run(id, ownerId, payload, createdAt, updatedAt); return id; }); },
-    updateAtPhoneTask(id, ownerId, payload, updatedAt) { return transaction(() => { const result = db.prepare("UPDATE at_phone_tasks SET payload=?,updated_at=? WHERE id=? AND owner_id=?").run(payload, updatedAt, id, ownerId); if (!result.changes) throw cdkError(404, "AT 接码任务不存在"); return result.changes; }); },
     smsOperationCostOrders: operationCostOrders,
     recordSmsCostOrder(source, options = {}) { return transaction(() => recordCostOrder(source, options)); },
     inventoryItem(id) { return readInventory(inventoryRow(id)); },

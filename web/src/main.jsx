@@ -38,7 +38,6 @@ import MfaWorkspace from "./MfaWorkspace.jsx";
 import EmailRebindWorkspace from "./EmailRebindWorkspace.jsx";
 import OfferWorkspace from "./OfferWorkspace.jsx";
 import SmsPoolWorkspace, { SmsPoolChoice, SmsPoolChargeDialog } from "./SmsPoolWorkspace.jsx";
-import AtPhoneWorkspace from "./AtPhoneWorkspace.jsx";
 import CdkGate from "./CdkGate.jsx";
 import CdkWorkspace from "./CdkWorkspace.jsx";
 import CurrentCdk from "./CurrentCdk.jsx";
@@ -884,7 +883,6 @@ function App({ auth }) {
         <div className="brand-block"><div className="brand-mark"><ShieldCheck size={21} /></div><h1>账号工作台</h1></div>
         <nav className="workspace-tabs" aria-label="工作区">
           <button type="button" className={activeWorkspace === "authorization" ? "active" : ""} aria-pressed={activeWorkspace === "authorization"} onClick={() => setActiveWorkspace("authorization")}><LogIn size={17} />账号授权</button>
-          <button type="button" className={activeWorkspace === "at-phone" ? "active" : ""} aria-pressed={activeWorkspace === "at-phone"} onClick={() => setActiveWorkspace("at-phone")}><PhoneIncoming size={17} />AT 模式接码</button>
           <button type="button" className={activeWorkspace === "mfa" ? "active" : ""} aria-pressed={activeWorkspace === "mfa"} onClick={() => setActiveWorkspace("mfa")}><ShieldCheck size={17} />MFA 修改</button>
           <button type="button" className={activeWorkspace === "rebind" ? "active" : ""} aria-pressed={activeWorkspace === "rebind"} onClick={() => setActiveWorkspace("rebind")}><MailCheck size={17} />邮箱换绑</button>
           <button type="button" className={activeWorkspace === "offers" ? "active" : ""} aria-pressed={activeWorkspace === "offers"} onClick={() => setActiveWorkspace("offers")}><Sparkles size={17} />优惠检测</button>
@@ -900,7 +898,7 @@ function App({ auth }) {
       </aside>
       <div className="workspace-content">
       <header className="topbar">
-        <div className="workspace-path"><span>工作区</span><ChevronRight size={14} /><strong>{({ authorization: "账号授权", "at-phone": "AT 模式接码", mfa: "MFA 修改", rebind: "邮箱换绑", offers: "优惠检测", "sms-pool": "接码池", "cdk-mine": "我的 CDK", "cdk-management": "CDK 管理", "cdk-security": "安全中心" })[activeWorkspace]}</strong></div>
+        <div className="workspace-path"><span>工作区</span><ChevronRight size={14} /><strong>{({ authorization: "账号授权", mfa: "MFA 修改", rebind: "邮箱换绑", offers: "优惠检测", "sms-pool": "接码池", "cdk-mine": "我的 CDK", "cdk-management": "CDK 管理", "cdk-security": "安全中心" })[activeWorkspace]}</strong></div>
         <div className="topbar-actions cdk-session-actions">
           <CurrentCdk auth={auth} onOpen={() => setActiveWorkspace("cdk-mine")} />
           {auth.account.role === "admin" && <button className="secondary-button" onClick={async () => {
@@ -917,7 +915,6 @@ function App({ auth }) {
       {auth.workspace.id !== auth.account.id && <p className="cdk-scope-note">管理员正在查看 {auth.workspace.note || auth.workspace.label} 的工作区。此处操作和新增导入属于该 CDK。</p>}
       {activeWorkspace.startsWith("cdk-") && <CdkWorkspace auth={auth} section={activeWorkspace.slice(4)} onNavigate={(section) => setActiveWorkspace(`cdk-${section}`)} />}
       {activeWorkspace === "sms-pool" && auth.account.role === "admin" && <SmsPoolWorkspace token={token} />}
-      {activeWorkspace === "at-phone" && <AtPhoneWorkspace token={token} balance={auth.workspace.balance - (auth.workspace.reserved || 0)} />}
       {activeWorkspace === "offers" && <OfferWorkspace token={token} balance={auth.workspace.balance} />}
       {activeWorkspace === "rebind" && <EmailRebindWorkspace token={token} onOpenAuthorization={() => { setPhoneTab("disabled"); setFilters(DEFAULT_FILTERS); setPage(1); setSelectedJobIds(new Set()); setExpandedJobId(null); setEmailFilter([]); setActiveWorkspace("authorization"); }} />}
       {activeWorkspace === "mfa" && <MfaWorkspace token={token} defaultProxyUrl={accountProxyUrl} focusAccountId={mfaFocusAccountId} onReconnect={() => setConnectionAttempt((current) => current + 1)} onOpenAuthorization={() => {

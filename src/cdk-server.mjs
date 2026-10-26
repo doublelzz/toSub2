@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import fs, { registerWorkspaceStorage } from "./workspace-storage.mjs";
+import fs from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,7 +9,6 @@ import { acquireCdkLock } from "./cdk-lock.mjs";
 import { cdkError, clientIp, normalizeClientIp, readRequestJson, requireSameOrigin } from "./cdk-security.mjs";
 import { assertOfferAccess } from "./offer-workspace.mjs";
 import { createSmsPool } from "./sms-pool.mjs";
-import { createAtPhoneWorkspace } from "./at-phone-workspace.mjs";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cookieName = "tosub2_session";
@@ -39,9 +38,9 @@ async function legacyEmails(root) {
       const data = await fs.readFile(path.join(root, "mfa", "accounts.json"), "utf8").then(JSON.parse).catch((error) => { if (error.code === "ENOENT" || error instanceof SyntaxError) return null; throw error; });
       for (const account of data?.accounts || []) if (account.email) emails.add(account.email.toLowerCase());
     } else {
-      for (const filename of ["job-meta.json"]) {
+      for (const filename of ["job-meta.json", "sub2api-import-oauth.json"]) {
         const data = await fs.readFile(path.join(root, entry.name, filename), "utf8").then(JSON.parse).catch((error) => { if (error.code === "ENOENT" || error instanceof SyntaxError) return null; throw error; });
-        const email = data?.email;
+        const email = data?.email || data?.accounts?.[0]?.credentials?.email || data?.accounts?.[0]?.name;
         if (typeof email === "string" && email.includes("@")) emails.add(email.toLowerCase());
       }
     }
@@ -57,8 +56,7 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
   const vault = await createCdkVault(root); const store = await createCdkStore(root, vault);
   const smsPool = createSmsPool({ store, ...smsPoolOptions });
   const namespace = crypto.createHash("sha256").update(root).digest("hex");
-  const workspaces = new Map(); const creating = new Map(); const importing = new Map(); const atPhoneWorkspaces = new Map();
-  const storage = new Map();
+  const workspaces = new Map(); const creating = new Map(); const importing = new Map();
   const recoveryLocked = new Set();
   const trustedProxies = String(process.env.TOSUB2_TRUSTED_PROXIES || "").split(",").map((value) => value.trim()).filter(Boolean);
   if (trustedProxies.some((address) => !normalizeClientIp(address))) throw new Error("TOSUB2_TRUSTED_PROXIES 需要有效的明确 IP 地址列表");
@@ -66,9 +64,8 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
   cleanupFailedStart = async () => {
     shuttingDown = true; clearInterval(queueTimer); clearInterval(cleanupTimer);
     if (server?.listening) await new Promise((resolve) => { server.close(resolve); server.closeIdleConnections?.(); });
-    await Promise.allSettled([...creating.values()]); await Promise.allSettled([...workspaces.values()].map((workspace) => workspace.shutdown())); await smsPool.close(); for (const value of storage.values()) value.close(); store.close();
+    await Promise.allSettled([...creating.values()]); await Promise.allSettled([...workspaces.values()].map((workspace) => workspace.shutdown())); await smsPool.close(); store.close();
   };
-  storage.set(store.adminId, await registerWorkspaceStorage({ root, ownerId: store.adminId, store, vault }));
   const initialLegacyEmails = await legacyEmails(root);
   let globalSlots = 20;
   const availableSlots = () => globalSlots;
@@ -94,18 +91,14 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
     if (creating.has(id)) return creating.get(id);
     const promise = (async () => {
       const workspaceRoot = id === store.adminId ? root : path.join(root, "cdk", id);
-      if (!storage.has(id)) storage.set(id, await registerWorkspaceStorage({ root: workspaceRoot, ownerId: id, store, vault }));
       const workspace = await createWorkspace({
         root: workspaceRoot, cdkId: id, namespace, legacyEmails: id === store.adminId ? initialLegacyEmails : new Set(),
-        storage: storage.get(id),
-        credentialVault: { seal: (value, scope) => vault.seal(value, `credentials:${id}:${scope}`), open: (value, scope) => vault.open(value, `credentials:${id}:${scope}`) },
         smsPool: smsPool.forOwner(id),
         rebindVault: { seal: (value, scope) => vault.seal(value, `rebind:${id}:${scope}`), open: (value, scope) => vault.open(value, `rebind:${id}:${scope}`) },
         offerVault: { seal: (value, scope) => vault.seal(value, `offers:${id}:${scope}`), open: (value, scope) => vault.open(value, `offers:${id}:${scope}`) },
         offerCanUse: () => !shuttingDown && store.get(id)?.status === "active" && store.get(id).balance >= 1,
         legacyUsed: (email) => store.legacyUsed(id, email),
         markLegacyUsed: (email) => store.markLegacyUsed(id, email),
-        markLegacyUsedMany: (emails) => store.markLegacyUsedMany(id, emails),
         isEnabled: () => acceptingWork && !shuttingDown && store.get(id)?.status === "active",
         availableSlots,
         requestSchedule,
@@ -124,7 +117,6 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
         fingerprint: vault.fingerprint,
       });
       workspaces.set(id, workspace);
-      atPhoneWorkspaces.set(id, createAtPhoneWorkspace({ store, vault, ownerId: id, feeProvider: () => smsPool.publicSummary().fee }));
       const pending = store.pendingImports().some((record) => record.cdk_id === id);
       if (!pending) { store.inventory(id, workspace.inventory()); if (cdk.status === "active") workspace.resume(); }
       return workspace;
@@ -231,22 +223,6 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
       return writeScopedHead.apply(this, args);
     };
     if (url.pathname === "/api/sms-pool" && req.method === "GET") { send(res, 200, smsPool.publicSummary()); return; }
-    const atWorkspace = atPhoneWorkspaces.get(owner) || (await workspaceFor(owner), atPhoneWorkspaces.get(owner));
-    if (url.pathname === "/api/at-phone" && req.method === "GET") { send(res, 200, atWorkspace.list(Object.fromEntries(url.searchParams))); return; }
-    if (url.pathname === "/api/at-phone/import" && req.method === "POST") {
-      const body = await readRequestJson(req); const tokens = Array.isArray(body.tokens) ? body.tokens : String(body.text || "").split(/\r?\n/);
-      send(res, 201, atWorkspace.importTokens(tokens, actor)); return;
-    }
-    const atTaskMatch = /^\/api\/at-phone\/([a-f0-9-]+)(?:\/(retry|cancel))?$/.exec(url.pathname);
-    if (atTaskMatch && req.method === "POST") {
-      const workspace = atWorkspace; const id = atTaskMatch[1]; const action = atTaskMatch[2];
-      if (action === "retry") { const body = await readRequestJson(req); send(res, 200, workspace.retry(id, body.token || body.at, actor)); return; }
-      if (action === "cancel") { send(res, 200, workspace.cancel(id, actor)); return; }
-      throw cdkError(405, "请求方法不支持");
-    }
-    if (url.pathname === "/api/at-phone/export" && req.method === "GET") {
-      const emails = atWorkspace.exportSuccess(Object.fromEntries(url.searchParams)); send(res, 200, { emails, count: emails.length }); return;
-    }
     if (url.pathname === "/api/auth/me" && req.method === "GET") { send(res, 200, await bootstrap(session)); return; }
     if (url.pathname === "/api/auth/logout" && req.method === "POST") { store.logout(session); res.setHeader("set-cookie", sessionCookie(req, "", true)); send(res, 200, { ok: true }); return; }
     if (url.pathname === "/api/auth/workspace" && req.method === "POST") {
@@ -445,7 +421,6 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
     await Promise.allSettled([...workspaces.values()].map((workspace) => workspace.shutdown()));
     await smsPool.close();
     let timer; await Promise.race([closed, new Promise((resolve) => { timer = setTimeout(() => { server.closeAllConnections?.(); resolve(); }, 3000); })]); clearTimeout(timer);
-    for (const value of storage.values()) value.close();
     store.close(); await processLock.close();
   })();
   if (listen) {
