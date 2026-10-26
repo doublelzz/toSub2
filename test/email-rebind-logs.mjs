@@ -52,5 +52,8 @@ try {
   const session = { type: "chatgpt-session", version: 1, email: "fixture@example.com", accessToken: "synthetic-private-token", accountId: "fixture-account", expiresAt: "2099-01-01T00:00:00Z" };
   await assert.rejects(emailRebindStep({ operation: "begin", email: session.email, newEmail: "new@example.com", session }, async () => ({ status: 429, body: { error: { code: "rate_limit_exceeded", message: "original error detail" } } })),
     (failure) => failure.rebindCode === "REQUEST_FAILED" && failure.diagnostic.httpStatus === 429 && failure.diagnostic.upstreamCode === "rate_limit_exceeded" && failure.diagnostic.operation === "begin");
+  await assert.rejects(emailRebindStep({ operation: "begin", email: session.email, newEmail: "new@example.com", session }, async () => ({ status: 403, body: {
+    error: { code: "sensitive_action_cooldown", message: "为保护账户安全，本次电子邮箱更改将暂缓 24 小时", param: "1793034703872" },
+  } })), (failure) => failure.status === 409 && failure.rebindCode === "SENSITIVE_ACTION_COOLDOWN" && failure.diagnostic.retryAfter === 1793034703872);
   console.log("email rebind logs passed (complete original responses, request IDs, causes, append history, encrypted persistence and cursor paging)");
 } finally { await fs.rm(root, { recursive: true, force: true }); }

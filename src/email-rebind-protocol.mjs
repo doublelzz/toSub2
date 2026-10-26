@@ -6,12 +6,13 @@ export const REBIND_ERRORS = {
   INELIGIBLE: "当前账号不允许更换邮箱，请核对账号资格",
   TARGET_IN_USE: "新邮箱已被使用，请核对目标邮箱",
   CODE_INVALID: "验证码不正确或已过期，请重新输入或重新发送",
+  SENSITIVE_ACTION_COOLDOWN: "为保护账户安全，本次电子邮箱更改将暂缓 24 小时",
   REQUEST_FAILED: "服务拒绝请求，请稍后重试",
   NETWORK: "网络请求未完成，请稍后重试",
   UNCERTAIN: "尚不能确认换绑结果，请核对新邮箱登录状态，不要重新换绑",
   RESPONSE_INVALID: "服务响应异常，请核对结果后重试",
 };
-export const rebindError = (code, diagnostic) => Object.assign(new Error(REBIND_ERRORS[code] || REBIND_ERRORS.REQUEST_FAILED), { rebindCode: code, status: 409, ...(diagnostic ? { diagnostic } : {}) });
+export const rebindError = (code, diagnostic, message) => Object.assign(new Error(message || REBIND_ERRORS[code] || REBIND_ERRORS.REQUEST_FAILED), { rebindCode: code, status: 409, ...(diagnostic ? { diagnostic } : {}) });
 
 export async function emailRebindStep({ operation, email, newEmail, session: source, code }, request) {
   let session;
@@ -22,7 +23,7 @@ export async function emailRebindStep({ operation, email, newEmail, session: sou
   if (operation !== "eligibility" && operation !== "inspect" && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(newEmail || "")) throw rebindError("TARGET_IN_USE");
   if (operation === "verify" && !/^\d{6}$/.test(code || "")) throw rebindError("CODE_INVALID");
   let diagnostic = { operation, path };
-  const fail = (code) => rebindError(code, diagnostic);
+  const fail = (code, message) => rebindError(code, diagnostic, message);
   const send = async (payload) => {
     let result;
     try { result = await request(path, { session, method: ["eligibility", "inspect"].includes(operation) ? "GET" : "POST", payload }); }
@@ -37,6 +38,13 @@ export async function emailRebindStep({ operation, email, newEmail, session: sou
   try { data = typeof response.body === "string" ? JSON.parse(response.body) : response.body; } catch {}
   const upstreamCode = String(data?.error?.code || data?.code || data?.error?.type || "");
   if (upstreamCode) diagnostic.upstreamCode = upstreamCode;
+  const upstreamMessage = String(data?.error?.message || data?.message || "");
+  if (upstreamMessage) diagnostic.upstreamMessage = upstreamMessage;
+  const cooldownParam = Number(data?.error?.param || data?.param);
+  if (upstreamCode === "sensitive_action_cooldown") {
+    diagnostic.retryAfter = Number.isFinite(cooldownParam) && cooldownParam > 0 ? cooldownParam : null;
+    throw fail("SENSITIVE_ACTION_COOLDOWN", upstreamMessage || REBIND_ERRORS.SENSITIVE_ACTION_COOLDOWN);
+  }
   if (response.status !== 200) {
     if (operation === "verify" && response.status >= 500) throw fail("UNCERTAIN");
     if (/email.*(?:taken|exists|linked|use)|already.*(?:email|linked)/i.test(upstreamCode)) throw fail("TARGET_IN_USE");

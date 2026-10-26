@@ -124,7 +124,8 @@ export async function createEmailRebindWorkspace({ root, vault, listSources, res
       updatedAt: item.updatedAt, confirmedAt: item.confirmedAt || null, requestedAt: item.requestedAt || null,
       challengeVersion: item.challengeVersion || 0, nextSendAt: item.nextSendAt || null,
       syncedJobId: sync?.id || null, credentialStatus: item.status === "success" ? "needs_login" : "unchanged",
-      canRetry: ["failed", "cancelled", "interrupted"].includes(item.status), events: item.events || [] };
+      retryAfter: item.retryAfter || null,
+      canRetry: ["failed", "cancelled", "interrupted"].includes(item.status) && (!item.retryAfter || now() >= item.retryAfter), events: item.events || [] };
   }
   function sources() {
     return listSources().map((source) => ({ ...source, busy: source.busy || isBusy(source.email),
@@ -207,7 +208,12 @@ export async function createEmailRebindWorkspace({ root, vault, listSources, res
     const code = failure.rebindCode || "REQUEST_FAILED";
     const uncertain = code === "UNCERTAIN" || (operation === "verify" && !failure.rebindCode);
     const httpStatus = failure.diagnostic?.httpStatus;
-    await update(item, uncertain ? "uncertain" : "failed", `${REBIND_ERRORS[code] || "请求未完成，请稍后重试"}${Number.isInteger(httpStatus) ? `（HTTP ${httpStatus}）` : ""}`);
+    if (code === "SENSITIVE_ACTION_COOLDOWN") item.retryAfter = Number.isFinite(failure.diagnostic?.retryAfter) ? failure.diagnostic.retryAfter : null;
+    const upstreamMessage = failure.diagnostic?.upstreamMessage;
+    const message = upstreamMessage
+      ? `${upstreamMessage}${Number.isInteger(httpStatus) ? `（HTTP ${httpStatus}）` : ""}`
+      : `${REBIND_ERRORS[code] || "请求未完成，请稍后重试"}${Number.isInteger(httpStatus) ? `（HTTP ${httpStatus}）` : ""}`;
+    await update(item, uncertain ? "uncertain" : "failed", message);
   }
   async function begin(item, run) {
     try {
@@ -313,6 +319,7 @@ export async function createEmailRebindWorkspace({ root, vault, listSources, res
   }
   async function retry(id, resend = false) {
     available(); const item = privateItem(id);
+    if (!resend && item.retryAfter && now() < item.retryAfter) throw error(`安全冷却中，暂时不能重试；开放时间：${new Date(item.retryAfter).toLocaleString("zh-CN", { hour12: false })}`);
     if (resend) { if (now() < (item.nextSendAt || 0)) throw error("请等待重新发送倒计时结束"); await manual(id); }
     else if (!["failed", "cancelled", "interrupted"].includes(item.status)) throw error("该结果不能重新换绑，请先核对结果");
     if (active.has(id) || isAccountBusy(item.oldEmail)) throw error("账号正在执行其他任务");

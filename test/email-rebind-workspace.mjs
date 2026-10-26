@@ -53,6 +53,14 @@ try {
   await assert.rejects(emailRebindStep({ ...protocolInput, operation: "eligibility" }, async () => ({ status: 200, body: { eligible: false } })), { rebindCode: "INELIGIBLE" });
   await assert.rejects(emailRebindStep(protocolInput, async () => ({ status: 401, body: {} })), { rebindCode: "SESSION_EXPIRED" });
   await assert.rejects(emailRebindStep(protocolInput, async () => ({ status: 200, body: { success: false } })), { rebindCode: "UNCERTAIN" });
+  await assert.rejects(emailRebindStep({ ...protocolInput, operation: "begin" }, async () => ({ status: 403, body: {
+    error: { code: "sensitive_action_cooldown", message: "为保护账户安全，本次电子邮箱更改将暂缓 24 小时", param: "1793034703872" },
+  } })), (failure) => failure.rebindCode === "SENSITIVE_ACTION_COOLDOWN"
+    && failure.status === 409
+    && failure.message.includes("暂缓 24 小时")
+    && failure.diagnostic.httpStatus === 403
+    && failure.diagnostic.upstreamCode === "sensitive_action_cooldown"
+    && failure.diagnostic.retryAfter === 1793034703872);
   await assert.rejects(emailRebindStep({ ...protocolInput, session: sourceSession("someone-else@example.com") }, async () => { throw new Error("must not request"); }), { rebindCode: "SESSION_INVALID" });
 
   instance = await createEmailRebindWorkspace(options);
