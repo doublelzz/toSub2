@@ -20,7 +20,7 @@ function identityFromToken(token) {
 }
 function maskEmail(email) { return email || "待识别邮箱"; }
 function statusLabel(status) { return ({ queued: "排队中", identity_checking: "校验 AT", running: "接码中", waiting_sms: "等待短信", verifying: "验证中", success: "成功", failed: "失败", unknown: "待核实", skipped: "无需接码", canceled: "已取消" })[status] || "状态未知"; }
-function publicStatus(status) { return ACTIVE.has(status) && status !== "unknown" ? "running" : status; }
+function publicStatus(status) { return status; }
 
 export function createAtPhoneWorkspace({ store, vault, ownerId, now = Date.now, feeProvider = null }) {
   const keyScope = (id) => `at-phone:${ownerId}:${id}`;

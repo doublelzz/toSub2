@@ -57,6 +57,7 @@
 .at-status > i { width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
 .at-status-success { color: var(--success); }
 .at-status-running { color: var(--green); }
+.at-status-queued, .at-status-identity_checking, .at-status-waiting_sms, .at-status-verifying { color: var(--green); }
 .at-status-failed { color: var(--danger); }
 .at-status-unknown { color: var(--amber); }
 .at-status-skipped, .at-status-canceled { color: var(--muted); }

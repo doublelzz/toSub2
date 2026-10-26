@@ -25,7 +25,7 @@ try {
   const token = fixtureToken("at-console@example.invalid");
   const imported = await other.call("/api/at-phone/import", "POST", { tokens: [token, token, "bad token"] });
   assert.equal(imported.status, 201); assert.equal(imported.data.count, 1); assert.equal(imported.data.invalid.length, 1); assert.equal(JSON.stringify(imported.data).includes("fixture"), false);
-  const list = await other.call("/api/at-phone?status=running&page=1&pageSize=20"); assert.equal(list.status, 200); assert.equal(list.data.total, 1); assert.equal(list.data.items[0].status, "running");
+  const list = await other.call("/api/at-phone?status=queued&page=1&pageSize=20"); assert.equal(list.status, 200); assert.equal(list.data.total, 1); assert.equal(list.data.items[0].status, "queued");
   const exportResponse = await other.call("/api/at-phone/export?status=success"); assert.deepEqual(exportResponse.data, { emails: [], count: 0 });
   const ordinaryPreview = await other.call("/api/imports/preview", "POST", { mode: "single", payload: { email: "at-console@example.invalid" } }); assert.equal(ordinaryPreview.status, 200); assert.equal(ordinaryPreview.data.charge, 1, "AT task ownership does not waive ordinary import charge");
   const adminList = await admin.call("/api/at-phone"); assert.equal(adminList.status, 200); assert.equal(adminList.data.total, 0, "CDK task data is owner isolated");
