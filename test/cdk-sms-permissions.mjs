@@ -9,6 +9,7 @@ const root = await fs.mkdtemp(path.join(os.tmpdir(), "tosub2-cdk-sms-permissions
 process.env.TOSUB2_ENCRYPTION_KEY = crypto.randomBytes(32).toString("base64");
 process.env.TOSUB2_ADMIN_CDK = "synthetic-cdk-sms-permissions-administrator";
 const ids = ["custom", "luban", "smsbower", "herosms", "pool"];
+const canonicalIds = ["luban", "smsbower", "herosms", "custom", "pool"];
 const smsKey = "chatgpt-onboarding.sms-provider-settings-v1";
 const legacyKey = "chatgpt-onboarding.luban-api-key";
 const mailKey = "chatgpt-onboarding.mail-request-settings-v1";
@@ -36,11 +37,12 @@ async function start() {
   }) }, createWorkspace: async (options) => {
     scopes.set(options.cdkId, options);
     const emails = [];
+    const providerAllowed = (id) => options.smsProviderAllowed(id);
     return { activeCount: () => 0, tick: () => 0, inventory: () => emails, publicJobs: () => [], pause() {}, resume() {}, stop: async () => {}, shutdown: async () => {},
-      dispatch: async () => ({ status: 200, body: Buffer.from(JSON.stringify({ features: { smsProviders: ids.map((id) => ({ id, name: id, fields: [] })), smsPool: { enabled: true, fee: 2 } } })) }),
+      dispatch: async (method, route) => ({ status: 200, body: Buffer.from(JSON.stringify({ features: { smsProviders: canonicalIds.map((id) => ({ id, name: id, fields: [] })), smsPool: { enabled: true, fee: 2 } } })) }),
       planImport: (mode, body) => [body.email || "fixture@example.invalid"],
       applyImport: async (mode, body) => { emails.push(body.email); return { status: 201, data: { created: true, job: { id: crypto.randomUUID(), email: body.email } } }; },
-      handle: async (req, res) => { forwarded++; res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: true })); },
+      handle: async (req, res) => { forwarded++; res.writeHead(200, { "content-type": "application/json" }); const pathname = new URL(req.url, "http://fixture.invalid").pathname; res.end(JSON.stringify(pathname === "/api/jobs" ? { features: { smsProviders: canonicalIds.filter(providerAllowed).map((id) => ({ id, name: id, fields: [] })) } } : { ok: true })); },
     };
   } });
   await new Promise((resolve) => app.server.listen(0, "127.0.0.1", resolve)); base = `http://127.0.0.1:${app.server.address().port}`;
@@ -62,6 +64,7 @@ try {
   let current = (await user("/api/bootstrap")).data;
   assert.deepEqual(current.features.smsProviders.map((provider) => provider.id), ["custom"]);
   assert.deepEqual(current.features.allowedSmsProviders, ["custom"]);
+  assert.deepEqual((await user("/api/jobs")).data.features.smsProviders.map((provider) => provider.id), current.features.smsProviders.map((provider) => provider.id), "bootstrap and job polling expose the same provider order");
   assert.equal(current.features.smsPool, undefined, "ungranted pool metadata is also hidden from bootstrap");
   assert.equal(scopes.get(owner.id).smsProviderAllowed("herosms"), false);
   assert.equal(scopes.get(owner.id).smsProviderAllowed("custom"), true);
@@ -95,7 +98,8 @@ try {
   saved = await admin(`/api/admin/cdks/${owner.id}`, "PATCH", { allowedSmsProviders: ["herosms", "pool", "herosms"] });
   assert.equal(saved.status, 200); assert.deepEqual(saved.data.allowedSmsProviders, ["custom", "herosms", "pool"]);
   current = (await user("/api/auth/me")).data;
-  assert.deepEqual(current.features.smsProviders.map((provider) => provider.id), ["custom", "herosms", "pool"], "permission changes retain the existing session and update its capabilities");
+  assert.deepEqual(current.features.smsProviders.map((provider) => provider.id), ["herosms", "custom", "pool"], "permission changes retain the existing session and update its capabilities in canonical order");
+  assert.deepEqual((await user("/api/jobs")).data.features.smsProviders.map((provider) => provider.id), current.features.smsProviders.map((provider) => provider.id), "permission updates keep bootstrap and job polling provider order aligned");
   assert.equal(JSON.parse(current.settings[smsKey]).configs.herosms.apiKey, "hidden-provider-secret");
   assert.equal(scopes.get(owner.id).smsProviderAllowed("herosms"), true);
   assert.equal((await user("/api/sms-providers/herosms/options", "POST", {})).status, 200);
@@ -146,7 +150,7 @@ try {
   await app.close(); app = null; await start();
   current = (await user("/api/auth/me")).data;
   assert.deepEqual(current.workspace.allowedSmsProviders, ["custom", "smsbower"], "permissions survive a store/server restart");
-  assert.deepEqual(current.features.smsProviders.map((provider) => provider.id), ["custom", "smsbower"]);
+  assert.deepEqual(current.features.smsProviders.map((provider) => provider.id), ["smsbower", "custom"]);
   assert.equal(app.store.get(owner.id).balance, balance);
   console.log("[ok] CDK SMS permissions: default custom, scoped grants/revocation, hidden encrypted settings, administrator workspace scope, purchase-time guards, reservation release, buffered claim races and persistence; synthetic fixtures only.");
 } finally { await app?.close(); await fs.rm(root, { recursive: true, force: true }); }

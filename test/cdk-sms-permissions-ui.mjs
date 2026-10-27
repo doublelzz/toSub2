@@ -103,6 +103,9 @@ try {
   assert.deepEqual([...container.querySelectorAll('.provider-tabs [role="tab"]')].map((row) => row.textContent), ["SMSBower", "自定义接码"]);
   await act(async () => container.querySelector('.provider-tabs [role="tab"]').click());
   assert.equal(container.querySelector('.provider-tabs [aria-selected="true"]').textContent, "SMSBower");
+  featureProviders = [definitions[3], definitions[1]];
+  await act(async () => root.render(React.createElement(App, { key: "ordinary", auth: auth() })));
+  assert.equal(container.querySelector('.provider-tabs [aria-selected="true"]').textContent, "SMSBower", "provider order changes do not reset the open tab");
   featureProviders = [definitions[3]];
   await act(async () => root.render(React.createElement(App, { key: "ordinary", auth: auth() })));
   assert.deepEqual([...container.querySelectorAll('.provider-tabs [role="tab"]')].map((row) => row.textContent), ["自定义接码"]);

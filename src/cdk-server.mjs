@@ -233,7 +233,9 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
     const response = await workspace.dispatch("GET", "/api/bootstrap");
     const original = JSON.parse(response.body.toString());
     const allowedSmsProviders = store.allowedSmsProviders(session.workspace.id);
-    const features = { ...original.features, smsProviders: allowedSmsProviders.map((id) => original.features?.smsProviders?.find((provider) => provider.id === id)).filter(Boolean),
+    const allowedSmsProviderSet = new Set(allowedSmsProviders);
+    const smsProviders = (original.features?.smsProviders || []).filter((provider) => allowedSmsProviderSet.has(provider.id));
+    const features = { ...original.features, smsProviders,
       allowedSmsProviders, cdk: true, admin: session.actor.role === "admin" };
     if (!allowedSmsProviders.includes("pool")) delete features.smsPool;
     return { authenticated: true, token: session.csrf, account: store.get(session.actor.id), workspace: store.get(session.workspace.id), settings: visibleWorkspaceSettings(session.workspace.id), features };

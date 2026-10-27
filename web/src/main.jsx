@@ -54,6 +54,7 @@ const SMS_PROVIDER_SETTINGS_KEY = "chatgpt-onboarding.sms-provider-settings-v1";
 const MAIL_REQUEST_SETTINGS_KEY = "chatgpt-onboarding.mail-request-settings-v1";
 const SUB2API_UPLOAD_SETTINGS_KEY = "chatgpt-onboarding.sub2api-upload-settings-v1";
 const ACCOUNT_PROXY_STORAGE_KEY = "chatgpt-onboarding.account-proxy-v1";
+const SMS_PROVIDER_ORDER = ["luban", "smsbower", "herosms", "custom", "pool"];
 const SMS_PROVIDER_EXTERNAL_LINKS = {
   luban: {
     href: "https://lubansms.com/",
@@ -261,8 +262,15 @@ function App({ auth }) {
   }, [token, features.sub2apiMonitor]);
 
   const pageJobIds = useMemo(() => jobs.map((job) => job.id), [jobs]);
-  const smsProviderDefinitions = Array.isArray(features.smsProviders) ? features.smsProviders : [];
-  const smsProviderAccessKey = smsProviderDefinitions.map((provider) => provider.id).join(",");
+  const smsProviderDefinitions = useMemo(() => {
+    const order = new Map(SMS_PROVIDER_ORDER.map((id, index) => [id, index]));
+    return [...(Array.isArray(features.smsProviders) ? features.smsProviders : [])].sort((left, right) => {
+      const leftIndex = order.get(left.id) ?? SMS_PROVIDER_ORDER.length;
+      const rightIndex = order.get(right.id) ?? SMS_PROVIDER_ORDER.length;
+      return leftIndex - rightIndex || String(left.id).localeCompare(String(right.id));
+    });
+  }, [features.smsProviders]);
+  const smsProviderAccessKey = smsProviderDefinitions.map((provider) => provider.id).sort().join(",");
   const smsProviderAccess = useRef(null);
   useEffect(() => {
     const previousAccess = smsProviderAccess.current;
