@@ -10,6 +10,7 @@ import { startCdkServer } from "../src/cdk-server.mjs";
 
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "tosub2-offer-http-"));
 const requests = []; const issued = new Map();
+const checkedEmails = []; const deviceHeaders = []; let aliasBroken = true; let dropHomepage = false;
 const accessToken = (email) => `e30.${Buffer.from(JSON.stringify({ email, exp: Math.floor(Date.now() / 1000) + 3600,
   "https://api.openai.com/auth": { chatgpt_account_id: `personal-${email}` } })).toString("base64url")}.fixture-private-session`;
 const backend = http.createServer((req, res) => void upstreamRequest(req, res));
@@ -23,7 +24,7 @@ async function upstreamRequest(req, res) {
   if (url.pathname.startsWith("/mail/")) {
     const at = issued.get("auto@example.com"); send({ data: { code: at ? "001234" : "999999", message_id: at ? "fresh" : "old", received_at: new Date(at || Date.now() - 3600000).toISOString() } }); return;
   }
-  if (url.pathname === "/") { send({}, 200, { "set-cookie": ["__Host-next-auth.csrf-token=fixture; Path=/", "oai-did=fixture-device; Path=/"] }); return; }
+  if (url.pathname === "/") { if (dropHomepage) { res.destroy(); return; } send({}, 200, { "set-cookie": ["__Host-next-auth.csrf-token=fixture; Path=/", "oai-did=fixture-device; Path=/"] }); return; }
   if (url.pathname === "/api/auth/providers") { send({}); return; }
   if (url.pathname === "/api/auth/csrf") { send({ csrfToken: "fixture" }); return; }
   if (url.pathname === "/api/auth/signin/openai") {
@@ -40,14 +41,28 @@ async function upstreamRequest(req, res) {
     if (url.pathname.endsWith("resend")) { issued.set(email, Date.now()); send({}); return; }
     if (url.pathname.includes("email-otp") && body.code !== "001234") { send({ error: { code: "wrong_email_otp_code" } }, 400); return; }
     if (url.pathname.includes("password") && body.password !== "fixture-private-password") { send({ error: { code: "incorrect_password" } }, 400); return; }
+    if (email === "password-alias@example.com") { send({ page: { type: "mfa_challenge" }, continue_url: `${upstream}/mfa-challenge/fixture-totp`,
+      "oai-client-auth-session": { mfa_challenge_factors: [{ factor_type: "totp", id: "fixture-totp" }] } }); return; }
+    send({ continue_url: `${upstream}/login-callback` }); return;
+  }
+  if (url.pathname === "/api/accounts/mfa/issue_challenge") { send({}); return; }
+  if (url.pathname === "/api/accounts/mfa/verify") {
+    const chunks = []; for await (const chunk of req) chunks.push(chunk); const body = JSON.parse(Buffer.concat(chunks).toString());
+    if (body.id !== "fixture-totp" || !/^\d{6}$/.test(body.code)) { send({}, 400); return; }
     send({ continue_url: `${upstream}/login-callback` }); return;
   }
   if (url.pathname === "/login-callback") { send({}, 200, { "set-cookie": "__Secure-next-auth.session-token=fixture; Path=/" }); return; }
-  if (url.pathname === "/api/auth/session") { send({ user: { email }, accessToken: accessToken(email), expires: "2099-01-01T00:00:00Z" }); return; }
+  if (url.pathname === "/api/auth/session") { send({ user: { email: email === "password-wrong-session@example.com" ? "someone-else@example.com" : email }, accessToken: accessToken(email), expires: "2099-01-01T00:00:00Z" }); return; }
   if (url.pathname === "/backend-api/accounts/check/v4-2023-04-27") {
     let claims; try { claims = JSON.parse(Buffer.from(req.headers.authorization.split(".")[1], "base64url")); } catch { send({}, 401); return; }
     const id = `personal-${claims.email}`;
+    checkedEmails.push(claims.email); deviceHeaders.push(req.headers["oai-device-id"]);
     if (req.headers["chatgpt-account-id"] !== id) { send({}, 403); return; }
+    const personal = { account: { account_id: id, plan_type: "free" }, eligible_promo_campaigns: { plus: { id: "plus-2-months-50-pct-off" } } };
+    if (claims.email === "password-alias@example.com") {
+      send({ accounts: { default: personal, [id]: aliasBroken ? { ...personal, eligible_promo_campaigns: { plus: { id: "plus-1-month-free" } } } : personal } }); return;
+    }
+    if (claims.email === "password-foreign-account@example.com") { send({ accounts: { default: { account: { account_id: "foreign-account", plan_type: "free" }, eligible_promo_campaigns: {} } } }); return; }
     send({ accounts: { team: { account: { account_id: "team", plan_type: "plus" } }, [id]: { account: { account_id: id, plan_type: "free" }, eligible_promo_campaigns: { plus: { id: "plus-2-months-50-pct-off" } } } } }); return;
   }
   send({ error: "Unexpected upstream route" }, 404);
@@ -107,6 +122,36 @@ try {
   const reused = await begin(JSON.stringify({ type: "chatgpt-session", version: 1, email: "existing@example.com", accessToken: accessToken("existing@example.com"), chatgptBase: upstream }));
   await waitFor(async () => (await call(`/api/offers/${reused.batch.id}/query`, "POST", {})).data.batch?.counts.completed === 1);
   assert.equal(requests.filter((route) => route === "/api/auth/signin/openai").length, signins, "valid imported sessions must not log in again");
+  const aliasBatch = await begin("password-alias@example.com----fixture-private-password----JBSWY3DPEHPK3PXP");
+  const aliasQuery = () => call(`/api/offers/${aliasBatch.batch.id}/query`, "POST", {});
+  const failedAlias = await waitFor(async () => (await aliasQuery()).data.items?.find((row) => row.status === "failed"));
+  assert.equal(failedAlias.errorCode, "invalid_response"); assert.equal(failedAlias.errorStage, "account_alias_conflict");
+  assert.equal(failedAlias.errorStageLabel, "优惠账号别名结果冲突"); assert.match(failedAlias.message, /冲突/);
+  assert.equal(failedAlias.history.at(-1).stage, "account_alias_conflict");
+  assert.ok(requests.includes("/api/accounts/mfa/verify"), "correct password and TOTP can reach an offer-response failure independently of login");
+  assert.equal(deviceHeaders.at(-1), "fixture-device", "the fresh login device is reused for the offer request");
+  const loginsBeforeRetry = requests.filter((route) => route === "/api/auth/signin/openai").length;
+  aliasBroken = false;
+  assert.equal((await call(`/api/offers/${aliasBatch.batch.id}/retry`, "POST", {})).status, 200);
+  const fixedAlias = await waitFor(async () => (await aliasQuery()).data.items?.find((row) => row.status === "completed"));
+  assert.equal(fixedAlias.result.kind, "half_2m"); assert.equal(fixedAlias.errorStage, "");
+  assert.equal(deviceHeaders.at(-1), "fixture-device");
+  assert.equal(requests.filter((route) => route === "/api/auth/signin/openai").length, loginsBeforeRetry, "valid login sessions survive offer parsing failure so retry does not repeat password/TOTP login");
+  const foreignBatch = await begin("password-foreign-account@example.com----fixture-private-password");
+  const foreign = await waitFor(async () => (await call(`/api/offers/${foreignBatch.batch.id}/query`, "POST", {})).data.items?.find((row) => row.status === "failed"));
+  assert.equal(foreign.errorCode, "identity_mismatch"); assert.equal(foreign.errorStage, "offer_response"); assert.match(foreign.message, /优惠响应未返回目标账号/);
+  const wrongSessionBatch = await begin("password-wrong-session@example.com----fixture-private-password");
+  const wrongSession = await waitFor(async () => (await call(`/api/offers/${wrongSessionBatch.batch.id}/query`, "POST", {})).data.items?.find((row) => row.status === "failed"));
+  assert.equal(wrongSession.errorCode, "identity_mismatch"); assert.equal(wrongSession.errorStage, "session_identity");
+  assert.equal(checkedEmails.includes("password-wrong-session@example.com"), false, "genuinely mismatched session must not request offers");
+  const beforeNetworkLogin = requests.filter((route) => route === "/api/auth/signin/openai").length;
+  dropHomepage = true;
+  const networkBatch = await begin("password-network@example.com----fixture-private-password");
+  const network = await waitFor(async () => (await call(`/api/offers/${networkBatch.batch.id}/query`, "POST", {})).data.items?.find((row) => row.status === "failed"));
+  dropHomepage = false;
+  assert.equal(network.errorCode, "network"); assert.equal(network.errorStage, "login");
+  assert.equal(requests.filter((route) => route === "/api/auth/signin/openai").length, beforeNetworkLogin, "pre-login connectivity failure never reaches credential submission");
+  assert.doesNotMatch(JSON.stringify(foreign) + JSON.stringify(wrongSession) + JSON.stringify(failedAlias), /fixture-private-password|fixture-private-session|JBSWY3DPEHPK3PXP/);
   assert.equal(app.store.get(owner.id).balance, balance);
   const savedCookie = cookie; const savedToken = token;
   await login(other.secret); assert.equal((await call("/api/offers/batches")).data.batches.length, 0);
@@ -126,5 +171,5 @@ try {
   assert.equal((await call("/api/offers/access")).status, 200);
   app.store.update(owner.id, { status: "disabled" }, app.store.adminId);
   assert.equal((await call("/api/offers/access")).status, 401);
-  console.log("offer console passed (actual protocol login and session checks, automatic/manual OTP, CDK >=1 gate, zero charging, isolation, export and restart)");
+  console.log("offer console passed (local real-protocol password/TOTP login, duplicate account aliases, conflict and identity failure stages, session/device reuse, OTP, isolation, zero charging and restart)");
 } finally { await app?.close(); await new Promise((resolve) => backend.close(resolve)); await fs.rm(root, { recursive: true, force: true }); }

@@ -6,6 +6,23 @@ const workspaceKeys = new Set([
 let workspace = null;
 let saveTimer;
 let confirmationHandler = null;
+const smsSettingsKey = "chatgpt-onboarding.sms-provider-settings-v1";
+const legacySmsKeys = ["chatgpt-onboarding.luban-api-key", "chatgpt-onboarding.luban-service-id"];
+const smsPermissions = (bootstrap) => Array.isArray(bootstrap.workspace?.allowedSmsProviders) ? [...bootstrap.workspace.allowedSmsProviders]
+  : Array.isArray(bootstrap.features?.allowedSmsProviders) ? [...bootstrap.features.allowedSmsProviders] : null;
+const parseSmsSettings = (value) => { try { const parsed = typeof value === "string" ? JSON.parse(value) : value; return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {}; } catch { return {}; } };
+function restrictSmsValues(values, allowed) {
+  if (!allowed) return { ...values };
+  const result = { ...values };
+  if (Object.hasOwn(result, smsSettingsKey)) {
+    const previous = parseSmsSettings(result[smsSettingsKey]);
+    const value = { selectedProviderId: allowed.includes(previous.selectedProviderId) ? previous.selectedProviderId : "custom",
+      configs: Object.fromEntries(Object.entries(previous.configs || {}).filter(([id]) => allowed.includes(id))) };
+    result[smsSettingsKey] = typeof result[smsSettingsKey] === "string" ? JSON.stringify(value) : value;
+  }
+  if (!allowed.includes("luban")) for (const key of legacySmsKeys) delete result[key];
+  return result;
+}
 
 export function setImportConfirmation(handler) { confirmationHandler = handler; }
 export function requestId() {
@@ -16,7 +33,8 @@ export function requestId() {
 
 export function hydrateWorkspaceSettings(bootstrap) {
   clearTimeout(saveTimer);
-  workspace = { id: bootstrap.workspace.id, token: bootstrap.token, quota: `${bootstrap.workspace.balance}:${bootstrap.workspace.reserved || 0}`, values: { ...(bootstrap.settings || {}) }, dirty: false, legacyValues: {} };
+  const allowed = smsPermissions(bootstrap);
+  workspace = { id: bootstrap.workspace.id, token: bootstrap.token, quota: `${bootstrap.workspace.balance}:${bootstrap.workspace.reserved || 0}`, values: restrictSmsValues(bootstrap.settings || {}, allowed), allowedSmsProviders: allowed, dirty: false, legacyValues: {} };
   if (bootstrap.account.role === "admin" && bootstrap.workspace.id === bootstrap.account.id && !Object.keys(workspace.values).length) {
     for (const key of workspaceKeys) {
       try {
@@ -34,6 +52,22 @@ export function hydrateWorkspaceSettings(bootstrap) {
   if (workspace.dirty) saveTimer = setTimeout(() => { void flushWorkspaceSettings().catch((error) => window.dispatchEvent(new CustomEvent("cdk-settings-error", { detail: error.message }))); }, 500);
 }
 
+export function refreshWorkspaceSmsPermissions(bootstrap) {
+  if (!workspace || workspace.id !== bootstrap.workspace.id || workspace.token !== bootstrap.token) { hydrateWorkspaceSettings(bootstrap); return; }
+  const allowed = smsPermissions(bootstrap);
+  if (!allowed) return;
+  const currentSms = parseSmsSettings(workspace.values[smsSettingsKey]);
+  const serverSms = parseSmsSettings(bootstrap.settings?.[smsSettingsKey]);
+  const source = { ...workspace.values };
+  if (Object.hasOwn(source, smsSettingsKey) || Object.hasOwn(bootstrap.settings || {}, smsSettingsKey)) {
+    const settings = { ...serverSms, ...currentSms, configs: { ...serverSms.configs, ...currentSms.configs } };
+    source[smsSettingsKey] = JSON.stringify(settings);
+  }
+  if (allowed.includes("luban")) for (const key of legacySmsKeys) if (!Object.hasOwn(source, key) && Object.hasOwn(bootstrap.settings || {}, key)) source[key] = bootstrap.settings[key];
+  workspace.allowedSmsProviders = allowed;
+  workspace.values = restrictSmsValues(source, allowed);
+}
+
 export function clearWorkspaceSettings() { clearTimeout(saveTimer); workspace = null; }
 
 export function readWorkspaceValue(key) {
@@ -44,7 +78,7 @@ export function readWorkspaceValue(key) {
 export function writeWorkspaceValue(key, value) {
   if (!workspaceKeys.has(key)) { try { window.localStorage.setItem(key, value); } catch {} return; }
   if (!workspace || workspace.values[key] === value) return;
-  workspace.values[key] = value; workspace.dirty = true;
+  workspace.values = restrictSmsValues({ ...workspace.values, [key]: value }, workspace.allowedSmsProviders); workspace.dirty = true;
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => { void flushWorkspaceSettings().catch((error) => window.dispatchEvent(new CustomEvent("cdk-settings-error", { detail: error.message }))); }, 500);
 }
@@ -52,7 +86,7 @@ export function writeWorkspaceValue(key, value) {
 export async function flushWorkspaceSettings() {
   clearTimeout(saveTimer);
   if (!workspace?.dirty) return;
-  const current = workspace; const values = { ...current.values };
+  const current = workspace; const values = restrictSmsValues(current.values, current.allowedSmsProviders);
   const response = await fetch("/api/settings/workspace", { method: "PUT", headers: { "content-type": "application/json", "x-console-token": current.token }, body: JSON.stringify({ workspaceId: current.id, settings: values }) });
   if (!response.ok) { const error = await response.json().catch(() => ({})); throw new Error(error.error || "配置保存失败，请重试"); }
   if (workspace === current && JSON.stringify(current.values) === JSON.stringify(values)) current.dirty = false;

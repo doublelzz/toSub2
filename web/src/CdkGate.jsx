@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from "react";
 import { KeyRound, LoaderCircle, ShieldCheck } from "lucide-react";
 import { ThemeControl } from "./WorkspaceUi.jsx";
 import ImportChargeDialog from "./ImportChargeDialog.jsx";
-import { clearWorkspaceSettings, flushWorkspaceSettings, hydrateWorkspaceSettings, setImportConfirmation } from "./cdk-api.mjs";
+import { clearWorkspaceSettings, flushWorkspaceSettings, hydrateWorkspaceSettings, refreshWorkspaceSmsPermissions, setImportConfirmation } from "./cdk-api.mjs";
 import "./cdk.css";
 
 export default function CdkGate({ children }) {
@@ -15,27 +15,34 @@ export default function CdkGate({ children }) {
   const [quote, setQuote] = useState(null);
   const quoteResolver = useRef(null);
   const current = useRef(null);
+  const reloadPromise = useRef(null);
 
   async function reload() {
-    try {
+    if (reloadPromise.current) return reloadPromise.current;
+    const operation = (async () => { try {
       const response = await fetch("/api/bootstrap"); const data = await response.json();
       if (!response.ok) { if (data.code === "IP_BLOCKED") setBlocked(data); throw new Error(data.error || "连接失败"); }
       if (data.authenticated) {
         if (!current.current || current.current.workspace.id !== data.workspace.id || current.current.token !== data.token) hydrateWorkspaceSettings(data);
+        else if (JSON.stringify(current.current.workspace.allowedSmsProviders || current.current.features?.allowedSmsProviders) !== JSON.stringify(data.workspace.allowedSmsProviders || data.features?.allowedSmsProviders)) refreshWorkspaceSmsPermissions(data);
         current.current = data; setBootstrap(data); setBlocked(null);
       } else { current.current = null; setBootstrap(null); clearWorkspaceSettings(); }
-    } catch (failure) { setError(failure.message); } finally { setLoading(false); }
+    } catch (failure) { setError(failure.message); } finally { setLoading(false); } })();
+    reloadPromise.current = operation;
+    try { return await operation; } finally { if (reloadPromise.current === operation) reloadPromise.current = null; }
   }
 
   useEffect(() => {
     void reload();
     const refresh = () => void reload();
+    const refreshVisible = () => { if (document.visibilityState !== "hidden") void reload(); };
     const onBlocked = (event) => { setBlocked(event.detail); setBootstrap(null); current.current = null; clearWorkspaceSettings(); };
     const onSettingsError = (event) => setSettingsError(event.detail);
     window.addEventListener("cdk-session-refresh", refresh); window.addEventListener("cdk-balance-changed", refresh);
+    window.addEventListener("cdk-sms-permissions-changed", refresh); window.addEventListener("focus", refreshVisible); document.addEventListener("visibilitychange", refreshVisible);
     window.addEventListener("cdk-access-blocked", onBlocked); window.addEventListener("cdk-settings-error", onSettingsError);
     setImportConfirmation((next) => new Promise((resolve) => { quoteResolver.current?.(false); quoteResolver.current = resolve; setQuote(next); }));
-    return () => { window.removeEventListener("cdk-session-refresh", refresh); window.removeEventListener("cdk-balance-changed", refresh); window.removeEventListener("cdk-access-blocked", onBlocked); window.removeEventListener("cdk-settings-error", onSettingsError); setImportConfirmation(null); quoteResolver.current?.(false); };
+    return () => { window.removeEventListener("cdk-session-refresh", refresh); window.removeEventListener("cdk-balance-changed", refresh); window.removeEventListener("cdk-sms-permissions-changed", refresh); window.removeEventListener("focus", refreshVisible); document.removeEventListener("visibilitychange", refreshVisible); window.removeEventListener("cdk-access-blocked", onBlocked); window.removeEventListener("cdk-settings-error", onSettingsError); setImportConfirmation(null); quoteResolver.current?.(false); };
   }, []);
 
   const finishQuote = (accepted) => { quoteResolver.current?.(accepted); quoteResolver.current = null; setQuote(null); };

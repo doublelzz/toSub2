@@ -29,7 +29,7 @@ export function createOfferRunner(protocolScript) {
         else if (message.type === "mail_sent") onMailSent(message.at);
         else if (message.type === "session") onSession(message.session);
         else if (message.type === "result") finish(null, message.result);
-        else if (message.type === "error") finish(offerError(Object.hasOwn(OFFER_ERRORS, message.code) ? message.code : "login_failed", message.retryable === true));
+        else if (message.type === "error") finish(offerError(Object.hasOwn(OFFER_ERRORS, message.code) ? message.code : "login_failed", message.retryable === true, message.stage));
       } catch { abort(); finish(offerError("invalid_response")); }
     });
     child.once("error", () => finish(offerError("network", true)));

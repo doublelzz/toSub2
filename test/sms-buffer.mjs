@@ -10,11 +10,12 @@ import { createSmsPool } from "../src/sms-pool.mjs";
 process.env.TOSUB2_ENCRYPTION_KEY = crypto.randomBytes(32).toString("base64"); process.env.TOSUB2_ADMIN_CDK = "synthetic-buffer-admin-fixture";
 const roots = []; let checks = 0;
 function check(value, message) { assert.ok(value, message); checks++; }
+async function fill(value) { await value.pool.warmup(value.adminId); await value.pool.tick(); }
 async function fixture({ getNumber, inspect, cancelStrict } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "tosub2-buffer-")); roots.push(root);
   const vault = await createCdkVault(root); const store = await createCdkStore(root, vault); let time = Date.now(); let count = 0; const cancelled = [];
   const provider = (id, config) => ({ activationPolicy: { lifetimeSeconds: 1500, minCancelAgeSeconds: 120, source: "https://provider.example.invalid/policy" },
-    getNumber: getNumber || (async () => { count++; return { requestId: `buffer-order-${count}`, number: `+1202555${String(count).padStart(4, "0")}`, expiresAt: time + 1500000, expiresAtSource: "provider_policy", cancelAllowedAt: time + 120000 }; }),
+    getNumber: getNumber ? () => getNumber(id, config) : (async () => { count++; return { requestId: `buffer-order-${count}`, number: `+1202555${String(count).padStart(4, "0")}`, expiresAt: time + 1500000, expiresAtSource: "provider_policy", cancelAllowedAt: time + 120000 }; }),
     inspect: inspect || (async () => ({ state: "waiting", hasSms: false })),
     cancelStrict: cancelStrict || (async (orderId) => { cancelled.push(orderId); return { cancelled: true, receipt: "ACCESS_CANCEL", refundStatus: "unconfirmed" }; }) });
   const pool = createSmsPool({ store, createProvider: provider, now: () => time }); const adminId = store.adminId;
@@ -31,8 +32,8 @@ try {
   const base = await fixture();
   try {
     await base.pool.tick(); check(base.count() === 0, "enabling a buffer without real demand never purchases inventory");
-    for (let index = 0; index < 3; index++) await base.pool.warmup(base.adminId);
-    check(base.store.inventoryItems({ activeOnly: true }).filter((row) => row.state === "ready").length === 3 && base.count() === 3, "explicit administrator warmup fills global target respecting per-entry cap");
+    await fill(base);
+    check(base.store.inventoryItems({ activeOnly: true }).filter((row) => row.state === "ready").length === 3 && base.count() === 3, "one explicit administrator warmup continuously fills the global target");
     check(base.store.get(base.first.id).balance === 20 && base.store.get(base.first.id).reserved === 0, "prefetch never consumes or reserves tenant quota");
     const summary = base.pool.publicSummary();
     check(summary.hasNumbers && summary.status === "ready" && !JSON.stringify(summary).includes("country") && summary.availableEntries === undefined, "public pool exposes availability without locations or inventory counts");
@@ -52,16 +53,46 @@ try {
     check(!base.pool.publicSummary().hasNumbers && base.store.inventoryItems().filter((row) => row.state === "ready").length === 0, "drain removes only unassigned inventory without replenishing");
   } finally { await base.pool.close(); base.store.close(); }
 
+  const aggressive = await fixture();
+  try {
+    const entries = aggressive.pool.adminSnapshot().entries;
+    for (const entry of entries.slice(1)) aggressive.pool.patchEntry(entry.id, { enabled: false }, aggressive.adminId);
+    aggressive.pool.saveRules({ buffer: { forceRefill: true, target: 10, perEntry: 1, maxPerMinute: 1, maxOutstanding: 1 } }, aggressive.adminId);
+    await aggressive.pool.tick(); check(aggressive.count() === 10, "one stocked quotation fills ten slots without per-entry or legacy minute caps");
+    check(aggressive.pool.adminSnapshot().buffer.progress.state === "full", "background progress confirms the target is full");
+    check(aggressive.pool.adminSnapshot().buffer.items.filter((row) => row.state === "ready").every((row) => row.phone.startsWith("+1202555")), "administrator inventory exposes complete acquired phone numbers");
+    const expiredReady = aggressive.store.inventoryItems({ activeOnly: true }).find((row) => row.state === "ready");
+    aggressive.store.updateInventory(expiredReady.id, (value) => ({ ...value, state: "closed" }));
+    await aggressive.pool.tick(); check(aggressive.count() === 11 && aggressive.store.inventoryItems({ activeOnly: true }).filter((row) => row.state === "ready").length === 10, "automatic refill immediately replaces a consumed inventory slot");
+    await aggressive.pool.tick(); check(aggressive.count() === 11, "a full inventory is never over-purchased");
+    aggressive.pool.saveRules({ buffer: { forceRefill: false } }, aggressive.adminId);
+    aggressive.advance(11 * 60000); await aggressive.pool.tick(); check(aggressive.count() === 11 && aggressive.pool.publicSummary().hasNumbers, "turning automatic refill off preserves usable inventory without idle retirement");
+    await aggressive.pool.drain(aggressive.adminId); aggressive.advance(5000); await aggressive.pool.tick();
+    check(aggressive.count() === 11 && aggressive.pool.adminSnapshot().buffer.rules.forceRefill === false && !aggressive.pool.publicSummary().hasNumbers, "draining pauses automatic refill and does not rebuy retired numbers");
+  } finally { await aggressive.pool.close(); aggressive.store.close(); }
+
+  let noStockCalls = 0;
+  const noStock = await fixture({ getNumber: async () => { noStockCalls++; throw Object.assign(new Error("fixture unavailable"), { code: "NO_NUMBERS" }); } });
+  try {
+    await fill(noStock);
+    const first = noStock.pool.adminSnapshot().buffer.progress;
+    check(noStockCalls === 3 && first.state === "waiting" && first.nextRetryAt === noStock.now() + 5000, "one unavailable pass visits each enabled quotation and schedules a five-second retry");
+    check(first.failures.length === 3 && first.failures.every((row) => row.count === 1), "normal no-stock failures are aggregated by quotation instead of repeated in inventory");
+    noStock.advance(4999); await noStock.pool.tick(); check(noStockCalls === 3, "unavailable sources do not spin inside the retry window");
+    noStock.advance(1); await noStock.pool.tick(); check(noStockCalls === 6 && noStock.pool.adminSnapshot().buffer.progress.failures.every((row) => row.count === 2), "retry aggregates counts and is not held by the legacy ten-minute cooldown");
+    await noStock.pool.pauseRefill(noStock.adminId); noStock.advance(5000); await noStock.pool.tick(); check(noStockCalls === 6 && noStock.pool.adminSnapshot().buffer.progress.state === "paused", "manual pause cancels future no-stock retries");
+  } finally { await noStock.pool.close(); noStock.store.close(); }
+
   const expired = await fixture();
   try {
-    await expired.pool.warmup(expired.adminId); expired.pool.pause(); expired.advance(1020001); await expired.pool.tick(); await expired.pool.tick();
+    await fill(expired); expired.pool.pause(); expired.advance(1020001); await expired.pool.tick(); await expired.pool.tick();
     check(expired.store.inventoryItems().every((row) => row.state !== "ready"), "inventory with less than minimum remaining lifetime is retired before assignment");
-    check(expired.cancelled.length === 1 && expired.count() === 1, "idle paused cleanup cancels without another purchase");
+    check(expired.cancelled.length === 3 && expired.count() === 3, "paused cleanup cancels expired inventory without another purchase");
   } finally { await expired.pool.close(); expired.store.close(); }
 
   const earlySms = await fixture({ inspect: async () => ({ state: "received", hasSms: true }) });
   try {
-    await earlySms.pool.warmup(earlySms.adminId); earlySms.pool.pause(); const input = earlySms.input(); const user = earlySms.pool.forOwner(earlySms.first.id); user.begin(input);
+    await fill(earlySms); earlySms.pool.pause(); const input = earlySms.input(); const user = earlySms.pool.forOwner(earlySms.first.id); user.begin(input);
     const allocation = await user.getNumber(input);
     check(!allocation.inventoryId && earlySms.store.inventoryItems().some((row) => row.lastError === "sms_received_before_assignment"), "received or reused SMS inventory is quarantined and empty-buffer fallback buys a new order");
     user.release(input);
@@ -70,8 +101,8 @@ try {
   let unknownCalls = 0;
   const unknown = await fixture({ getNumber: async () => { unknownCalls++; throw new Error("fixture lost purchase response"); } });
   try {
-    unknown.pool.saveRules({ buffer: { target: 1, lowWater: 0, perEntry: 1, maxOutstanding: 1 } }, unknown.adminId);
-    await unknown.pool.warmup(unknown.adminId); await unknown.pool.tick();
+    unknown.pool.saveRules({ buffer: { forceRefill: true, target: 1, lowWater: 0, perEntry: 1, maxOutstanding: 1 } }, unknown.adminId);
+    await fill(unknown);
     check(unknownCalls === 1 && unknown.store.inventoryItems()[0].state === "purchase_unknown", "uncertain purchase consumes outstanding cap and is never automatically repeated");
     await unknown.pool.close(); unknown.store.close(); unknown.store = await createCdkStore(unknown.root, unknown.vault);
     unknown.pool = createSmsPool({ store: unknown.store, createProvider: unknown.provider, now: unknown.now });
@@ -81,16 +112,18 @@ try {
   let cancelCalls = 0;
   const denied = await fixture({ cancelStrict: async () => { cancelCalls++; throw Object.assign(new Error("fixture cancellation denied"), { code: "OTP_RECEIVED" }); } });
   try {
-    await denied.pool.warmup(denied.adminId); denied.pool.pause(); denied.advance(121000); await denied.pool.drain(denied.adminId); await denied.pool.tick();
+    await fill(denied); denied.pool.pause(); denied.advance(121000); await denied.pool.drain(denied.adminId); await denied.pool.tick();
     const row = denied.store.inventoryItems()[0];
-    check(cancelCalls === 1 && row.state === "quarantined" && row.refundStatus === "unconfirmed", "cancel denial stays quarantined without false refund or cancellation retries");
+    check(cancelCalls === 3 && row.state === "quarantined" && row.refundStatus === "unconfirmed", "cancel denial stays quarantined without false refund or cancellation retries");
   } finally { await denied.pool.close(); denied.store.close(); }
 
   let duplicateCalls = 0;
   const duplicates = await fixture({ getNumber: async () => ({ requestId: `duplicate-${++duplicateCalls}`, number: "+12025550123" }) });
   try {
-    await duplicates.pool.warmup(duplicates.adminId); await duplicates.pool.warmup(duplicates.adminId);
+    await fill(duplicates); await fill(duplicates);
     check(duplicates.store.inventoryItems().filter((row) => row.state === "ready").length === 1 && duplicates.store.inventoryItems().some((row) => row.state === "quarantined" && row.lastError === "duplicate_phone"), "same normalized phone cannot produce two ready allocations across provider orders");
+    const callsAfterDuplicate = duplicateCalls; await duplicates.pool.tick(); duplicates.advance(5000); await duplicates.pool.tick();
+    check(duplicateCalls === callsAfterDuplicate && duplicates.pool.adminSnapshot().buffer.progress.state === "blocked", "unresolved duplicate-phone isolation stops later ticks from repeatedly purchasing the same number");
     const entry = duplicates.pool.adminSnapshot().entries.find((row) => row.id === duplicates.store.inventoryItems().find((row) => row.state === "ready").entryId);
     duplicates.pool.patchEntry(entry.id, { enabled: false }, duplicates.adminId);
     check(!duplicates.pool.publicSummary().hasNumbers, "disabled routing never advertises its old inventory as assignable");
@@ -99,16 +132,16 @@ try {
   const rate = await fixture();
   try {
     rate.pool.saveRules({ buffer: { maxPerMinute: 1 } }, rate.adminId);
-    for (let index = 0; index < 4; index++) await rate.pool.warmup(rate.adminId);
-    check(rate.count() === 1, "prefetch minute rate budget applies even when warmup is repeatedly requested");
-    rate.advance(61000); await rate.pool.tick(); check(rate.count() === 2, "next minute permits a bounded refill");
-    rate.advance(11 * 60000); await rate.pool.tick(); check(rate.count() === 2, "idle window stops all replenishment until another real demand or explicit warmup");
+    await fill(rate); check(rate.count() === 3, "manual refill fills its target despite a legacy per-minute value");
+    const ready = rate.store.inventoryItems({ activeOnly: true }).find((row) => row.state === "ready"); rate.store.updateInventory(ready.id, (row) => ({ ...row, state: "closed" }));
+    await rate.pool.tick(); check(rate.count() === 3, "manual one-shot refill stops after reaching its target");
+    await fill(rate); check(rate.count() === 4, "another explicit refill starts a new one-shot target fill");
   } finally { await rate.pool.close(); rate.store.close(); }
 
   let repeatedOrderCancels = 0;
   const repeatedOrder = await fixture({ getNumber: async () => ({ requestId: "one-activation-only", number: "+12025550123" }), cancelStrict: async () => { repeatedOrderCancels++; return { cancelled: true, receipt: "ACCESS_CANCEL" }; } });
   try {
-    await repeatedOrder.pool.warmup(repeatedOrder.adminId); await repeatedOrder.pool.warmup(repeatedOrder.adminId); repeatedOrder.pool.pause();
+    await fill(repeatedOrder); await fill(repeatedOrder); repeatedOrder.pool.pause();
     const stock = repeatedOrder.store.inventoryItems();
     check(stock.filter((row) => row.state === "ready").length === 1 && stock.some((row) => row.state === "purchase_unknown" && row.lastError === "duplicate_order" && !row.order), "duplicate provider activation is never represented as a second cancellable order");
     repeatedOrder.advance(121000); await repeatedOrder.pool.tick();
@@ -151,9 +184,20 @@ try {
     check(interrupted.store.inventoryItems()[0].order.requestId === "shutdown-prefetch-order", "in-flight purchase result is durably saved during shutdown");
   } finally { await interrupted.pool.close(); interrupted.store.close(); }
 
+  let finishPausedPurchase;
+  const pausedArrival = await fixture({ getNumber: () => new Promise((resolve) => { finishPausedPurchase = resolve; }) });
+  try {
+    await pausedArrival.pool.warmup(pausedArrival.adminId);
+    check(typeof finishPausedPurchase === "function", "warmup acknowledges a continuing request without waiting for its provider response");
+    await pausedArrival.pool.pauseRefill(pausedArrival.adminId);
+    finishPausedPurchase({ requestId: "paused-arrival", number: "+12025550123" }); await pausedArrival.pool.tick();
+    check(pausedArrival.store.inventoryItems()[0].state === "ready" && pausedArrival.pool.adminSnapshot().buffer.progress.state === "paused", "pausing stops new purchases while preserving a valid in-flight arrival");
+  } finally { await pausedArrival.pool.close(); pausedArrival.store.close(); }
+
   let finishDrainPurchase;
   const draining = await fixture({ getNumber: () => new Promise((resolve) => { finishDrainPurchase = resolve; }) });
   try {
+    draining.pool.saveRules({ buffer: { forceRefill: true } }, draining.adminId);
     const warmup = draining.pool.warmup(draining.adminId); const drain = draining.pool.drain(draining.adminId);
     finishDrainPurchase({ requestId: "drained-arrival", number: "+12025550123" }); await Promise.all([warmup, drain]);
     check(draining.store.inventoryItems()[0].state === "cancel_pending" && !draining.pool.publicSummary().hasNumbers, "in-flight warmup response after drain retires on arrival instead of recreating ready stock");

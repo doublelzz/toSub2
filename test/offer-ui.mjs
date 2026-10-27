@@ -11,8 +11,11 @@ const compiled = await transformWithEsbuild(code, "OfferWorkspace.jsx", { loader
 const usedIcons = Object.fromEntries([...code.matchAll(/<([A-Z]\w*)/g)].map((match) => match[1]).filter((name) => icons[name]).map((name) => [name, icons[name]]));
 const allRows = Array.from({ length: 25 }, (_, index) => ({ id: `row-${index}`, email: `fixture-${index}@example.com`, status: "completed", hasPassword: true,
   result: { kind: "half_2m", label: "Plus 半价 2 个月", checkedAt: "2026-10-24T02:00:00Z" }, history: [] }));
-const batch = (id) => ({ id, name: id, status: "completed", total: 25, processed: 25, counts: { completed: 25 }, categories: { half_2m: 25 }, offers: 25, hitRate: 1 });
+Object.assign(allRows[0], { status: "failed", result: null, message: "优惠响应未返回目标账号，已停止检测", errorStageLabel: "解析优惠响应", history: [{ at: "2026-10-24T02:00:00Z", status: "failed", code: "identity_mismatch", stage: "offer_response" }] });
+Object.assign(allRows[1], { status: "failed", result: null, message: "登录身份与账号不一致，请核对资料", history: [{ at: "2026-10-24T02:00:00Z", status: "failed", code: "identity_mismatch" }] });
+const batch = (id) => ({ id, name: id, status: "completed", total: 25, processed: 25, counts: { completed: 23, failed: 2 }, categories: { half_2m: 23 }, offers: 23, hitRate: 1 });
 const calls = []; let access = true;
+const workspaceProxy = "socks5://fixture-user:fixture-password@proxy.example.invalid:1080";
 const cdkFetch = async (url, options = {}) => {
   calls.push({ url, body: options.body ? JSON.parse(options.body) : null });
   if (!access) return Response.json({ error: "余额至少为 1", code: "OFFER_BALANCE_REQUIRED" }, { status: 403 });
@@ -22,11 +25,12 @@ const cdkFetch = async (url, options = {}) => {
     return Response.json({ batch: batch(url.split("/").at(-2)), total: 25, page, pages: 2, items: allRows.slice((page - 1) * 20, page * 20), selection: allRows.map((row) => row.id) });
   }
   if (url.endsWith("/export")) { const body = JSON.parse(options.body); return Response.json({ content: "fixture export", count: body.ids?.length || 25, filename: "fixture.txt" }); }
+  if (url.endsWith("/retry")) return Response.json(batch(url.split("/").at(-2)));
   if (url.endsWith("/access")) return Response.json({ allowed: true });
   throw Error(`Unexpected UI request: ${url}`);
 };
 const bindings = { React, useCallback, useEffect, useRef, useState, ...usedIcons, useDialogFocus: () => {},
-  Drawer: ({ children }) => React.createElement("section", null, children), cdkFetch, readWorkspaceValue: () => "" };
+  Drawer: ({ children, onClose }) => React.createElement("section", { "data-offer-drawer": true }, React.createElement("button", { "aria-label": "关闭测试详情", onClick: onClose }, "关闭详情"), children), cdkFetch, readWorkspaceValue: (key) => key === "chatgpt-onboarding.account-proxy-v1" ? workspaceProxy : "" };
 const { OfferWorkspace, OfferImportDialog, OfferExportDialog, OfferInput } = new Function(...Object.keys(bindings), `${compiled.code};return {OfferWorkspace,OfferImportDialog,OfferExportDialog,OfferInput};`)(...Object.values(bindings));
 const dom = new JSDOM('<div id="root"></div>', { url: "http://localhost" });
 globalThis.window = dom.window; globalThis.document = dom.window.document; globalThis.HTMLElement = dom.window.HTMLElement;
@@ -65,10 +69,55 @@ try {
   await fill(container.querySelector("input"), "001234"); await click("继续"); assert.deepEqual(inputs, ["001234"]);
   await act(async () => root.render(React.createElement(OfferWorkspace, { token: "fixture", balance: 1 })));
   assert.equal(container.querySelectorAll("tbody tr").length, 20);
+  const failedRows = container.querySelectorAll("tbody tr");
+  assert.match(failedRows[0].querySelector('[data-label="执行状态"]').textContent, /失败阶段：解析优惠响应/);
+  assert.doesNotMatch(failedRows[1].querySelector('[data-label="执行状态"]').textContent, /失败阶段/);
+  await act(async () => failedRows[0].querySelector('[data-label="操作"] button').click());
+  assert.match(container.querySelector("[data-offer-drawer]").textContent, /失败阶段：解析优惠响应/);
+  const singleProxy = container.querySelector('[aria-label="本次重试代理"]');
+  assert.equal(singleProxy.type, "password", "proxy credentials remain masked");
+  assert.equal(singleProxy.value, workspaceProxy, "single account retry starts from current workspace proxy");
+  await fill(container.querySelector('.offer-credentials input[type="password"]'), "replacement-password");
+  await fill(singleProxy, "http://replacement.example.invalid:8080");
+  await click("重试这个账号");
+  assert.deepEqual(calls.findLast((value) => value.url.endsWith("/retry")).body, { ids: ["row-0"], credentials: { password: "replacement-password" }, proxyUrl: "http://replacement.example.invalid:8080" }, "single retry sends proxyUrl at top level alongside credentials");
+  assert.equal(container.querySelector("[data-offer-drawer]"), null);
+  await act(async () => container.querySelectorAll("tbody tr")[0].querySelector('[data-label="操作"] button').click());
+  const resetProxy = container.querySelector('[aria-label="本次重试代理"]'); assert.equal(resetProxy.value, workspaceProxy);
+  await fill(resetProxy, ""); await click("重试这个账号");
+  assert.deepEqual(calls.findLast((value) => value.url.endsWith("/retry")).body, { ids: ["row-0"], credentials: {}, proxyUrl: "" }, "clearing single retry proxy explicitly requests direct connection");
+  await act(async () => container.querySelectorAll("tbody tr")[0].querySelector('[data-label="操作"] button').click());
+  await click("关闭详情");
+  await act(async () => container.querySelectorAll("tbody tr")[1].querySelector('[data-label="操作"] button').click());
+  assert.doesNotMatch(container.querySelector("[data-offer-drawer]").textContent, /失败阶段/);
+  await click("关闭详情");
+  const beforeRetryReview = calls.filter((value) => value.url.endsWith("/retry")).length;
+  await click("继续 / 重试失败");
+  assert.equal(container.querySelectorAll("[data-offer-drawer]").length, 1, "batch retry opens one settings drawer");
+  assert.equal(container.querySelector('[aria-label="重试代理方式"]').value, "keep");
+  assert.equal(calls.filter((value) => value.url.endsWith("/retry")).length, beforeRetryReview, "opening settings does not launch a retry");
+  await click("取消");
+  assert.equal(calls.filter((value) => value.url.endsWith("/retry")).length, beforeRetryReview);
+  await click("继续 / 重试失败"); await click("确认继续 / 重试失败");
+  assert.deepEqual(calls.findLast((value) => value.url.endsWith("/retry")).body, {}, "preserving original proxies does not send an implicit override");
+  await click("继续 / 重试失败");
+  await fill(container.querySelector('[aria-label="重试代理方式"]'), "workspace");
+  const batchProxy = container.querySelector('[aria-label="批量重试代理"]');
+  assert.equal(batchProxy.type, "password"); assert.equal(batchProxy.value, workspaceProxy);
+  await click("确认继续 / 重试失败");
+  assert.deepEqual(calls.findLast((value) => value.url.endsWith("/retry")).body, { proxyUrl: workspaceProxy }, "workspace proxy requires explicit selection");
+  await click("继续 / 重试失败");
+  await fill(container.querySelector('[aria-label="重试代理方式"]'), "direct");
+  await click("确认继续 / 重试失败");
+  assert.deepEqual(calls.findLast((value) => value.url.endsWith("/retry")).body, { proxyUrl: "" }, "direct retry explicitly overrides the saved batch proxy");
   await act(async () => container.querySelector('[aria-label="选择检测账号 fixture-0@example.com"]').click());
   await act(async () => container.querySelector('[aria-label="优惠下一页"]').click());
   await act(async () => container.querySelector('[aria-label="选择检测账号 fixture-20@example.com"]').click());
   assert.match(container.textContent, /已选 2 个/);
+  await click("继续 / 重试失败");
+  assert.match(container.querySelector("[data-offer-drawer]").textContent, /选中的 2 个账号/);
+  await click("确认继续 / 重试失败");
+  assert.deepEqual(calls.findLast((value) => value.url.endsWith("/retry")).body, { ids: ["row-0", "row-20"] }, "retry target selection is retained across pages");
   const beforeExport = downloadCount;
   await click("导出所选"); assert.equal(downloadCount, beforeExport);
   assert.deepEqual(calls.findLast((value) => value.url.endsWith("/export")).body.ids, ["row-0", "row-20"]);
@@ -78,7 +127,7 @@ try {
   await act(async () => container.querySelector('[aria-label="关闭优惠导出"]').click());
   await fill(container.querySelector('[aria-label="选择检测批次"]'), "older"); assert.match(container.textContent, /已选 0 个/);
   access = false; await click("刷新"); assert.match(container.textContent, /可用余额至少为 1/); assert.equal(container.querySelector("table"), null);
-  console.log("offer UI passed (import preview, settings, OTP leading zeroes, cross-page selection, batch reset, balance gate and copy/TXT preview)");
+  console.log("offer UI passed (explicit single/batch retry proxies, masked credentials, confirmation cancellation, failure stages, import preview, OTP, cross-page selection, balance gate and exports)");
 } finally {
   await act(() => root.unmount()); dom.window.close(); URL.createObjectURL = originalCreate; URL.revokeObjectURL = originalRevoke;
   if (originalNavigator) Object.defineProperty(globalThis, "navigator", originalNavigator); else delete globalThis.navigator;

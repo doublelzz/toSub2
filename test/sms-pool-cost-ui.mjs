@@ -35,10 +35,11 @@ try {
     buffer: { rules: bufferRules, counts: {}, items: [{ id: "zero", state: "closed", providerId: "smsbower", phone: "******0123", cost: costOrders[0].cost, cancelState: "confirmed", refundStatus: "unconfirmed" },
       { id: "quoted", state: "ready", providerId: "herosms", phone: "******0124", quote: costOrders[1].quote, maxPrice: costOrders[1].maxPrice },
       { id: "legacy", state: "ready", providerId: "herosms", phone: "******0126", maxPrice: "0.40", currency: "USD" },
-      { id: "unknown-currency", state: "ready", providerId: "smsbower", cost: { amount: "1.2", currency: null, source: "order" } }] } };
+      { id: "unknown-currency", state: "ready", providerId: "smsbower", phone: "+12025550127", cost: { amount: "1.2", currency: null, source: "order" } }] } };
   let offline = false;
   const api = async (path = "") => { if (offline) throw Error("fixture cost service offline"); return path.startsWith("/operations?") ? { items: [operation], page: 1, pageSize: 20, pages: 1, total: 1 } : structuredClone(snapshot); };
   await render(SmsPoolWorkspace, { api });
+  await tab("国家报价");
   const summary = container.querySelector('[aria-label="管理员服务商成本"]');
   assert.equal(summary.querySelectorAll(".sp-cost-currency").length, 2);
   assert.match(summary.querySelector(".sp-cost-currency").textContent, /已确认购号金额 0 USD/);
@@ -47,7 +48,8 @@ try {
   assert.match(summary.textContent, /金额未知订单 2/); assert.match(summary.textContent, /币种未知订单 1/);
   assert.match(summary.textContent, /不代表最终净成本/);
 
-  await tab("号码缓冲");
+  await tab("号码库存");
+  await act(async () => button("全部号码").click());
   const bufferRows = [...container.querySelectorAll(".sp-buffer-table tbody tr")];
   assert.match(bufferRows[0].querySelector('[data-label="号码费用"]').textContent, /0 USD平台确认购号金额/);
   assert.match(bufferRows[0].textContent, /取消已确认/); assert.match(bufferRows[0].textContent, /退款待核实/);

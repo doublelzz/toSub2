@@ -44,6 +44,7 @@ try {
     throw Error(`Unexpected production UI request: ${method} ${path}`);
   };
   await render(SmsPoolWorkspace, { api });
+  await tab("设置");
   await fill(container.querySelector('[aria-label="验证成功扣次"]'), "6");
   snapshot.rules = { ...snapshot.rules, fee: 8 };
   await click("刷新");
@@ -57,7 +58,7 @@ try {
   snapshot.rules = { ...snapshot.rules, fee: 9 };
   await click("刷新");
   assert.equal(container.querySelector('[aria-label="验证成功扣次"]').value, "9", "an unedited draft adopts current server rules");
-  await tab("服务商凭据");
+  await tab("设置");
   assert.match(container.querySelector(".sp-credential-row").textContent, /凭据异常/);
   assert.match(container.querySelector(".sp-credential-error").textContent, /余额不足/);
   await click("充值后恢复");

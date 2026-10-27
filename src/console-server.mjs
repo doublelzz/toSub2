@@ -66,6 +66,12 @@ const TOOL_ROOT = path.resolve(__dirname, "..");
 const WORKSPACE_ROOT = TOOL_ROOT;
 export async function createConsoleWorkspace(options) {
 const smsPool = options.smsPool || null;
+const smsProviderAllowed = (providerId) => typeof options.smsProviderAllowed !== "function" || options.smsProviderAllowed(providerId) === true;
+function assertSmsProviderAllowed(providerId) {
+  if (!smsProviderAllowed(providerId)) throw Object.assign(httpError(403, "当前 CDK 未开通此接码方式，请联系管理员配置"), { code: "SMS_PROVIDER_FORBIDDEN" });
+}
+const visibleSmsProviderDefinitions = () => [...publicSmsProviderDefinitions(), ...(smsPool ? [{ id: "pool", name: "接码池", description: "自动获取可用号码，验证成功后扣次", fields: [] }] : [])].filter((provider) => smsProviderAllowed(provider.id));
+const smsFeatures = () => { const smsProviders = visibleSmsProviderDefinitions(); return { smsProviders, allowedSmsProviders: smsProviders.map((provider) => provider.id) }; };
 const PROTOCOL_SCRIPT = path.resolve(options.protocolScript || process.env.ONBOARDING_PROTOCOL_SCRIPT || path.join(__dirname, "protocol-login.mjs"));
 const SUB2API_MONITOR_INTERVAL_MS = readDurationEnv("SUB2API_MONITOR_INTERVAL_MS", 5 * 60_000, 1_000);
 const SUB2API_AUTO_REPAIR_COOLDOWN_MS = readDurationEnv("SUB2API_AUTO_REPAIR_COOLDOWN_MS", 5 * 60_000, 0);
@@ -209,8 +215,8 @@ async function handleApi(req, res, requestUrl) {
         batchPhoneBinding: true,
         pagination: true,
         uniqueEmail: true,
-        smsProviders: [...publicSmsProviderDefinitions(), ...(smsPool ? [{ id: "pool", name: "接码池", description: "自动获取可用号码，验证成功后扣次", fields: [] }] : [])],
-        ...(smsPool ? { smsPool: await smsPool.summary() } : {}),
+        ...smsFeatures(),
+        ...(smsPool && smsProviderAllowed("pool") ? { smsPool: await smsPool.summary() } : {}),
         queue: true,
         sourceExport: true,
         cancelAll: true,
@@ -588,6 +594,7 @@ async function handleApi(req, res, requestUrl) {
   const providerOptionsMatch = /^\/api\/sms-providers\/([a-z0-9_-]+)\/options$/.exec(requestUrl.pathname);
   if (req.method === "POST" && providerOptionsMatch) {
     const body = await readJson(req);
+    assertSmsProviderAllowed(providerOptionsMatch[1]);
     let smsClient;
     try {
       smsClient = createSmsProvider(providerOptionsMatch[1], body.config, {
@@ -725,6 +732,7 @@ async function sendJobsPage(res, requestedPage, emailFilter = null, filters = {}
   const page = Math.min(requestedPage, totalPages);
   const start = (page - 1) * PAGE_SIZE;
   sendJson(res, 200, {
+    features: smsFeatures(),
     jobs: visibleJobs.slice(start, start + PAGE_SIZE).map(publicJob),
     selection: visibleJobs.map(publicSelectionJob),
     pagination: { page, pageSize: PAGE_SIZE, total, totalPages, totalAll: allJobs.length },
@@ -1009,6 +1017,7 @@ function normalizePhoneBinding(value) {
 
 function validatedSmsSetup(value) {
   if (!value || typeof value !== "object") throw httpError(400, "请先完成接码平台配置");
+  assertSmsProviderAllowed(value.id);
   if (value.id === "pool") {
     if (!smsPool) throw httpError(409, "当前接码池不可用");
     const config = value.config || {};
@@ -1022,6 +1031,14 @@ function validatedSmsSetup(value) {
     normalizeSmsNumberRetryConfig(value.config);
     return { id: client.id, config: value.config };
   } catch (error) { throw httpError(400, safeSmsProviderError(error, value.config?.apiKey)); }
+}
+
+async function assertSavedSmsSetupAllowed(job) {
+  if (!job.phoneBindingRequested && job.phoneBindingMode !== "automatic") return;
+  let setup;
+  try { setup = JSON.parse(await fs.readFile(path.join(path.dirname(job.outputPath), "sms-provider.json"), "utf8")); }
+  catch { return; }
+  if (setup?.id) assertSmsProviderAllowed(setup.id);
 }
 
 function captureSmsPoolActor(job, actorId) {
@@ -1260,6 +1277,7 @@ async function prepareAndLaunchJob(job, mode, queueRunId) {
     if (missing.length) throw httpError(409, `已保存的${missing.join("、")}无法读取，请重新填写后再执行`);
     if (mode === "full" && (job.phoneBindingRequested || job.phoneBindingMode === "automatic")) {
       try { job.pendingSmsSetup = JSON.parse(await fs.readFile(path.join(path.dirname(job.outputPath), "sms-provider.json"), "utf8")); } catch { job.pendingSmsSetup = null; }
+      if (job.pendingSmsSetup?.id) assertSmsProviderAllowed(job.pendingSmsSetup.id);
     }
     if (["full", "totp_setup", "password_add"].includes(mode) && job.mailApiUrl) await loadMailboxBaseline(job);
     if (job.deleted || shuttingDown || !options.isEnabled() || !isActive(job.status) || job.status === "queued" || job.queueRunId !== queueRunId) return;
@@ -1516,6 +1534,7 @@ async function retryJob(job, options = {}) {
   if (!["failed", "canceled", "reauth_required", "resume_available", "phone_skipped"].includes(job.status)) {
     throw httpError(409, "当前任务不需要重新授权");
   }
+  await assertSavedSmsSetupAllowed(job);
   const retryingSecurityCheck = Boolean(job.securityCheckRequired);
   if (Object.hasOwn(options, "proxyUrl")) {
     await reloadMissingJobCredentials(job);
@@ -1598,6 +1617,7 @@ async function forceReloginJob(job, options = {}, context = {}) {
   if (!canForceRelogin(job)) {
     throw httpError(409, "当前任务正在进行中，不能重新登录");
   }
+  await assertSavedSmsSetupAllowed(job);
   if (job.pendingPasswordRecovery || job.pendingTotpRecovery || Object.hasOwn(options, "proxyUrl")) await reloadMissingJobCredentials(job);
   if (!canForceRelogin(job)) {
     throw httpError(409, "当前任务正在进行中，不能重新登录");
@@ -2706,6 +2726,7 @@ function startPoolSmsNumberAcquisition(job) {
         job.smsStatus = "idle";
         return;
       }
+      assertSmsProviderAllowed("pool");
       try {
         const billing = await smsPool.begin({ operationId, jobId: job.id, email: job.email, runId,
           expectedFee: job.smsPoolExpectedFee, actorId: job.smsPoolActorId || options.cdkId });
@@ -2725,6 +2746,7 @@ function startPoolSmsNumberAcquisition(job) {
       updatePoolBilling(job, await smsPool.release({ operationId, reason: "排队任务已停止" }));
       return;
     }
+    assertSmsProviderAllowed("pool");
     job.smsError = null;
     const allocation = await smsPool.getNumber({ operationId });
     const client = allocation.client || poolProviderClient(allocation.providerId, allocation.config);
@@ -2759,7 +2781,8 @@ function startPoolSmsNumberAcquisition(job) {
   void operation.catch(async error => {
     if (job.smsPoolOperationId !== operationId) return;
     job.smsStatus = "error";
-    job.smsError = error.code === "SMS_POOL_FEE_CHANGED" ? "接码池收费已变更，请重新确认后开始"
+    job.smsError = error.code === "SMS_PROVIDER_FORBIDDEN" ? error.message
+      : error.code === "SMS_POOL_FEE_CHANGED" ? "接码池收费已变更，请重新确认后开始"
       : error.code === "INSUFFICIENT_QUOTA" ? "可用次数不足以使用接码池，请补充次数后重试"
       : "接码池暂未取得可用号码，请稍后重试";
     if (job.smsPoolBilling?.state === "queued") updatePoolBilling(job, { ...job.smsPoolBilling, state: "released", reserved: 0 });
@@ -2777,6 +2800,7 @@ function startPoolSmsNumberAcquisition(job) {
 }
 
 async function acquireSmsNumber(job, providerId, config) {
+  assertSmsProviderAllowed(providerId);
   if (job.phoneBindingEnabled === false) throw httpError(409, "该任务已关闭接码，不会申请手机号");
   requireStage(job, "phone");
   if (job.smsStatus === "requesting" || job.smsNumberAcquisitionPromise) {
@@ -2886,6 +2910,7 @@ async function acquireSmsNumberAttempt(job, token) {
   const smsClient = job.smsClient;
   const providerConfig = job.smsProviderConfig;
   if (!smsClient) return "stopped";
+  assertSmsProviderAllowed(job.smsPoolMode ? "pool" : job.smsProviderId);
   job.smsNumberAttempt += 1;
   const attempt = job.smsNumberAttempt;
   job.smsStatus = "requesting";
@@ -2950,6 +2975,10 @@ function requestAutomaticSmsRotation(job, reason) {
     || job.smsRetryPending
     || job.smsNumberAcquisitionPromise
   ) return;
+  if (!smsProviderAllowed(job.smsPoolMode ? "pool" : job.smsProviderId)) {
+    job.smsStatus = "error"; job.smsError = "当前 CDK 已停用此接码方式，自动换号已停止，请选择已开通的接码方式";
+    job.smsRetryPending = false; touch(job); void saveJobMetadata(job).catch(() => {}); return;
+  }
   const message = String(reason || "当前手机号不可用");
   if (job.smsNumberAttempt >= job.smsNumberMaxAttempts) {
     releaseSmsNumber(
@@ -2975,6 +3004,10 @@ function requestAutomaticSmsRotation(job, reason) {
 }
 
 function scheduleSmsNumberRetry(job, reason = "手机号不可用", options = {}) {
+  if (job.smsProviderId && !smsProviderAllowed(job.smsPoolMode ? "pool" : job.smsProviderId)) {
+    job.smsRetryPending = false; job.smsStatus = "error"; job.smsError = "当前 CDK 已停用此接码方式，自动换号已停止，请选择已开通的接码方式";
+    touch(job); void saveJobMetadata(job).catch(() => {}); return;
+  }
   const alreadyPending = options.alreadyPending === true;
   if (alreadyPending && job.smsNumberAttempt >= job.smsNumberMaxAttempts) {
     job.smsRetryPending = false;
@@ -3008,6 +3041,7 @@ function scheduleSmsNumberRetry(job, reason = "手机号不可用", options = {}
       ) return;
       let smsClient;
       try {
+        assertSmsProviderAllowed(job.smsPoolMode ? "pool" : job.smsProviderId);
         smsClient = createSmsProvider(job.smsProviderId, job.smsProviderConfig, {
           lubanApiBase: process.env.LUBAN_SMS_API_BASE,
           smsBowerApiBase: process.env.SMSBOWER_API_BASE,

@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Ban,
@@ -117,9 +117,9 @@ function App({ auth }) {
   const [page, setPage] = useState(1);
   const [pagination, setPagination] = useState({ page: 1, pageSize: 20, total: 0, totalPages: 1 });
   const [stats, setStats] = useState({ active: 0, queued: 0, completed: 0 });
-  const [smsSettings, setSmsSettings] = useState(readSmsProviderSettings);
+  const [smsSettings, setSmsSettings] = useState(() => withSmsProviderDefaults(auth.features?.smsProviders || [], readSmsProviderSettings()));
   const [smsSettingsOpen, setSmsSettingsOpen] = useState(false);
-  const [smsSettingsDraft, setSmsSettingsDraft] = useState(readSmsProviderSettings);
+  const [smsSettingsDraft, setSmsSettingsDraft] = useState(() => withSmsProviderDefaults(auth.features?.smsProviders || [], readSmsProviderSettings()));
   const [smsSettingsError, setSmsSettingsError] = useState("");
   const [smsChargeQuote, setSmsChargeQuote] = useState(null);
   const [smsNumberOptionsState, setSmsNumberOptionsState] = useState(null);
@@ -165,6 +165,11 @@ function App({ auth }) {
   useEffect(() => writeLocalJson(SUB2API_UPLOAD_SETTINGS_KEY, sub2apiSettings), [sub2apiSettings]);
   useEffect(() => writeLocalTextSetting(ACCOUNT_PROXY_STORAGE_KEY, accountProxyUrl.trim()), [accountProxyUrl]);
   useEffect(() => writeLocalTextSetting("tosub2.density", density), [density]);
+
+  useEffect(() => {
+    setToken(auth.token);
+    setFeatures(auth.features || {});
+  }, [auth.token, auth.features]);
 
   useEffect(() => {
     let stopped = false;
@@ -216,6 +221,7 @@ function App({ auth }) {
           setJobSelectionIndex(data.selection || data.jobs);
           setPagination(data.pagination || { page, pageSize: 20, total: data.jobs.length, totalPages: 1 });
           setStats(data.stats || { active: 0, queued: 0, completed: 0 });
+          if (data.features) setFeatures((current) => ({ ...current, ...data.features }));
           setLoaded(true);
           if (data.pagination?.page && data.pagination.page !== page) setPage(data.pagination.page);
           setError("");
@@ -256,6 +262,24 @@ function App({ auth }) {
 
   const pageJobIds = useMemo(() => jobs.map((job) => job.id), [jobs]);
   const smsProviderDefinitions = Array.isArray(features.smsProviders) ? features.smsProviders : [];
+  const smsProviderAccessKey = smsProviderDefinitions.map((provider) => provider.id).join(",");
+  const smsProviderAccess = useRef(null);
+  useEffect(() => {
+    const previousAccess = smsProviderAccess.current;
+    smsProviderAccess.current = smsProviderAccessKey;
+    const normalize = (current) => {
+      const next = withSmsProviderDefaults(smsProviderDefinitions, current);
+      return JSON.stringify(next) === JSON.stringify(current) ? current : next;
+    };
+    setSmsSettings(normalize);
+    setSmsSettingsDraft(normalize);
+    setSmsNumberOptionsState((current) => current && smsProviderDefinitions.some((provider) => provider.id === current.providerId) ? current : null);
+    setSmsChargeQuote((current) => {
+      if (!current || smsProviderDefinitions.some((provider) => provider.id === "pool")) return current;
+      current.resolve(null); return null;
+    });
+    if (previousAccess !== null && previousAccess !== smsProviderAccessKey) window.dispatchEvent(new window.CustomEvent("cdk-sms-permissions-changed"));
+  }, [smsProviderAccessKey]);
   const activeSmsProvider = useMemo(
     () => resolveSmsProvider(smsProviderDefinitions, smsSettings),
     [smsProviderDefinitions, smsSettings],
@@ -460,6 +484,7 @@ function App({ auth }) {
   }
 
   async function loadSmsNumberOptions(settings = smsSettingsDraft) {
+    const requestedAccess = smsProviderAccess.current;
     const resolved = resolveSmsProvider(smsProviderDefinitions, settings);
     if (!resolved.definition?.optionsEndpoint) return;
     if (!String(resolved.config.apiKey || "").trim()) {
@@ -473,6 +498,7 @@ function App({ auth }) {
         method: "POST",
         body: JSON.stringify({ config: resolved.config }),
       });
+      if (requestedAccess !== smsProviderAccess.current) return;
       const options = Array.isArray(data.options) ? data.options : [];
       setSmsNumberOptionsState({ providerId: resolved.id, apiKey: resolved.config.apiKey, service: resolved.config.service, options });
       const eligible = resolved.id === "smsbower" ? filterSmsOptionsByGrade(options, resolved.config.gradeFilter) : options;
@@ -753,7 +779,9 @@ function App({ auth }) {
   async function prepareSmsProvider(count = 1, { importing = false } = {}) {
     if (activeSmsProvider.id !== "pool") return { id: activeSmsProvider.id, config: activeSmsProvider.config };
     if (importing) return { id: "pool", config: {} };
+    const requestedAccess = smsProviderAccess.current;
     const summary = await apiFetch(token, "/api/sms-pool");
+    if (requestedAccess !== smsProviderAccess.current) throw new Error("接码权限已变化，请重新选择接码方式");
     if (!summary.enabled || !summary.available) throw new Error("接码池暂时无法取号，请稍后重试或选择自己的接码平台");
     const admin = auth.workspace.role === "admin";
     if (!admin && auth.workspace.balance < summary.fee) throw new Error(`接码池需要预留 ${summary.fee} 次，当前可用 ${auth.workspace.balance} 次`);
@@ -2543,9 +2571,9 @@ function formatSub2ApiProxy(proxy) {
 }
 
 function withSmsProviderDefaults(definitions, settings) {
-  const configs = { ...(settings?.configs || {}) };
+  const configs = {};
   definitions.forEach((provider) => {
-    const current = { ...(configs[provider.id] || {}) };
+    const current = { ...(settings?.configs?.[provider.id] || {}) };
     provider.fields.forEach((field) => {
       if (!String(current[field.key] || "").trim() && field.defaultValue) current[field.key] = field.defaultValue;
     });
@@ -2553,7 +2581,7 @@ function withSmsProviderDefaults(definitions, settings) {
   });
   const selectedProviderId = definitions.some((provider) => provider.id === settings?.selectedProviderId)
     ? settings.selectedProviderId
-    : definitions[0]?.id || settings?.selectedProviderId || "luban";
+    : definitions.find((provider) => provider.id === "custom")?.id || definitions[0]?.id || "";
   return { selectedProviderId, configs };
 }
 

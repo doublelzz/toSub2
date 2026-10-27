@@ -36,7 +36,7 @@ async function fill(element, value) {
   });
 }
 const credentials = [{ id: "cred-a", name: "Primary", providerId: "smsbower", enabled: true, hasApiKey: true }, { id: "cred-b", name: "Backup", providerId: "herosms", enabled: true, hasApiKey: true }];
-const rules = { enabled: true, fee: 3, noStockThreshold: 3, cooldownMinutes: 10, maxAttempts: 10, maxConcurrent: 5, buffer: { enabled: false, target: 3, lowWater: 1, perEntry: 1, refillConcurrency: 1, minRemainingSeconds: 480, idleMinutes: 10, maxOutstanding: 10, maxPerMinute: 6 } };
+const rules = { enabled: true, fee: 3, noStockThreshold: 3, cooldownMinutes: 10, maxAttempts: 10, maxConcurrent: 5, buffer: { enabled: false, forceRefill: false, target: 3, lowWater: 1, perEntry: 1, refillConcurrency: 1, minRemainingSeconds: 480, idleMinutes: 10, maxOutstanding: 10, maxPerMinute: 6 } };
 const issues = []; const check = (condition, message) => { if (!condition) issues.push(message); };
 
 try {
@@ -45,6 +45,7 @@ try {
   const api = async (path = "", method = "GET", body) => { calls.push({ path, method, body }); if (path === "/rules") snapshot = { ...snapshot, rules: body }; return structuredClone(snapshot); };
   await render(SmsPoolWorkspace, { api });
   assert.match(container.querySelector(".sp-pool-status").textContent, /1 个可用条目/);
+  await act(() => [...container.querySelectorAll(".sp-tabs button")].find((element) => element.textContent === "设置").click());
   const switchInput = container.querySelector('[role="switch"]');
   await act(() => switchInput.click());
   await fill(container.querySelector('[aria-label="验证成功扣次"]'), "1.5");
@@ -52,7 +53,7 @@ try {
   for (const [label, value] of [["验证成功扣次", "4"], ["连续无号暂停阈值", "5"], ["首次冷却分钟", "8"], ["单次取号尝试上限", "7"], ["池并发上限", "3"]]) await fill(container.querySelector(`[aria-label="${label}"]`), value);
   await click("保存池规则");
   const submittedRules = calls.find((row) => row.path === "/rules");
-  assert.deepEqual(submittedRules.body, { enabled: false, fee: 4, noStockThreshold: 5, cooldownMinutes: 8, maxAttempts: 7, maxConcurrent: 3, buffer: rules.buffer });
+  assert.deepEqual(submittedRules.body, { enabled: false, fee: 4, noStockThreshold: 5, cooldownMinutes: 8, maxAttempts: 7, maxConcurrent: 3, buffer: { enabled: true, forceRefill: false, target: 3 } });
   assert.match(container.textContent, /接码池已关闭/);
   check(container.querySelector('[aria-label="单次取号尝试上限"]').max === "20", "UI maximum attempts must match server limit 20");
 

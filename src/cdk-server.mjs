@@ -12,6 +12,8 @@ import { createSmsPool } from "./sms-pool.mjs";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cookieName = "tosub2_session";
+const smsSettingsKey = "chatgpt-onboarding.sms-provider-settings-v1";
+const legacySmsSettingsKeys = ["chatgpt-onboarding.luban-api-key", "chatgpt-onboarding.luban-service-id"];
 
 function send(res, status, value) {
   if (res.headersSent) return;
@@ -54,7 +56,46 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
   let cleanupFailedStart = async () => {};
   try {
   const vault = await createCdkVault(root); const store = await createCdkStore(root, vault);
-  const smsPool = createSmsPool({ store, ...smsPoolOptions });
+  const smsPool = createSmsPool({ store, ...smsPoolOptions, canUseProvider: (ownerId, providerId) => store.smsProviderAllowed(ownerId, providerId) });
+  const assertSmsProvider = (owner, providerId) => {
+    if (!store.smsProviderAllowed(owner, providerId)) throw cdkError(403, "当前 CDK 未开通此接码方式，请联系管理员", "SMS_PROVIDER_FORBIDDEN");
+  };
+  const parseSmsSettings = (value) => {
+    try { const parsed = typeof value === "string" ? JSON.parse(value) : value; return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null; } catch { return null; }
+  };
+  const visibleWorkspaceSettings = (owner, source = store.setting(owner, "workspace") || {}) => {
+    const settings = { ...source }; const allowed = store.allowedSmsProviders(owner);
+    if (Object.hasOwn(settings, smsSettingsKey)) {
+      const original = parseSmsSettings(settings[smsSettingsKey]) || {};
+      const configs = Object.fromEntries(Object.entries(original.configs || {}).filter(([id]) => allowed.includes(id)));
+      const value = { selectedProviderId: allowed.includes(original.selectedProviderId) ? original.selectedProviderId : "custom", configs };
+      settings[smsSettingsKey] = typeof settings[smsSettingsKey] === "string" ? JSON.stringify(value) : value;
+    }
+    if (!allowed.includes("luban")) for (const key of legacySmsSettingsKeys) delete settings[key];
+    return settings;
+  };
+  const mergeWorkspaceSettings = (owner, incoming, previous) => {
+    const settings = { ...incoming }; const allowed = store.allowedSmsProviders(owner);
+    for (const key of legacySmsSettingsKeys) {
+      if (Object.hasOwn(settings, key) && settings[key] && !allowed.includes("luban")) assertSmsProvider(owner, "luban");
+      if (!allowed.includes("luban") && Object.hasOwn(previous, key)) settings[key] = previous[key];
+    }
+    if (Object.hasOwn(settings, smsSettingsKey)) {
+      const supplied = parseSmsSettings(settings[smsSettingsKey]);
+      if (!supplied || supplied.configs != null && (typeof supplied.configs !== "object" || Array.isArray(supplied.configs))) throw cdkError(422, "接码配置格式不正确");
+      if (supplied.selectedProviderId != null) assertSmsProvider(owner, supplied.selectedProviderId);
+      for (const id of Object.keys(supplied.configs || {})) if (!allowed.includes(id)) assertSmsProvider(owner, id);
+      const stored = parseSmsSettings(previous[smsSettingsKey]) || {};
+      const hidden = Object.fromEntries(Object.entries(stored.configs || {}).filter(([id]) => !allowed.includes(id)));
+      const value = { selectedProviderId: supplied.selectedProviderId || "custom", configs: { ...hidden, ...supplied.configs } };
+      settings[smsSettingsKey] = typeof settings[smsSettingsKey] === "string" ? JSON.stringify(value) : value;
+    } else if (Object.hasOwn(previous, smsSettingsKey)) settings[smsSettingsKey] = previous[smsSettingsKey];
+    return settings;
+  };
+  const assertSmsRequest = (owner, body = {}) => {
+    if (body.smsProvider?.id) assertSmsProvider(owner, body.smsProvider.id);
+    if (body.lubanApiKey || body.lubanServiceId) assertSmsProvider(owner, "luban");
+  };
   const namespace = crypto.createHash("sha256").update(root).digest("hex");
   const workspaces = new Map(); const creating = new Map(); const importing = new Map();
   const recoveryLocked = new Set();
@@ -94,6 +135,7 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
       const workspace = await createWorkspace({
         root: workspaceRoot, cdkId: id, namespace, legacyEmails: id === store.adminId ? initialLegacyEmails : new Set(),
         smsPool: smsPool.forOwner(id),
+        smsProviderAllowed: (providerId) => store.smsProviderAllowed(id, providerId),
         rebindVault: { seal: (value, scope) => vault.seal(value, `rebind:${id}:${scope}`), open: (value, scope) => vault.open(value, `rebind:${id}:${scope}`) },
         offerVault: { seal: (value, scope) => vault.seal(value, `offers:${id}:${scope}`), open: (value, scope) => vault.open(value, `offers:${id}:${scope}`) },
         offerCanUse: () => !shuttingDown && store.get(id)?.status === "active" && store.get(id).balance >= 1,
@@ -131,6 +173,7 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
     await previous;
     let workspace; let record; let applied = false;
     try {
+      if (["single", "authorization"].includes(mode)) assertSmsRequest(id, body);
       workspace = await workspaceFor(id); workspace.pause();
       const prior = store.findImport(id, mode, body, requestKey);
       if (prior?.status === "completed") return JSON.parse(prior.result);
@@ -189,7 +232,11 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
     const workspace = await workspaceFor(session.workspace.id);
     const response = await workspace.dispatch("GET", "/api/bootstrap");
     const original = JSON.parse(response.body.toString());
-    return { authenticated: true, token: session.csrf, account: store.get(session.actor.id), workspace: store.get(session.workspace.id), settings: store.setting(session.workspace.id, "workspace") || {}, features: { ...original.features, cdk: true, admin: session.actor.role === "admin" } };
+    const allowedSmsProviders = store.allowedSmsProviders(session.workspace.id);
+    const features = { ...original.features, smsProviders: allowedSmsProviders.map((id) => original.features?.smsProviders?.find((provider) => provider.id === id)).filter(Boolean),
+      allowedSmsProviders, cdk: true, admin: session.actor.role === "admin" };
+    if (!allowedSmsProviders.includes("pool")) delete features.smsPool;
+    return { authenticated: true, token: session.csrf, account: store.get(session.actor.id), workspace: store.get(session.workspace.id), settings: visibleWorkspaceSettings(session.workspace.id), features };
   }
 
   function sessionCookie(req, value, expired = false) {
@@ -222,7 +269,7 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
       if (cdk) { this.setHeader("x-cdk-id", owner); this.setHeader("x-cdk-balance", String(cdk.balance)); this.setHeader("x-cdk-reserved", String(cdk.reserved)); }
       return writeScopedHead.apply(this, args);
     };
-    if (url.pathname === "/api/sms-pool" && req.method === "GET") { send(res, 200, smsPool.publicSummary()); return; }
+    if (url.pathname === "/api/sms-pool" && req.method === "GET") { assertSmsProvider(owner, "pool"); send(res, 200, smsPool.publicSummary()); return; }
     if (url.pathname === "/api/auth/me" && req.method === "GET") { send(res, 200, await bootstrap(session)); return; }
     if (url.pathname === "/api/auth/logout" && req.method === "POST") { store.logout(session); res.setHeader("set-cookie", sessionCookie(req, "", true)); send(res, 200, { ok: true }); return; }
     if (url.pathname === "/api/auth/workspace" && req.method === "POST") {
@@ -230,13 +277,13 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
       const updated = store.session(cookie(req)); updated.csrf = csrf; send(res, 200, await bootstrap(updated)); return;
     }
     if (url.pathname === "/api/settings/workspace") {
-      if (req.method === "GET") send(res, 200, { settings: store.setting(owner, "workspace") || {} });
+      if (req.method === "GET") send(res, 200, { settings: visibleWorkspaceSettings(owner) });
       else if (req.method === "PUT") {
         const body = await readRequestJson(req);
         if (body.workspaceId !== owner) throw cdkError(409, "工作区已变化，请重新加载配置");
         const allowed = new Set(["chatgpt-onboarding.sms-provider-settings-v1", "chatgpt-onboarding.mail-request-settings-v1", "chatgpt-onboarding.sub2api-upload-settings-v1", "chatgpt-onboarding.account-proxy-v1", "chatgpt-onboarding.luban-api-key", "chatgpt-onboarding.luban-service-id"]);
         const settings = Object.fromEntries(Object.entries(body.settings || {}).filter(([key]) => allowed.has(key)));
-        store.saveSetting(owner, "workspace", settings); send(res, 200, { ok: true });
+        store.saveSetting(owner, "workspace", mergeWorkspaceSettings(owner, settings, store.setting(owner, "workspace") || {})); send(res, 200, { ok: true });
       } else throw cdkError(405, "请求方法不支持");
       return;
     }
@@ -266,9 +313,15 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
     if (url.pathname.startsWith("/api/admin/")) {
       if (session.actor.role !== "admin") throw cdkError(403, "需要管理员权限");
       if (url.pathname === "/api/admin/sms-pool" && req.method === "GET") { send(res, 200, smsPool.adminSnapshot()); return; }
+      if (url.pathname === "/api/admin/sms-pool/analytics" && req.method === "GET") { send(res, 200, smsPool.analytics(Object.fromEntries(url.searchParams))); return; }
+      if (url.pathname === "/api/admin/sms-pool/inventory" && req.method === "GET") { send(res, 200, smsPool.inventoryPage(Object.fromEntries(url.searchParams))); return; }
       if (url.pathname === "/api/admin/sms-pool/rules" && req.method === "PUT") { send(res, 200, smsPool.saveRules(await readRequestJson(req), actor)); return; }
       if (url.pathname === "/api/admin/sms-pool/buffer/warmup" && req.method === "POST") {
         send(res, 200, await smsPool.warmup(actor));
+        return;
+      }
+      if (url.pathname === "/api/admin/sms-pool/buffer/pause" && req.method === "POST") {
+        send(res, 200, await smsPool.pauseRefill(actor));
         return;
       }
       if (url.pathname === "/api/admin/sms-pool/buffer/drain" && req.method === "POST") {
@@ -361,6 +414,7 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
     }
     if (url.pathname === "/api/imports/preview" && req.method === "POST") {
       const body = await readRequestJson(req); const mode = ["single", "authorization", "mfa", "rebind"].includes(body.mode) ? body.mode : "authorization";
+      if (["single", "authorization"].includes(mode)) assertSmsRequest(owner, body.payload || {});
       const emails = workspace.planImport(mode, body.payload || {}); send(res, 200, store.preview(owner, emails)); return;
     }
     const importMode = req.method === "POST" && ({ "/api/jobs": "single", "/api/jobs/batch": "authorization", "/api/mfa/import": "mfa", "/api/rebind/sync": "rebind" })[url.pathname];
@@ -369,6 +423,14 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
       res.setHeader("x-cdk-balance", String(store.get(owner).balance)); send(res, result.status, result.data); return;
     }
     if (!["GET", "HEAD"].includes(req.method)) req.jsonBody = await readRequestJson(req);
+    if (req.method === "POST") {
+      const providerOptions = /^\/api\/sms-providers\/([^/]+)\/options$/.exec(url.pathname);
+      if (providerOptions) assertSmsProvider(owner, providerOptions[1]);
+      if (/^\/api\/jobs(?:\/|$)/.test(url.pathname)) {
+        assertSmsRequest(owner, req.jsonBody || {});
+        if (/\/(sms-number|luban-number)$/.test(url.pathname)) assertSmsProvider(owner, url.pathname.endsWith("/luban-number") ? "luban" : req.jsonBody?.providerId || "luban");
+      }
+    }
     if (!["GET", "HEAD"].includes(req.method) && (importing.has(owner) || recoveryLocked.has(owner))) throw cdkError(409, "此工作区正在导入或恢复，请稍后再操作");
     if (url.pathname === "/api/jobs/delete-batch") {
       const response = await workspace.dispatch(req.method, url.pathname, req.jsonBody, actor);

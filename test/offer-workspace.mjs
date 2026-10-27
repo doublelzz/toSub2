@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createCdkVault } from "../src/cdk-vault.mjs";
-import { checkOffer, classifyOffer, OFFER_CAMPAIGNS } from "../src/offer-checker.mjs";
+import { checkOffer, classifyOffer, OFFER_CAMPAIGNS, offerProtocolFailure } from "../src/offer-checker.mjs";
 import { createOfferWorkspace, parseOfferImport } from "../src/offer-workspace.mjs";
 
 const identity = { email: "fixture@example.com", accountId: "personal-id" };
@@ -17,10 +17,46 @@ assert.equal(classifyOffer(response("plus-1-month-free", { plan_type: "pro" }), 
 assert.equal(classifyOffer(response("plus-1-month-free", { is_deactivated: true }), identity).kind, "banned");
 assert.throws(() => classifyOffer({ accounts: { other: { account: { plan_type: "free" }, eligible_promo_campaigns: {} } } }, identity), /身份/);
 assert.throws(() => classifyOffer({ accounts: { "personal-id": { account: { plan_type: "free" } } } }, identity), /响应/);
+// A single verified account may be returned under both an alias and its ID.
+const personal = response("plus-1-month-free").accounts["personal-id"];
+for (const accounts of [{ default: personal, "personal-id": personal }, { "personal-id": personal, default: personal },
+  { team: response().accounts.unrelated, default: personal, alias: personal, "PERSONAL-ID": personal }]) {
+  assert.equal(classifyOffer({ accounts }, identity).kind, "trial_1m");
+}
+assert.equal(classifyOffer({ accounts: { default: { ...personal, account: { ...personal.account, name: "default display" } }, "personal-id": personal } }, identity).kind, "trial_1m", "display metadata does not change the same account conclusion");
+assert.equal(classifyOffer({ accounts: { "personal-id": { ...personal, account: { plan_type: "free" } } } }, identity).kind, "trial_1m", "exact map key supports an omitted inner ID");
+for (const other of [response().accounts["personal-id"], response("plus-2-months-50-pct-off").accounts["personal-id"],
+  response("plus-1-month-free", { plan_type: "plus" }).accounts["personal-id"]]) {
+  assert.throws(() => classifyOffer({ accounts: { default: personal, "personal-id": other } }, identity),
+    (error) => error.offerCode === "invalid_response" && error.offerStage === "account_alias_conflict", "conflicting aliases must not choose whichever offer is preferred");
+}
+assert.throws(() => classifyOffer({ accounts: { default: personal, "personal-id": { ...personal, account: { account_id: "another-account", plan_type: "free" } } } }, identity),
+  (error) => error.offerCode === "identity_mismatch" && error.offerStage === "offer_response", "canonical map key cannot conceal a different explicit account ID");
+for (const accounts of [{ default: { account: { plan_type: "free" }, eligible_promo_campaigns: {} } },
+  { default: { ...personal, account: { account_id: "team-id", plan_type: "free" } } }]) {
+  assert.throws(() => classifyOffer({ accounts }, identity), (error) => error.offerCode === "identity_mismatch" && error.offerStage === "offer_response");
+}
+for (const account of [null, [], { account_id: {}, plan_type: "free" }]) {
+  assert.throws(() => classifyOffer({ accounts: { "personal-id": { account, eligible_promo_campaigns: {} } } }, identity), (error) => error.offerCode === "invalid_response");
+}
 const token = `e30.${Buffer.from(JSON.stringify({ email: identity.email, exp: Math.floor(Date.now() / 1000) + 3600, "https://api.openai.com/auth": { chatgpt_account_id: identity.accountId } })).toString("base64url")}.fixture`;
 const session = { type: "chatgpt-session", version: 1, email: identity.email, accessToken: token };
 await assert.rejects(checkOffer(session, identity.email, async () => ({ status: 403, body: { error: { code: "forbidden" } } })), (failure) => failure.offerCode === "forbidden");
+await assert.rejects(checkOffer(session, "wrong@example.invalid", () => { throw Error("no request should be made"); }), (failure) => failure.offerCode === "identity_mismatch" && failure.offerStage === "session_identity");
+await assert.rejects(checkOffer(session, identity.email, async () => ({ status: 403, body: {} })), (failure) => failure.offerStage === "offer_request");
 assert.equal((await checkOffer(session, identity.email, async () => ({ status: 403, body: { error: { code: "account_deactivated" } } }))).kind, "banned");
+for (const [message, proxy, expected] of [
+  ["DNSError: curl: (6) Could not resolve host: fixture.invalid", true, "proxy_dns"],
+  ["Could not resolve host: fixture.invalid", false, "network_dns"],
+  ["Failed to perform, curl: (56) CONNECT tunnel failed, response 407", true, "proxy_connection"],
+  ["Failed to perform, curl: (28) Operation timed out", true, "network_timeout"],
+  ["PROXY_RISK_CONTROL: security-check page", true, "forbidden"],
+  ["Password was rejected", true, "login_failed"],
+]) {
+  const failure = offerProtocolFailure(new Error(`${message} PRIVATE_DIAGNOSTIC_SHOULD_NOT_ESCAPE`), "login", proxy);
+  assert.equal(failure.offerCode, expected); assert.equal(failure.offerStage, "login");
+  assert.doesNotMatch(failure.message, /PRIVATE_DIAGNOSTIC|fixture\.invalid|407/);
+}
 const parseText = (value) => value.split("\n").map((line) => { const [email, password = ""] = line.split("----"); if (!email.includes("@")) throw Error(); return { email, password }; });
 assert.equal(parseOfferImport("a@example.com----private-password\na@example.com----second", parseText).duplicateCount, 1);
 assert.throws(() => parseOfferImport('{"type":"sub2api-data"}', parseText), /列表/);

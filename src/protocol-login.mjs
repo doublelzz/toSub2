@@ -11,7 +11,7 @@ import { normalizeOAuthCredentials, withSub2ApiExpiry, validateSub2ApiData } fro
 import { readMfaSession, writeMfaSession } from "./mfa-session.mjs";
 import { emailRebindStep } from "./email-rebind-protocol.mjs";
 import { describeRebindError, formatRebindDiagnostic, traceRebindTransport } from "./email-rebind-logs.mjs";
-import { checkOffer, offerError, offerIdentity } from "./offer-checker.mjs";
+import { checkOffer, offerError, offerIdentity, offerProtocolFailure } from "./offer-checker.mjs";
 import {
   browserIdentityForTlsProfile,
   DEFAULT_TLS_PROFILE,
@@ -772,6 +772,7 @@ async function runOfferProtocol({ chatgptBase, authBase, transport, proxyTemplat
     const match = /^\[email-otp-requested-at\] (.+)$/.exec(String(values[0]));
     if (match && Number.isFinite(Date.parse(match[1]))) send({ type: "mail_sent", at: Date.parse(match[1]) });
   };
+  let stage = "input";
   try {
     const payload = await first;
     const email = String(payload.email || "").trim().toLowerCase();
@@ -779,12 +780,15 @@ async function runOfferProtocol({ chatgptBase, authBase, transport, proxyTemplat
     if (payload.session?.chatgptBase && payload.session.chatgptBase !== chatgptBase) throw offerError("identity_mismatch");
     await transport.configure(proxyTemplate, { force: true });
     const client = new ProtocolClient({ transport, verbose: false, hideUrlQuery: true });
+    let deviceId = payload.session?.deviceId || crypto.randomUUID();
     const request = async (target, identity) => {
-      const result = await client.request("GET", `${chatgptBase}${target}`, {
-        headers: { ...chatgptMfaHeaders({ chatgptBase, accessToken: identity.accessToken, deviceId: payload.session?.deviceId || crypto.randomUUID() }, target),
-          "chatgpt-account-id": identity.accountId, accept: "application/json" }, referer: `${chatgptBase}/`,
-      });
-      return { status: result.res.status, body: result.text };
+      try {
+        const result = await client.request("GET", `${chatgptBase}${target}`, {
+          headers: { ...chatgptMfaHeaders({ chatgptBase, accessToken: identity.accessToken, deviceId }, target),
+            "chatgpt-account-id": identity.accountId, accept: "application/json" }, referer: `${chatgptBase}/`,
+        });
+        return { status: result.res.status, body: result.text };
+      } catch (error) { throw offerProtocolFailure(error, "offer_request", Boolean(proxyTemplate)); }
     };
     let result;
     if (payload.session) {
@@ -792,6 +796,7 @@ async function runOfferProtocol({ chatgptBase, authBase, transport, proxyTemplat
       catch (error) { if (!["unauthorized", "token_expired", "authorization_invalid"].includes(error.offerCode)) throw error; }
     }
     if (!result) {
+      stage = "login";
       if (!payload.credentials?.password && !payload.credentials?.mailApiUrl && !payload.allowManualLogin) throw offerError("authorization_invalid");
       const rl = { question: async (prompt) => {
         const kind = /^Password/.test(prompt) ? "password" : /^2FA/.test(prompt) ? "totp" : /^Email OTP/.test(prompt) ? "email" : "";
@@ -801,15 +806,19 @@ async function runOfferProtocol({ chatgptBase, authBase, transport, proxyTemplat
       } };
       const web = await loginChatgptWeb(client, { chatgptBase, authBase, email, rl, existingOnly: true,
         password: payload.credentials?.password || "", totpSecret: payload.credentials?.totpSecret || "" });
+      deviceId = web.deviceId;
+      stage = "session_request";
       const { data } = await client.getJson("GET", `${chatgptBase}/api/auth/session`, { referer: `${chatgptBase}/` });
       const session = { type: "chatgpt-session", version: 1, email: data?.user?.email, accessToken: data?.accessToken,
         expiresAt: data?.expires, deviceId: web.deviceId, chatgptBase };
+      stage = "session_identity";
       session.accountId = offerIdentity(session, email).accountId;
-      result = await checkOffer(session, email, request);
       send({ type: "session", session });
+      stage = "offer_request";
+      result = await checkOffer(session, email, request);
     }
     send({ type: "result", result });
-  } catch (error) { send({ type: "error", code: error.offerCode || "login_failed", retryable: error.retryable === true }); }
+  } catch (error) { const failure = offerProtocolFailure(error, error.offerStage || stage, Boolean(proxyTemplate)); send({ type: "error", code: failure.offerCode, retryable: failure.retryable === true, stage: failure.offerStage || stage }); }
   finally { console.log = log; channel.close(); }
 }
 

@@ -68,7 +68,7 @@ async function dispatch(ownerId, route, body = {}) {
 }
 try {
   await start();
-  [first, second] = app.store.generate({ count: 2, quota: 20, note: "Synthetic central+console" }, app.store.adminId);
+  [first, second] = app.store.generate({ count: 2, quota: 20, note: "Synthetic central+console", allowedSmsProviders: ["custom", "pool"] }, app.store.adminId);
   app.smsPool.saveRules({ enabled: true, fee: 2, maxConcurrent: 2 }, app.store.adminId);
   app.smsPool.saveCredential({ providerId: "smsbower", name: "Shared synthetic key", apiKey: "synthetic-e2e-key" }, app.store.adminId);
   const credentialId = app.smsPool.adminSnapshot().credentials[0].id;

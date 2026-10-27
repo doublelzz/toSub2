@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { OFFER_LABELS, OFFER_ERRORS, offerError } from "./offer-checker.mjs";
+import { OFFER_LABELS, OFFER_ERRORS, OFFER_STAGES, offerError, offerFailureMessage } from "./offer-checker.mjs";
 import { fetchMailboxOtpCandidates, filterMailboxOtpCandidatesByRequestTime, validateMailApiUrl } from "./mail-otp.mjs";
 
 const LIVE = new Set(["queued", "running", "waiting_input"]);
@@ -70,16 +70,17 @@ export async function createOfferWorkspace({ root, vault, parseText, resolveSour
   const saveSecret = (row, value) => db.prepare("UPDATE items SET secret=? WHERE id=?").run(vault.seal(value, `item:${row.id}`), row.id);
   function update(row, status, fields = {}) {
     const current = db.prepare("SELECT * FROM items WHERE id=?").get(row.id);
-    const history = [...JSON.parse(current.history), { at: stamp(), status, code: fields.error_code || "" }].slice(-30);
+    const history = [...JSON.parse(current.history), { at: stamp(), status, code: fields.error_code || "", ...(Object.hasOwn(OFFER_STAGES, fields.error_stage) ? { stage: fields.error_stage } : {}) }].slice(-30);
     const allowed = ["result", "error_code", "prompt_kind", "prompt_id", "retries", "available_at"];
     const names = Object.keys(fields).filter((key) => allowed.includes(key));
     db.prepare(`UPDATE items SET status=?,updated_at=?,history=?${names.map((key) => `,${key}=?`).join("")} WHERE id=?`)
       .run(status, stamp(), JSON.stringify(history), ...names.map((key) => fields[key]), row.id);
   }
   function publicItem(row) {
+    const history = JSON.parse(row.history); const stage = history.at(-1)?.code === row.error_code && Object.hasOwn(OFFER_STAGES, history.at(-1)?.stage) ? history.at(-1).stage : "";
     return { id: row.id, batchId: row.batch_id, email: row.email, status: row.status, result: row.result ? JSON.parse(row.result) : null,
-      message: OFFER_ERRORS[row.error_code] || "", errorCode: row.error_code, promptKind: row.prompt_kind, promptId: row.prompt_id,
-      retries: row.retries, updatedAt: row.updated_at, ...JSON.parse(row.flags), history: JSON.parse(row.history) };
+      message: offerFailureMessage(row.error_code, stage), errorCode: row.error_code, errorStage: stage, errorStageLabel: OFFER_STAGES[stage] || "", promptKind: row.prompt_kind, promptId: row.prompt_id,
+      retries: row.retries, updatedAt: row.updated_at, ...JSON.parse(row.flags), history };
   }
   function publicBatch(row) {
     const rows = db.prepare("SELECT status,CASE WHEN status='completed' THEN json_extract(result,'$.kind') END AS kind,COUNT(*) AS n FROM items WHERE batch_id=? GROUP BY status,kind").all(row.id);
@@ -219,7 +220,7 @@ export async function createOfferWorkspace({ root, vault, parseText, resolveSour
         try { run.baseline = new Set((await pollMailbox(payload.credentials.mailApiUrl, { timeoutMs: 10_000, request: { ...mailRequest(), body: payload.credentials.mailRequestBody } })).map((candidate) => candidate.key)); run.baselineKnown = true; } catch {}
       }
       if (!validRun(row, run)) return;
-      run.handle = runAccount({ email: row.email, session: payload.session, credentials: payload.credentials, proxyUrl: payload.proxyUrl || source?.credentials?.proxyUrl || "" }, {
+      run.handle = runAccount({ email: row.email, session: payload.session, credentials: payload.credentials, proxyUrl: Object.hasOwn(payload, "proxyUrl") ? payload.proxyUrl : source?.credentials?.proxyUrl || "" }, {
         signal: run.controller.signal,
         onMailSent: (at) => { if (Number.isFinite(at)) run.requestedAt = at; },
         onSession: (session) => { if (validRun(row, run)) { payload.session = session; saveSecret(row, payload); } },
@@ -240,7 +241,7 @@ export async function createOfferWorkspace({ root, vault, parseText, resolveSour
       const current = item(row.batch_id, row.id); const settings = JSON.parse(batch(row.batch_id).options);
       const code = Object.hasOwn(OFFER_ERRORS, failure.offerCode) ? failure.offerCode : "login_failed";
       const retrying = failure.retryable === true && current.retries < settings.maxRetries;
-      update(row, retrying ? "queued" : "failed", { error_code: code, prompt_kind: "", prompt_id: "", retries: current.retries + (retrying ? 1 : 0), available_at: retrying ? now() + 1000 * (current.retries + 1) : 0 });
+      update(row, retrying ? "queued" : "failed", { error_code: code, error_stage: failure.offerStage, prompt_kind: "", prompt_id: "", retries: current.retries + (retrying ? 1 : 0), available_at: retrying ? now() + 1000 * (current.retries + 1) : 0 });
     }).finally(() => {
       if (!closing && !canUse()) {
         const current = db.prepare("SELECT status FROM items WHERE id=?").get(row.id);
@@ -289,15 +290,30 @@ export async function createOfferWorkspace({ root, vault, parseText, resolveSour
     if (body.ids !== undefined) where(batchId, { ids: body.ids });
     const selected = body.ids ? rows.filter((row) => body.ids.includes(row.id)) : rows;
     if (!selected.length) throw error("没有需要重试的账号");
+    const updateProxy = Object.hasOwn(body, "proxyUrl");
+    if (updateProxy && typeof body.proxyUrl !== "string") throw error("请提供有效的代理地址，或留空直连");
+    const proxyUrl = updateProxy ? normalizeProxy(body.proxyUrl) || "" : null;
+    const changes = new Map();
     if (body.credentials && selected.length === 1) {
       const row = selected[0]; const payload = secret(row); const values = body.credentials;
       if (typeof values.password === "string") payload.credentials.password = values.password.slice(0, 256);
       if (values.totpSecret) { if (!/^[A-Z2-7]{16,128}$/i.test(values.totpSecret)) throw error("MFA 密钥格式错误"); payload.credentials.totpSecret = values.totpSecret; }
       if (values.mailApiUrl) { if (!validateMailApiUrl(values.mailApiUrl)) throw error("取件 URL 无效"); payload.credentials.mailApiUrl = values.mailApiUrl; }
-      saveSecret(row, payload);
+      changes.set(row.id, payload);
     }
-    for (const row of selected) update(row, "queued", { error_code: "", prompt_kind: "", prompt_id: "", retries: 0, available_at: 0 });
-    db.prepare("UPDATE batches SET status='running' WHERE id=?").run(current.id); requestSchedule(); return publicBatch(batch(batchId));
+    if (updateProxy) for (const row of selected) { const payload = changes.get(row.id) || secret(row); payload.proxyUrl = proxyUrl; changes.set(row.id, payload); }
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const row of selected) {
+        if (changes.has(row.id)) saveSecret(row, changes.get(row.id));
+        update(row, "queued", { error_code: "", prompt_kind: "", prompt_id: "", retries: 0, available_at: 0 });
+      }
+      const settings = JSON.parse(current.options);
+      if (updateProxy && selected.length === db.prepare("SELECT COUNT(*) AS n FROM items WHERE batch_id=?").get(batchId).n) settings.proxyConfigured = Boolean(proxyUrl);
+      db.prepare("UPDATE batches SET status='running',options=? WHERE id=?").run(JSON.stringify(settings), current.id);
+      db.exec("COMMIT");
+    } catch (failure) { db.exec("ROLLBACK"); throw failure; }
+    requestSchedule(); return publicBatch(batch(batchId));
   }
   async function shutdown() {
     closing = true;
