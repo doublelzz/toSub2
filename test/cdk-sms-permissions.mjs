@@ -13,7 +13,7 @@ const canonicalIds = ["luban", "smsbower", "herosms", "custom", "pool"];
 const smsKey = "chatgpt-onboarding.sms-provider-settings-v1";
 const legacyKey = "chatgpt-onboarding.luban-api-key";
 const mailKey = "chatgpt-onboarding.mail-request-settings-v1";
-let app; let base; let forwarded = 0; let purchases = 0; let holdPurchase = false; let finishPurchase; let holdInspection = false; let finishInspection;
+let app; let base; let forwarded = 0; let purchases = 0; let holdPurchase = false; let finishPurchase; let inspections = 0;
 const scopes = new Map();
 function client() {
   let cookie = ""; let csrf = "";
@@ -32,7 +32,7 @@ async function start() {
   app = await startCdkServer({ root, listen: false, smsPoolOptions: { createProvider: () => ({
     activationPolicy: { lifetimeSeconds: 1500, minCancelAgeSeconds: 120, source: "fixture" },
     getNumber: async () => { const index = ++purchases; const order = { requestId: `permission-order-${index}`, number: `+1202555${String(index).padStart(4, "0")}` }; if (holdPurchase) return new Promise((resolve) => { finishPurchase = () => resolve(order); }); return order; },
-    inspect: async () => holdInspection ? new Promise((resolve) => { finishInspection = () => resolve({ state: "waiting", hasSms: false }); }) : { state: "waiting", hasSms: false },
+    inspect: async () => { inspections++; return { state: "waiting", hasSms: false }; },
     cancelStrict: async () => ({ cancelled: true, receipt: "ACCESS_CANCEL" }),
   }) }, createWorkspace: async (options) => {
     scopes.set(options.cdkId, options);
@@ -110,7 +110,7 @@ try {
   assert.equal((await admin("/api/sms-pool")).status, 403);
   await admin("/api/auth/workspace", "POST", { cdkId: adminId });
 
-  app.smsPool.saveRules({ enabled: true, fee: 2, maxConcurrent: 5 }, adminId);
+  app.smsPool.saveRules({ enabled: true, fee: 2, requestConcurrency: 3 }, adminId);
   app.smsPool.saveCredential({ providerId: "herosms", name: "Synthetic pool source", apiKey: "synthetic-permission-provider" }, adminId);
   const credentialId = app.smsPool.adminSnapshot().credentials[0].id;
   app.smsPool.saveEntry({ credentialId, country: "1", maxPrice: "0.25" }, adminId);
@@ -130,19 +130,19 @@ try {
   assert.throws(() => poolUser.begin(context()), (error) => error.code === "SMS_PROVIDER_FORBIDDEN");
 
   await admin(`/api/admin/cdks/${owner.id}`, "PATCH", { allowedSmsProviders: ["pool"] });
-  app.smsPool.saveRules({ buffer: { enabled: true, forceRefill: false, target: 1 } }, adminId);
+  app.smsPool.pause(); // Isolate purchase-time permission checks from former-inventory maintenance.
   const inventoryId = crypto.randomUUID(); const at = Date.now();
   app.store.createInventoryPurchase({ id: inventoryId, entryId: app.smsPool.adminSnapshot().entries[0].id, credentialId, providerId: "herosms", config: { apiKey: "synthetic-permission-provider", service: "dr", country: "1", maxPrice: "0.25" }, createdAt: at }, { simplified: true, target: 1 });
   app.store.finishInventoryPurchase(inventoryId, { order: { requestId: "buffer-permission-order", number: "+12025550999" }, state: "ready", expiresAt: at + 1500000, expiresSource: "provider", cancelAllowedAt: at + 120000 });
-  const inspecting = context(); poolUser.begin(inspecting); holdInspection = true;
-  const inspectingPurchase = poolUser.getNumber(inspecting); const inspectingRejected = assert.rejects(inspectingPurchase, (error) => error.code === "SMS_PROVIDER_FORBIDDEN");
-  await wait(() => typeof finishInspection === "function");
-  await admin(`/api/admin/cdks/${owner.id}`, "PATCH", { allowedSmsProviders: ["custom"] });
-  finishInspection(); await inspectingRejected; holdInspection = false;
-  assert.equal(app.store.inventoryItem(inventoryId).state, "ready", "a revoked user cannot claim checked shared inventory");
+  const demand = context(); poolUser.begin(demand); const inspectionsBefore = inspections;
+  const fresh = await poolUser.getNumber(demand);
+  assert.equal(fresh.inventoryId, undefined); assert.equal(inspections, inspectionsBefore, "new tasks never inspect or claim former prefetched orders");
+  assert.equal(app.store.inventoryItem(inventoryId).state, "ready");
   assert.equal(app.store.inventoryItem(inventoryId).claimOwner, null);
-  assert.equal(app.store.smsOperation(owner.id, inspecting.operationId).state, "released");
-  assert.equal(purchases, 1); assert.equal(app.store.get(owner.id).reserved, 0);
+  await admin(`/api/admin/cdks/${owner.id}`, "PATCH", { allowedSmsProviders: ["custom"] });
+  assert.equal((await poolUser.getNumber(demand)).order.requestId, fresh.order.requestId, "revocation preserves the order already assigned to its task");
+  poolUser.release(demand); assert.throws(() => poolUser.begin(context()), (error) => error.code === "SMS_PROVIDER_FORBIDDEN");
+  assert.equal(purchases, 2); assert.equal(app.store.get(owner.id).reserved, 0);
 
   await admin(`/api/admin/cdks/${owner.id}`, "PATCH", { allowedSmsProviders: ["smsbower"] });
   const generatedWithAccess = await admin("/api/admin/cdks", "POST", { count: 1, quota: 1, allowedSmsProviders: ["luban"] });
@@ -152,5 +152,5 @@ try {
   assert.deepEqual(current.workspace.allowedSmsProviders, ["custom", "smsbower"], "permissions survive a store/server restart");
   assert.deepEqual(current.features.smsProviders.map((provider) => provider.id), ["smsbower", "custom"]);
   assert.equal(app.store.get(owner.id).balance, balance);
-  console.log("[ok] CDK SMS permissions: default custom, scoped grants/revocation, hidden encrypted settings, administrator workspace scope, purchase-time guards, reservation release, buffered claim races and persistence; synthetic fixtures only.");
+  console.log("[ok] CDK SMS permissions: default custom, scoped grants/revocation, hidden encrypted settings, administrator workspace scope, purchase-time guards, reservation release, legacy inventory isolation and persistence; synthetic fixtures only.");
 } finally { await app?.close(); await fs.rm(root, { recursive: true, force: true }); }

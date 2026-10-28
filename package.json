@@ -24,12 +24,14 @@
     "check:sms": "node --check src/hero-sms.mjs && node test/hero-sms.mjs && node test/sms-providers.mjs && node test/sms-provider-console-smoke.mjs && node test/sms-price-selector.mjs",
     "check:ui": "node test/task-query.mjs && node test/task-query-console.mjs && node test/workspace-settings-ui.mjs && node test/dialog-focus-stack.mjs && node test/import-charge-confirmation.mjs",
     "check:phone-binding": "node test/phone-binding-console.mjs",
-    "check:sms-orders": "node test/sms-orders.mjs",
+    "check:sms-orders": "node test/sms-orders.mjs && node test/sms-order-cancellation.mjs",
     "check:cdk": "node test/cdk-store.mjs && node test/cdk-console.mjs && node test/cdk-sub2api-context.mjs && npm run check:cdk-sms",
     "check:cdk-sms": "node test/cdk-sms-permissions.mjs && node test/cdk-sms-routes.mjs && node test/cdk-sms-client-settings.mjs && node test/cdk-sms-permissions-ui.mjs",
-    "check:sms-pool": "node test/sms-pool.mjs && node test/sms-pool-api.mjs && node test/sms-pool-console.mjs && node test/phone-verification-evidence.mjs && node test/sms-pool-ui.mjs && node test/cdk-billing-ui.mjs && node test/sms-pool-actions-ui.mjs && node test/sms-pool-e2e.mjs && node test/cdk-quota-events.mjs && node test/sms-pool-production-ui.mjs && node test/sms-order-lifecycle.mjs && node test/sms-buffer.mjs && node test/sms-buffer-e2e.mjs && node test/sms-pool-buffer-ui.mjs && npm run check:sms-pool-costs",
+    "check:sms-pool": "npm run check:sms-demand && npm run check:sms-categories && node test/sms-pool.mjs && node test/sms-pool-api.mjs && node test/sms-pool-console.mjs && node test/phone-verification-evidence.mjs && node test/sms-pool-ui.mjs && node test/cdk-billing-ui.mjs && node test/sms-pool-actions-ui.mjs && node test/sms-pool-e2e.mjs && node test/cdk-quota-events.mjs && node test/sms-pool-production-ui.mjs && node test/sms-order-lifecycle.mjs && node test/sms-buffer.mjs && node test/sms-buffer-e2e.mjs && node test/sms-pool-buffer-ui.mjs && npm run check:sms-pool-costs",
     "check:sms-pool-costs": "node test/sms-pool-costs.mjs && node test/sms-pool-cost-ui.mjs && npm run check:sms-pool-analytics",
-    "check:sms-pool-analytics": "node test/sms-pool-analytics.mjs && node test/sms-pool-analytics-ui.mjs"
+    "check:sms-pool-analytics": "node test/sms-pool-analytics.mjs && node test/sms-pool-analytics-ui.mjs",
+    "check:sms-demand": "node test/sms-pool-demand.mjs && node test/sms-order-cancellation.mjs",
+    "check:sms-categories": "node test/sms-category-store.mjs && node test/sms-pool-categories.mjs && node test/sms-category-console.mjs"
   },
   "keywords": [
     "chatgpt",

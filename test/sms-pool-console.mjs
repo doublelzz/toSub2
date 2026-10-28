@@ -49,7 +49,7 @@ let workspaceEnabled = true;
 const secret = "fixture-admin-provider-key-must-not-leak";
 const billing = row => ({ operationId: row.operationId, state: row.state, fee: 2, reserved: ["verified", "released"].includes(row.state) ? 0 : 2, maxAttempts: 5 });
 const smsPool = {
-  summary: () => ({ enabled: true, available: true, fee: configuredFee }),
+  summary: () => ({ id: "other", name: "其他", enabled: true, available: true, fee: configuredFee, feeVersion: 1 }),
   begin(input) {
     if (input.expectedFee !== undefined && input.expectedFee !== configuredFee) throw Object.assign(new Error("fee changed"), { code: "SMS_POOL_FEE_CHANGED" });
     if ([...operations.values()].filter(row => !["verified", "released"].includes(row.state)).length >= maxConcurrent) throw Object.assign(new Error("pool busy"), { code: "SMS_POOL_BUSY" });
@@ -105,7 +105,7 @@ const wait = async (predicate, label) => {
   throw new Error(`${label}: ${JSON.stringify(workspace.publicJobs())}`);
 };
 async function start(email, automatic = true, actorId = "fixture-cdk") {
-  const response = await call("/api/jobs", { email, actorId: "untrusted-body-actor", phoneBindingEnabled: true, ...(automatic ? { phoneBindingMode: "automatic", smsProvider: { id: "pool", config: {} } } : {}) }, actorId);
+  const response = await call("/api/jobs", { email, actorId: "untrusted-body-actor", phoneBindingEnabled: true, ...(automatic ? { phoneBindingMode: "automatic", smsProvider: { id: "pool", config: { categoryId: "other" } } } : {}) }, actorId);
   assert.equal(response.status, 201, JSON.stringify(response.data));
   return response.data.job.id;
 }
@@ -154,7 +154,7 @@ try {
   await wait(() => workspace.activeCount() === 0, "admin confirmation fixture should exit");
   const canceled = await start("cancel@example.com", false);
   await wait(() => workspace.publicJobs().find(row => row.id === canceled && row.status === "phone"), "manual request should wait for number");
-  assert.equal((await call(`/api/jobs/${canceled}/sms-number`, { providerId: "pool", config: { quotedFee: 2 }, actorId: "untrusted-body-actor" }, "fixture-request-admin")).status, 200);
+  assert.equal((await call(`/api/jobs/${canceled}/sms-number`, { providerId: "pool", config: { categoryId: "other", quotedFee: 2 }, actorId: "untrusted-body-actor" }, "fixture-request-admin")).status, 200);
   await wait(() => workspace.publicJobs().find(row => row.id === canceled && row.smsPoolBilling), "manual request should reserve");
   await wait(() => operations.get(workspace.publicJobs().find(row => row.id === canceled).smsPoolBilling.operationId), "manual request should reach central begin");
   assert.equal(operations.get(workspace.publicJobs().find(row => row.id === canceled).smsPoolBilling.operationId).actorId, "fixture-request-admin", "manual pool request captures authenticated actor");
@@ -171,7 +171,7 @@ try {
   assert.equal(charges, 3);
   workspace.resume();
   const actorBatch = await workspace.applyImport("authorization", { text: "actor-batch-one@example.com\nactor-batch-two@example.com", actorId: "untrusted-import-actor",
-    phoneBindingMode: "automatic", smsProvider: { id: "pool", config: { quotedFee: 2 } } }, "fixture-import-admin");
+    phoneBindingMode: "automatic", smsProvider: { id: "pool", config: { categoryId: "other", quotedFee: 2 } } }, "fixture-import-admin");
   workspace.resume();
   const actorBatchIds = actorBatch.data.jobs.map(row => row.id);
   await wait(() => actorBatchIds.every(id => workspace.publicJobs().find(row => row.id === id)?.smsPoolBilling?.state === "verified"), "batch imports should propagate actual initiator into deferred pool operations");

@@ -123,6 +123,8 @@ function App({ auth }) {
   const [smsSettingsDraft, setSmsSettingsDraft] = useState(() => withSmsProviderDefaults(auth.features?.smsProviders || [], readSmsProviderSettings()));
   const [smsSettingsError, setSmsSettingsError] = useState("");
   const [smsChargeQuote, setSmsChargeQuote] = useState(null);
+  const [poolCategories, setPoolCategories] = useState(null);
+  const [poolCategoryError, setPoolCategoryError] = useState("");
   const [smsNumberOptionsState, setSmsNumberOptionsState] = useState(null);
   const [smsOptionsLoading, setSmsOptionsLoading] = useState(false);
   const [mailRequestSettings, setMailRequestSettings] = useState(readMailRequestSettings);
@@ -289,13 +291,19 @@ function App({ auth }) {
     if (previousAccess !== null && previousAccess !== smsProviderAccessKey) window.dispatchEvent(new window.CustomEvent("cdk-sms-permissions-changed"));
   }, [smsProviderAccessKey]);
   const activeSmsProvider = useMemo(
-    () => resolveSmsProvider(smsProviderDefinitions, smsSettings),
-    [smsProviderDefinitions, smsSettings],
+    () => resolveSmsProvider(smsProviderDefinitions, smsSettings, poolCategories),
+    [smsProviderDefinitions, smsSettings, poolCategories],
   );
   const draftSmsProvider = useMemo(
-    () => resolveSmsProvider(smsProviderDefinitions, smsSettingsDraft),
-    [smsProviderDefinitions, smsSettingsDraft],
+    () => resolveSmsProvider(smsProviderDefinitions, smsSettingsDraft, poolCategories),
+    [smsProviderDefinitions, smsSettingsDraft, poolCategories],
   );
+  useEffect(() => {
+    if (!smsProviderDefinitions.some((provider) => provider.id === "pool")) { setPoolCategories(null); return undefined; }
+    let active = true;
+    void apiFetch(token, "/api/sms-pool").then((value) => { if (active) { setPoolCategories(Array.isArray(value.categories) ? value.categories : []); setPoolCategoryError(""); } }).catch((failure) => { if (active) { setPoolCategories(null); setPoolCategoryError(failure.message); } });
+    return () => { active = false; };
+  }, [token, smsProviderAccessKey]);
   const smsNumberOptions = smsNumberOptionsState?.providerId === draftSmsProvider.id
     && smsNumberOptionsState.apiKey === draftSmsProvider.config.apiKey
     && smsNumberOptionsState.service === draftSmsProvider.config.service
@@ -562,7 +570,7 @@ function App({ auth }) {
 
   function saveSmsSettings(event) {
     event.preventDefault();
-    const resolved = resolveSmsProvider(smsProviderDefinitions, smsSettingsDraft);
+    const resolved = resolveSmsProvider(smsProviderDefinitions, smsSettingsDraft, poolCategories);
     if (!resolved.definition) {
       setSmsSettingsError("请选择接码平台");
       return;
@@ -582,6 +590,7 @@ function App({ auth }) {
       }
     }
     if (resolved.id === "pool") {
+      if (!resolved.ready) { setSmsSettingsError(resolved.selectionError || "请选择可用的接码池分类"); return; }
       setSmsSettings(withSmsProviderDefaults(smsProviderDefinitions, smsSettingsDraft));
       setSmsSettingsOpen(false);
       setSmsSettingsError("");
@@ -632,7 +641,7 @@ function App({ auth }) {
     if (!email.trim() || busy) return;
     setBusy(true);
     try {
-      const smsProvider = phoneBindingEnabled && activeSmsProvider.ready ? await prepareSmsProvider(1, { importing: true }) : undefined;
+      const smsProvider = phoneBindingEnabled && (activeSmsProvider.ready || activeSmsProvider.id === "pool") ? await prepareSmsProvider(1, { importing: true }) : undefined;
       if (phoneBindingEnabled && activeSmsProvider.id === "pool" && !smsProvider) return;
       await apiFetch(token, "/api/jobs", {
         method: "POST",
@@ -656,7 +665,7 @@ function App({ auth }) {
     if (!batchText.trim() || batchBusy) return;
     setBatchBusy(true);
     try {
-      const smsProvider = phoneBindingEnabled && activeSmsProvider.ready ? await prepareSmsProvider(1, { importing: true }) : undefined;
+      const smsProvider = phoneBindingEnabled && (activeSmsProvider.ready || activeSmsProvider.id === "pool") ? await prepareSmsProvider(1, { importing: true }) : undefined;
       if (phoneBindingEnabled && activeSmsProvider.id === "pool" && !smsProvider) return;
       await apiFetch(token, "/api/jobs/batch", {
         method: "POST",
@@ -763,7 +772,10 @@ function App({ auth }) {
     if (!canStartPhoneSelected || !activeSmsProvider.ready || batchAction) return;
     setBatchAction("start-phone");
     try {
-      const smsProvider = await prepareSmsProvider(phoneBindingSelectedCount);
+      const candidates = selectedJobs.filter((job) => job.canStartPhoneBinding);
+      const fixed = candidates.map((job) => job.smsPoolBilling).filter((billing) => billing?.categoryId && !["verified", "released"].includes(billing.state));
+      if (fixed.length && (fixed.length !== candidates.length || fixed.some((billing) => billing.categoryId !== fixed[0].categoryId || billing.categoryFeeVersion !== fixed[0].categoryFeeVersion || billing.fee !== fixed[0].fee || billing.categoryFee !== fixed[0].categoryFee))) throw new Error("选中任务包含不同分类或费率的已有接码，请分别继续这些任务");
+      const smsProvider = await prepareSmsProvider(phoneBindingSelectedCount, { poolBilling: fixed[0] });
       if (!smsProvider) return;
       const data = await apiFetch(token, "/api/jobs/start-phone-batch", {
         method: "POST",
@@ -784,16 +796,29 @@ function App({ auth }) {
     }
   }
 
-  async function prepareSmsProvider(count = 1, { importing = false } = {}) {
+  async function prepareSmsProvider(count = 1, { importing = false, poolBilling } = {}) {
+    const fixed = poolBilling?.categoryId && !["verified", "released"].includes(poolBilling.state) ? poolBilling : null;
+    if (fixed) {
+      if (!smsProviderDefinitions.some((provider) => provider.id === "pool")) throw new Error("接码池权限已变化，请联系管理员");
+      const admin = auth.workspace.role === "admin";
+      const category = poolCategories?.find((row) => row.id === fixed.categoryId);
+      const categoryFee = fixed.categoryFee ?? (admin ? category?.fee : fixed.fee);
+      const feeVersion = fixed.categoryFeeVersion ?? category?.feeVersion;
+      if (!Number.isSafeInteger(categoryFee) || categoryFee < 1 || !Number.isSafeInteger(feeVersion) || feeVersion < 1) throw new Error("原分类费率尚未读取，请刷新后重试");
+      return new Promise((resolve) => setSmsChargeQuote({ categoryId: fixed.categoryId, categoryName: fixed.categoryName, feeVersion, fee: categoryFee, count, admin, resolve, fixed: true }));
+    }
     if (activeSmsProvider.id !== "pool") return { id: activeSmsProvider.id, config: activeSmsProvider.config };
-    if (importing) return { id: "pool", config: {} };
+    const categoryId = String(activeSmsProvider.config.categoryId || "").trim();
+    if (!categoryId) throw new Error("请先在接码平台配置中选择接码池分类");
+    if (importing) return { id: "pool", config: { categoryId } };
     const requestedAccess = smsProviderAccess.current;
-    const summary = await apiFetch(token, "/api/sms-pool");
+    const category = await apiFetch(token, `/api/sms-pool?categoryId=${encodeURIComponent(categoryId)}`);
     if (requestedAccess !== smsProviderAccess.current) throw new Error("接码权限已变化，请重新选择接码方式");
-    if (!summary.enabled || !summary.available) throw new Error("接码池暂时无法取号，请稍后重试或选择自己的接码平台");
+    if (category.id !== categoryId || !category.enabled || !category.available) throw new Error("所选接码池分类已停用或暂时无法取号，请重新选择");
+    if (!Number.isSafeInteger(category.fee) || category.fee < 1 || !Number.isSafeInteger(category.feeVersion) || category.feeVersion < 1) throw new Error("分类费用尚未确认，请刷新后重试");
     const admin = auth.workspace.role === "admin";
-    if (!admin && auth.workspace.balance < summary.fee) throw new Error(`接码池需要预留 ${summary.fee} 次，当前可用 ${auth.workspace.balance} 次`);
-    return new Promise((resolve) => setSmsChargeQuote({ fee: summary.fee, count, admin, resolve }));
+    if (!admin && auth.workspace.balance < category.fee) throw new Error(`接码池需要预留 ${category.fee} 次，当前可用 ${auth.workspace.balance} 次`);
+    return new Promise((resolve) => setSmsChargeQuote({ categoryId, categoryName: category.name, feeVersion: category.feeVersion, fee: category.fee, count, admin, resolve }));
   }
 
   async function setupTotpSelected() {
@@ -982,7 +1007,7 @@ function App({ auth }) {
         <div id="authorization-task-panel" role="tabpanel" aria-labelledby={`phone-tab-${phoneTab}`}>
         <TaskFilters value={filters} onChange={updateFilters} statuses={AUTH_STATUSES} dateFields={{ createdAt: "创建时间", lastOperationAt: "最近操作时间" }} day={calendarDay}
           extra={<button className={`secondary-button ${emailFilter.length ? "filter-active" : ""}`} type="button" onClick={() => { setFilterError(""); setFilterText(emailFilter.join("\n")); setFilterOpen(true); }} disabled={!token}><Filter size={16} />{emailFilter.length ? `精确邮箱 ${emailFilter.length}` : "精确邮箱"}</button>} />
-        <div className="config-summary"><Settings2 size={14} /><button type="button" onClick={() => setSettingsOpen(true)}>配置摘要</button><span>代理 · {accountProxyUrl.trim() ? "已配置" : "本地网络"}</span><span>短信 · {activeSmsProvider.ready ? activeSmsProvider.name : "未配置"}</span><span>邮件 · {mailRequestSettings.method}</span><span>Sub2API · {sub2apiSettings.adminApiKey ? "已配置" : "未配置"}</span>{sub2apiMonitorStatus.enabled && <span>号池巡检 · {sub2apiMonitorStatus.running ? "正在检查" : "已开启"}</span>}</div>
+        <div className="config-summary"><Settings2 size={14} /><button type="button" onClick={() => setSettingsOpen(true)}>配置摘要</button><span>代理 · {accountProxyUrl.trim() ? "已配置" : "本地网络"}</span><span>短信 · {activeSmsProvider.ready ? `${activeSmsProvider.name}${activeSmsProvider.id === "pool" ? ` · ${activeSmsProvider.summary}` : ""}` : "未配置"}</span><span>邮件 · {mailRequestSettings.method}</span><span>Sub2API · {sub2apiSettings.adminApiKey ? "已配置" : "未配置"}</span>{sub2apiMonitorStatus.enabled && <span>号池巡检 · {sub2apiMonitorStatus.running ? "正在检查" : "已开启"}</span>}</div>
 
         {error && (
           <div className="global-error" role="alert">
@@ -1178,7 +1203,7 @@ function App({ auth }) {
               ))}
             </div>
 
-            {draftSmsProvider.id === "pool" && <SmsPoolChoice token={token} onManage={auth.account.role === "admin" ? () => { setSmsSettingsOpen(false); setActiveWorkspace("sms-pool"); } : undefined} />}
+            {draftSmsProvider.id === "pool" && <SmsPoolChoice token={token} value={draftSmsProvider.config.categoryId || ""} onChange={(categoryId) => updateSmsProviderConfig("pool", { categoryId })} onSummary={(value) => { setPoolCategories(Array.isArray(value?.categories) ? value.categories : []); setPoolCategoryError(""); }} onManage={auth.account.role === "admin" ? () => { setSmsSettingsOpen(false); setActiveWorkspace("sms-pool"); } : undefined} />}
             {draftSmsProvider.definition && draftSmsProvider.id !== "pool" && (
               <div className="provider-config-section">
                 <div className="provider-description-row">
@@ -1237,7 +1262,7 @@ function App({ auth }) {
               </div>
             )}
 
-            {smsSettingsError && <div className="dialog-error" role="alert"><CircleAlert size={15} />{smsSettingsError}</div>}
+            {(smsSettingsError || draftSmsProvider.id === "pool" && poolCategoryError) && <div className="dialog-error" role="alert"><CircleAlert size={15} />{smsSettingsError || poolCategoryError}</div>}
             <div className="dialog-footer">
               <button type="button" className="cancel-button" onClick={() => setSmsSettingsOpen(false)}>取消</button>
               <button type="submit" className="primary-button" disabled={!draftSmsProvider.definition}>
@@ -1758,7 +1783,7 @@ function SmsSummary({ summary, billing }) {
     const released = billing.state === "released";
     const unknown = billing.state === "unknown";
     const queued = billing.state === "queued";
-    return <div className="sms-summary"><strong>{completed ? "已接码" : released ? "接码已结束" : unknown ? "接码待核实" : queued ? "等待池名额" : "池接码中"}</strong><span>管理员接码池</span><span>{completed ? billing.fee ? `已扣 ${billing.fee} 次` : "管理员工作区，不扣次" : released ? "未扣次，预留已释放" : queued ? "尚未取号，未预留次数" : `预留 ${billing.reserved} 次`}</span>{unknown && <small>结果未确认，等待核实</small>}{summary?.historyCount > 1 && <small>{summary.historyCount} 次取号记录</small>}</div>;
+    return <div className="sms-summary"><strong>{completed ? "已接码" : released ? "接码已结束" : unknown ? "接码待核实" : queued ? "等待池名额" : "池接码中"}</strong><span>接码池 · {billing.categoryName || "原分类"}</span><span>{completed ? billing.fee ? `已扣 ${billing.fee} 次` : "管理员工作区，不扣次" : released ? "未扣次，预留已释放" : queued ? "尚未取号，未预留次数" : `预留 ${billing.reserved} 次`}</span>{unknown && <small>结果未确认，等待核实</small>}{summary?.historyCount > 1 && <small>{summary.historyCount} 次取号记录</small>}</div>;
   }
   if (!summary || summary.verificationStatus === "not_started") return <div className="sms-summary"><span className="insight-note">未接码</span></div>;
   const latest = summary.latest;
@@ -1909,11 +1934,13 @@ function JobRow({ prepareSmsProvider, job, token, expanded, onToggleLogs, onErro
     }
   }
 
+  const fixedPoolBilling = job.smsPoolBilling?.categoryId && !["verified", "released"].includes(job.smsPoolBilling.state) ? job.smsPoolBilling : null;
+  const canUseSmsProvider = smsProvider.ready || Boolean(fixedPoolBilling);
   async function requestSmsNumber() {
-    if (!smsProvider.ready) return;
+    if (!canUseSmsProvider) return;
     setSubmitting(true);
     try {
-      const setup = prepareSmsProvider ? await prepareSmsProvider(1) : { id: smsProvider.id, config: smsProvider.config };
+      const setup = prepareSmsProvider ? await prepareSmsProvider(1, { poolBilling: fixedPoolBilling }) : { id: smsProvider.id, config: smsProvider.config };
       if (!setup) return;
       await apiFetch(token, `/api/jobs/${job.id}/sms-number`, {
         method: "POST",
@@ -1928,10 +1955,10 @@ function JobRow({ prepareSmsProvider, job, token, expanded, onToggleLogs, onErro
   }
 
   async function startPhoneBinding() {
-    if (!smsProvider.ready || !job.canStartPhoneBinding) return;
+    if (!canUseSmsProvider || !job.canStartPhoneBinding) return;
     setSubmitting(true);
     try {
-      const setup = prepareSmsProvider ? await prepareSmsProvider(1) : { id: smsProvider.id, config: smsProvider.config };
+      const setup = prepareSmsProvider ? await prepareSmsProvider(1, { poolBilling: fixedPoolBilling }) : { id: smsProvider.id, config: smsProvider.config };
       if (!setup) return;
       await apiFetch(token, `/api/jobs/${job.id}/start-phone`, {
         method: "POST",
@@ -2036,11 +2063,11 @@ function JobRow({ prepareSmsProvider, job, token, expanded, onToggleLogs, onErro
                   type="button"
                   className="platform-number-button"
                   onClick={requestSmsNumber}
-                  disabled={!smsProvider.ready || submitting || job.smsStatus === "requesting"}
-                  title={smsProvider.ready ? `使用 ${smsProvider.name} 取号` : "请先完成接码平台配置"}
+                  disabled={!canUseSmsProvider || submitting || job.smsStatus === "requesting"}
+                  title={canUseSmsProvider ? `使用 ${smsProvider.name} 取号` : "请先完成接码平台配置"}
                 >
                   {submitting || job.smsStatus === "requesting" ? <LoaderCircle className="spin" size={15} /> : <PhoneIncoming size={15} />}
-                  {smsProvider.name || "平台"}取号
+                  {fixedPoolBilling ? `接码池 · ${fixedPoolBilling.categoryName || "原分类"}` : smsProvider.name || "平台"}取号
                 </button>
               </>
             )}
@@ -2074,7 +2101,7 @@ function JobRow({ prepareSmsProvider, job, token, expanded, onToggleLogs, onErro
 </div>;
   const actionContent = <>
           {job.canStartPhoneBinding && (
-            <button type="button" className="primary-button" onClick={startPhoneBinding} disabled={submitting || !smsProviderAvailable || !smsProvider.ready} title={smsProvider.ready ? "恢复登录状态并开始接码" : "请先完成接码平台配置"}>
+            <button type="button" className="primary-button" onClick={startPhoneBinding} disabled={submitting || !smsProviderAvailable || !canUseSmsProvider} title={canUseSmsProvider ? "恢复登录状态并开始接码" : "请先完成接码平台配置"}>
               {submitting ? <LoaderCircle className="spin" size={16} /> : <PhoneIncoming size={16} />}开始接码
             </button>
           )}
@@ -2593,7 +2620,7 @@ function withSmsProviderDefaults(definitions, settings) {
   return { selectedProviderId, configs };
 }
 
-function resolveSmsProvider(definitions, settings) {
+function resolveSmsProvider(definitions, settings, poolCategories = null) {
   const normalized = withSmsProviderDefaults(definitions, settings || {});
   const definition = definitions.find((provider) => provider.id === normalized.selectedProviderId) || null;
   const config = definition ? normalized.configs[definition.id] || {} : {};
@@ -2601,8 +2628,10 @@ function resolveSmsProvider(definitions, settings) {
     field.required === false || String(config[field.key] || "").trim()
   ));
   const customEntries = definition?.id === "custom" ? inspectCustomSmsEntries(config.entries) : null;
-  const ready = requiredFieldsReady && !customEntries?.error;
-  const summary = definition?.id === "pool" ? "验证成功后按池规则扣次" : definition?.id === "custom"
+  const selectedCategory = definition?.id === "pool" && Array.isArray(poolCategories) ? poolCategories.find((category) => category.id === config.categoryId && !category.archivedAt) : null;
+  const selectionError = definition?.id !== "pool" ? "" : !config.categoryId ? "请选择接码池分类" : !Array.isArray(poolCategories) ? "分类状态尚未读取，请刷新后重试" : !selectedCategory || !selectedCategory.enabled ? "所选分类已停用或归档，请重新选择" : !Number.isSafeInteger(selectedCategory.fee) || selectedCategory.fee < 1 || !Number.isSafeInteger(selectedCategory.feeVersion) || selectedCategory.feeVersion < 1 ? "分类费率尚未确认，请刷新后重试" : "";
+  const ready = requiredFieldsReady && !customEntries?.error && !selectionError;
+  const summary = definition?.id === "pool" ? selectedCategory ? `${selectedCategory.name} · 成功扣 ${selectedCategory.fee} 次` : selectionError : definition?.id === "custom"
     ? (customEntries?.count ? `${customEntries.count} 个号码` : "")
     : definition
     ? definition.fields
@@ -2617,6 +2646,7 @@ function resolveSmsProvider(definitions, settings) {
     definition,
     config,
     ready,
+    selectionError,
     summary,
   };
 }

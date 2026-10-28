@@ -57,7 +57,7 @@ async function wait(predicate, message) {
   throw new Error(message);
 }
 async function importJob(ownerId, email, automatic = true) {
-  const body = { email, phoneBindingEnabled: true, ...(automatic ? { phoneBindingMode: "automatic", smsProvider: { id: "pool", config: { quotedFee: 2 } } } : {}) };
+  const body = { email, phoneBindingEnabled: true, ...(automatic ? { phoneBindingMode: "automatic", smsProvider: { id: "pool", config: { categoryId: "other", quotedFee: 2 } } } : {}) };
   const imported = await app.importFor(ownerId, "single", body, crypto.randomUUID(), ownerId);
   check(imported.status, 201, "CDK import completed"); return imported.data.job.id;
 }
@@ -69,7 +69,7 @@ async function dispatch(ownerId, route, body = {}) {
 try {
   await start();
   [first, second] = app.store.generate({ count: 2, quota: 20, note: "Synthetic central+console", allowedSmsProviders: ["custom", "pool"] }, app.store.adminId);
-  app.smsPool.saveRules({ enabled: true, fee: 2, maxConcurrent: 2 }, app.store.adminId);
+  app.smsPool.saveRules({ enabled: true, fee: 2, requestConcurrency: 2 }, app.store.adminId);
   app.smsPool.saveCredential({ providerId: "smsbower", name: "Shared synthetic key", apiKey: "synthetic-e2e-key" }, app.store.adminId);
   const credentialId = app.smsPool.adminSnapshot().credentials[0].id;
   app.smsPool.saveEntry({ credentialId, country: "1", countryLabel: "Synthetic country", maxPrice: "0.25", providerIds: "1" }, app.store.adminId);
@@ -84,23 +84,23 @@ try {
   check(rawMetadata.includes("synthetic-e2e-key"), false, "no shared API key in tenant metadata");
   const jobs = (await app.workspaceFor(first.id)).publicJobs(); check(JSON.stringify(jobs).includes("synthetic-e2e-key"), false, "no shared API key in tenant responses");
 
-  app.smsPool.saveRules({ maxConcurrent: 1 }, app.store.adminId); holdNew = true;
+  app.smsPool.saveRules({ requestConcurrency: 1 }, app.store.adminId); holdNew = true;
   const held = await importJob(first.id, "cancel-held@example.invalid");
   await wait(async () => (await job(first.id, held)).smsStatus === "waiting_sms", "held order should be allocated while waiting for SMS");
-  check(app.store.get(first.id).reserved, 2, "concurrency lease covers allocated SMS wait");
+  check(app.store.get(first.id).reserved, 2, "SMS wait keeps its own fee reservation");
   const contender = await importJob(second.id, "contender@example.invalid", false);
   await wait(async () => (await job(second.id, contender)).status === "phone", "manual contender should reach phone step");
   const beforeBusy = purchaseCalls;
-  const busy = await dispatch(second.id, `/api/jobs/${contender}/sms-number`, { providerId: "pool", config: { quotedFee: 2 } });
-  check(busy.status, 200, "busy session is accepted into pool wait queue");
-  await wait(async () => (await job(second.id, contender)).smsPoolBilling?.state === "queued", "concurrency overflow should wait without reserving");
-  check(app.store.get(second.id).reserved, 0, "queued pool session holds no CDK reservation");
-  check(purchaseCalls, beforeBusy, "queued session does not purchase another number");
+  const busy = await dispatch(second.id, `/api/jobs/${contender}/sms-number`, { providerId: "pool", config: { categoryId: "other", quotedFee: 2 } });
+  check(busy.status, 200, "another session is accepted while the first waits for SMS");
+  await wait(async () => (await job(second.id, contender)).smsStatus === "waiting_sms", "another session acquires without waiting for the first SMS result");
+  check(app.store.get(second.id).reserved, 2, "independent active session has its own reservation");
+  check(purchaseCalls, beforeBusy + 1, "SMS waits do not occupy the single provider request slot");
   await dispatch(first.id, `/api/jobs/${held}/cancel`);
   await wait(() => app.store.get(first.id).reserved === 0, "cancel before OTP submission should release fee");
   check(app.store.get(first.id).smsPoolConsumed, 2, "cancellation adds no fee");
-  await wait(async () => (await job(second.id, contender)).smsStatus === "waiting_sms", "queued session should continue automatically when lease is released");
-  check(purchaseCalls, beforeBusy + 1, "released pool slot starts the next purchase without another click");
+  check((await job(second.id, contender)).smsStatus, "waiting_sms", "cancelling another tenant never changes the current SMS wait");
+  check(purchaseCalls, beforeBusy + 1, "cancellation never starts another purchase");
   await dispatch(second.id, `/api/jobs/${contender}/cancel`);
 
   holdNew = false;

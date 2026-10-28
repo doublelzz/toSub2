@@ -1021,9 +1021,12 @@ function validatedSmsSetup(value) {
   if (value.id === "pool") {
     if (!smsPool) throw httpError(409, "当前接码池不可用");
     const config = value.config || {};
-    if (typeof config !== "object" || Array.isArray(config) || Object.keys(config).some(key => key !== "quotedFee")) throw httpError(400, "接码池配置由管理员管理");
+    if (typeof config !== "object" || Array.isArray(config) || Object.keys(config).some(key => !["categoryId", "quotedFee", "feeVersion"].includes(key))) throw httpError(400, "接码池配置由管理员管理");
+    if (typeof config.categoryId !== "string" || !/^[a-zA-Z0-9_-]{1,120}$/.test(config.categoryId)) throw httpError(400, "请选择接码池分类");
     if (Object.hasOwn(config, "quotedFee") && (!Number.isSafeInteger(config.quotedFee) || config.quotedFee < 1)) throw httpError(400, "请重新确认接码池扣次");
-    return { id: "pool", config: Object.hasOwn(config, "quotedFee") ? { quotedFee: config.quotedFee } : {} };
+    if (Object.hasOwn(config, "feeVersion") && (!Number.isSafeInteger(config.feeVersion) || config.feeVersion < 1)) throw httpError(400, "请重新确认接码池分类费率");
+    if (!smsPool.summary(config.categoryId).enabled) throw httpError(409, "所选接码分类已停用");
+    return { id: "pool", config: { categoryId: config.categoryId, ...(Object.hasOwn(config, "quotedFee") ? { quotedFee: config.quotedFee } : {}), ...(Object.hasOwn(config, "feeVersion") ? { feeVersion: config.feeVersion } : {}) } };
   }
   try {
     const client = createSmsProvider(value.id, value.config, { acquireCustomSmsEntry });
@@ -1062,6 +1065,16 @@ function normalizePhoneOptions(body, actorId = options.cdkId) {
 async function writeSmsSetup(job, setup) {
   const target = path.join(path.dirname(job.outputPath), "sms-provider.json");
   await fs.writeFile(target, JSON.stringify(setup), { mode: 0o600 });
+}
+
+async function readSmsSetup(job) {
+  const target = path.join(path.dirname(job.outputPath), "sms-provider.json");
+  const setup = JSON.parse(await fs.readFile(target, "utf8"));
+  if (setup?.id === "pool" && !setup.config?.categoryId) {
+    setup.config = { ...setup.config, categoryId: "other" };
+    await writeSmsSetup(job, setup);
+  }
+  return setup;
 }
 
 async function savePhoneOptions(job, options) {
@@ -1276,7 +1289,7 @@ async function prepareAndLaunchJob(job, mode, queueRunId) {
       has_totp_key: ["full", "totp_setup", "password_add"].includes(mode) && job.hasTotpCredential, proxy_configured: job.hasProxyCredential }, job);
     if (missing.length) throw httpError(409, `已保存的${missing.join("、")}无法读取，请重新填写后再执行`);
     if (mode === "full" && (job.phoneBindingRequested || job.phoneBindingMode === "automatic")) {
-      try { job.pendingSmsSetup = JSON.parse(await fs.readFile(path.join(path.dirname(job.outputPath), "sms-provider.json"), "utf8")); } catch { job.pendingSmsSetup = null; }
+      try { job.pendingSmsSetup = await readSmsSetup(job); } catch { job.pendingSmsSetup = null; }
       if (job.pendingSmsSetup?.id) assertSmsProviderAllowed(job.pendingSmsSetup.id);
     }
     if (["full", "totp_setup", "password_add"].includes(mode) && job.mailApiUrl) await loadMailboxBaseline(job);
@@ -2539,11 +2552,12 @@ function publicPoolBilling(job) {
   const value = job.smsPoolBilling;
   if (!value || !job.smsPoolOperationId) return null;
   return { state: String(value.state || "reserved"), fee: Number(value.fee) || 0, reserved: Number(value.reserved) || 0,
-    operationId: job.smsPoolOperationId };
+    operationId: job.smsPoolOperationId, categoryId: value.categoryId || job.smsPoolCategoryId || "other", categoryName: value.categoryName || "其他", categoryFeeVersion: value.categoryFeeVersion || job.smsPoolFeeVersion || 1, categoryFee: value.categoryFee ?? (value.fee > 0 ? value.fee : job.smsPoolExpectedFee) };
 }
 
 function updatePoolBilling(job, value) {
-  if (value) job.smsPoolBilling = { state: value.state, fee: Number(value.fee) || 0, reserved: Number(value.reserved) || 0, maxAttempts: Number(value.maxAttempts) || MAX_SMS_NUMBER_MAX_ATTEMPTS };
+  if (value) job.smsPoolBilling = { state: value.state, fee: Number(value.fee) || 0, reserved: Number(value.reserved) || 0, maxAttempts: Number(value.maxAttempts) || MAX_SMS_NUMBER_MAX_ATTEMPTS,
+    categoryId: value.categoryId || job.smsPoolCategoryId || "other", categoryName: value.categoryName || job.smsPoolBilling?.categoryName || "其他", categoryFeeVersion: value.categoryFeeVersion || job.smsPoolFeeVersion || 1, categoryFee: value.categoryFee ?? job.smsPoolBilling?.categoryFee ?? (value.fee > 0 ? value.fee : job.smsPoolExpectedFee) };
   touch(job);
 }
 
@@ -2677,6 +2691,7 @@ function poolProviderClient(providerId, config) {
 async function acquirePoolSmsNumber(job, config) {
   validatedSmsSetup({ id: "pool", config });
   await job.smsPoolTask;
+  if (job.smsPoolOperationId && !["verified", "released"].includes(job.smsPoolBilling?.state) && (job.smsPoolCategoryId || job.smsPoolBilling?.categoryId || "other") !== config.categoryId) throw httpError(409, "当前接码操作已固定分类，请先结束当前操作再切换分类");
   if (job.smsPoolBilling?.state === "unknown" || job.smsPoolSubmissionPending) {
     await queueSmsPoolTask(job, () => reconcileSmsPool(job));
     if (job.smsPoolBilling?.state === "unknown" || job.smsPoolSubmissionPending) throw httpError(409, "上次接码结果待核实，暂不能再次取号");
@@ -2689,8 +2704,10 @@ async function acquirePoolSmsNumber(job, config) {
     job.smsPoolContext = null;
     job.smsPoolSubmissionPending = false;
     job.smsNumberAttempt = 0;
-    job.smsPoolExpectedFee = config?.quotedFee ?? (await smsPool.summary()).fee;
-    updatePoolBilling(job, { state: "queued", fee: job.smsPoolExpectedFee, reserved: 0 });
+    const category = await smsPool.summary(config.categoryId);
+    job.smsPoolCategoryId = config.categoryId; job.smsPoolFeeVersion = config.feeVersion ?? category.feeVersion;
+    job.smsPoolExpectedFee = config?.quotedFee ?? category.fee;
+    updatePoolBilling(job, { state: "queued", fee: job.smsPoolExpectedFee, reserved: 0, categoryId: category.id, categoryName: category.name, categoryFeeVersion: job.smsPoolFeeVersion });
     await saveJobMetadata(job);
   }
   job.smsPoolMode = true;
@@ -2729,7 +2746,7 @@ function startPoolSmsNumberAcquisition(job) {
       assertSmsProviderAllowed("pool");
       try {
         const billing = await smsPool.begin({ operationId, jobId: job.id, email: job.email, runId,
-          expectedFee: job.smsPoolExpectedFee, actorId: job.smsPoolActorId || options.cdkId });
+          categoryId: job.smsPoolCategoryId || "other", feeVersion: job.smsPoolFeeVersion || undefined, expectedFee: job.smsPoolExpectedFee, actorId: job.smsPoolActorId || options.cdkId });
         updatePoolBilling(job, billing);
         job.smsNumberMaxAttempts = billing.maxAttempts || MAX_SMS_NUMBER_MAX_ATTEMPTS;
         reserved = true;
@@ -2748,11 +2765,10 @@ function startPoolSmsNumberAcquisition(job) {
     }
     assertSmsProviderAllowed("pool");
     job.smsError = null;
-    const allocation = await smsPool.getNumber({ operationId });
+    const allocation = await smsPool.getNumber({ operationId, canContinue });
     const client = allocation.client || poolProviderClient(allocation.providerId, allocation.config);
     await withEmailJobLock(job.email, async () => {
       if (job.smsNumberAcquisitionToken !== token || job.runId !== runId || job.status !== "phone" || !job.child) {
-        await client.release(allocation.order.requestId).catch(() => {});
         await smsPool.abandon({ operationId, allocationId: allocation.allocationId, reason: "取号后任务已停止" });
         updatePoolBilling(job, await smsPool.release({ operationId, reason: "取号后任务已停止" }));
         return;
@@ -3186,6 +3202,7 @@ function releaseSmsOrder(job, nextStatus = "idle", errorMessage = null) {
   const requestId = job.smsOrderId;
   const smsClient = job.smsClient;
   const history = job.smsOrders?.find(order => order.orderId === requestId && order.providerId === job.smsProviderId);
+  const poolOrder = Boolean(history?.poolOperationId || job.smsPoolContext && requestId === job.smsPoolContext.orderId);
   if (job.smsPoolContext && requestId === job.smsPoolContext.orderId && !job.smsPoolSubmissionPending && !["verified", "released"].includes(job.smsPoolBilling?.state)) {
     void queueSmsPoolTask(job, () => abandonPoolAllocation(job, errorMessage || "号码释放")).catch(() => {});
   }
@@ -3199,7 +3216,7 @@ function releaseSmsOrder(job, nextStatus = "idle", errorMessage = null) {
   job.smsLastSubmittedCode = null;
   job.smsStatus = nextStatus;
   job.smsError = errorMessage;
-  if (requestId && smsClient) {
+  if (requestId && smsClient && !poolOrder) {
     void smsClient.release(requestId).then(() => {
       if (history) history.status = "cancel_requested";
       return saveJobMetadata(job);
@@ -4904,6 +4921,8 @@ function restoredCredentialFlags(metadata = {}, credentials = {}) {
     smsPoolSubmissionPending: metadata.sms_pool_submission_pending === true,
     smsPoolMode: metadata.sms_pool_mode === true,
     smsPoolExpectedFee: Number.isSafeInteger(metadata.sms_pool_expected_fee) ? metadata.sms_pool_expected_fee : null,
+    smsPoolCategoryId: metadata.sms_pool_category_id || metadata.sms_pool_billing?.categoryId || "other",
+    smsPoolFeeVersion: metadata.sms_pool_fee_version || metadata.sms_pool_billing?.categoryFeeVersion || null,
     smsPoolActorId: typeof metadata.sms_pool_actor_id === "string" ? metadata.sms_pool_actor_id : options.cdkId,
     smsOrders: Array.isArray(metadata.sms_orders) ? metadata.sms_orders : [],
     accountSessionAvailable: metadata.account_session_available === true || metadata.status === "phone_skipped",
@@ -5520,6 +5539,8 @@ async function saveJobMetadata(job) {
         sms_pool_submission_pending: Boolean(job.smsPoolSubmissionPending),
         sms_pool_mode: Boolean(job.smsPoolMode),
         sms_pool_expected_fee: job.smsPoolExpectedFee ?? null,
+        sms_pool_category_id: job.smsPoolCategoryId || job.smsPoolBilling?.categoryId || null,
+        sms_pool_fee_version: job.smsPoolFeeVersion || job.smsPoolBilling?.categoryFeeVersion || null,
         sms_pool_actor_id: job.smsPoolActorId || options.cdkId,
         account_session_available: Boolean(job.accountSessionAvailable),
         account_insights_return_status: job.accountInsightsReturnStatus || null,

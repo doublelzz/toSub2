@@ -34,7 +34,7 @@ const provider = http.createServer((req, res) => {
 await new Promise((resolve) => provider.listen(0, "127.0.0.1", resolve));
 process.env.SMSBOWER_API_BASE = `http://127.0.0.1:${provider.address().port}/handler_api.php`;
 const vault = await createCdkVault(root);
-const pool = { summary: async () => ({ enabled: true, available: true, fee: 2, hasNumbers: false }),
+const pool = { summary: (categoryId) => categoryId ? { id: categoryId, name: "其他", enabled: true, available: true, fee: 2, feeVersion: 1 } : { enabled: true, available: true, categories: [{ id: "other", name: "其他", enabled: true, fee: 2, feeVersion: 1, available: true }] },
   begin: async () => { poolBegins++; throw Object.assign(new Error("fixture pool busy"), { code: "SMS_POOL_BUSY" }); },
   getNumber: async () => { poolGets++; throw Error("unexpected purchase"); },
   release: async () => { poolReleases++; return { state: "released", reserved: 0, fee: 2 }; },
@@ -103,7 +103,7 @@ try {
   check(numberCalls === heldPurchases, "manual phone input requires no SMS-platform permission and makes no purchase");
 
   allowed.add("pool");
-  const queuedPool = await add("queued-pool@example.invalid", { id: "pool", config: { quotedFee: 2 } });
+  const queuedPool = await add("queued-pool@example.invalid", { id: "pool", config: { categoryId: "other", quotedFee: 2 } });
   await until(() => poolBegins > 0, "pool should wait for a slot"); allowed.delete("pool");
   await until(() => job(queuedPool.id)?.smsStatus === "error", "revoked pool queue should stop");
   check(poolGets === 0 && job(queuedPool.id)?.smsPoolBilling?.reserved === 0, "revoked queued pool does not reserve or buy");

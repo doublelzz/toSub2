@@ -18,7 +18,7 @@ const dom = new JSDOM('<div id="root"></div>', { url: "http://localhost" });
 globalThis.window = dom.window; globalThis.document = dom.window.document; globalThis.HTMLElement = dom.window.HTMLElement;
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 const { useDialogFocus } = await load("../web/src/WorkspaceUi.jsx", ["useDialogFocus"]);
-let publicRequest = async () => Response.json({ enabled: true, available: true, fee: 3, status: "ready", hasNumbers: true });
+let publicRequest = async () => Response.json({ enabled: true, categories: [{ id: "other", name: "其他", enabled: true, available: true, fee: 3, feeVersion: 1, status: "available_on_demand" }] });
 const { SmsPoolWorkspace, EntryDialog, CredentialDialog, SmsPoolChoice, SmsPoolChargeDialog } = await load("../web/src/SmsPoolWorkspace.jsx", ["SmsPoolWorkspace", "EntryDialog", "CredentialDialog", "SmsPoolChoice", "SmsPoolChargeDialog"], {
   useDialogFocus, Drawer: ({ children }) => React.createElement("section", null, children), cdkFetch: (...args) => publicRequest(...args),
 });
@@ -36,26 +36,60 @@ async function fill(element, value) {
   });
 }
 const credentials = [{ id: "cred-a", name: "Primary", providerId: "smsbower", enabled: true, hasApiKey: true }, { id: "cred-b", name: "Backup", providerId: "herosms", enabled: true, hasApiKey: true }];
-const rules = { enabled: true, fee: 3, noStockThreshold: 3, cooldownMinutes: 10, maxAttempts: 10, maxConcurrent: 5, buffer: { enabled: false, forceRefill: false, target: 3, lowWater: 1, perEntry: 1, refillConcurrency: 1, minRemainingSeconds: 480, idleMinutes: 10, maxOutstanding: 10, maxPerMinute: 6 } };
+const rules = { enabled: true, fee: 3, noStockThreshold: 3, cooldownMinutes: 10, maxAttempts: 10, requestConcurrency: 3 };
 const issues = []; const check = (condition, message) => { if (!condition) issues.push(message); };
 
 try {
-  let snapshot = { rules, credentials, entries: [{ id: "entry-a", credentialId: "cred-a", providerId: "smsbower", country: "6", countryLabel: "Country A", maxPrice: "0.30", priority: 10, enabled: true, state: "available", noStockCount: 0 }], operations: [] };
+  let snapshot = { categories: [{ id: "other", name: "其他", enabled: true, fee: 3, feeVersion: 1 }, { id: "us", name: "美区", enabled: false, fee: 8, feeVersion: 1 }], rules, credentials, entries: [{ id: "entry-a", categoryId: "other", credentialId: "cred-a", providerId: "smsbower", country: "6", countryLabel: "Country A", maxPrice: "0.30", priority: 10, enabled: true, state: "available", noStockCount: 0 }], operations: [] };
   const calls = [];
-  const api = async (path = "", method = "GET", body) => { calls.push({ path, method, body }); if (path === "/rules") snapshot = { ...snapshot, rules: body }; return structuredClone(snapshot); };
+  const api = async (path = "", method = "GET", body) => {
+    calls.push({ path, method, body });
+    if (path === "/rules") snapshot = { ...snapshot, rules: body };
+    if (path === "/categories") { const category = { id: "vip", feeVersion: 1, ...body }; snapshot.categories.push(category); return { ...structuredClone(snapshot), savedCategory: category }; }
+    if (path.startsWith("/categories/")) snapshot.categories = snapshot.categories.map((row) => row.id === path.split("/").at(-1) ? { ...row, ...body, ...(body.archived ? { archivedAt: "2026-10-28T01:00:00Z", enabled: false } : {}) } : row);
+    if (path === "/entries") snapshot.entries.push(...body.entries.map((row, index) => ({ ...row, id: `copy-${index}`, providerId: "smsbower", state: "available" })));
+    if (path.startsWith("/entries/")) snapshot.entries = snapshot.entries.map((row) => row.id === path.split("/").at(-1) ? { ...row, ...body } : row);
+    return structuredClone(snapshot);
+  };
   await render(SmsPoolWorkspace, { api });
   assert.match(container.querySelector(".sp-pool-status").textContent, /1 个可用条目/);
+  assert.ok(container.querySelector('.sp-tabs button[aria-pressed="true"]').textContent.startsWith("国家报价"));
+  assert.doesNotMatch(container.querySelector(".sp-tabs").textContent, /号码库存/);
+  assert.equal(container.querySelector('[aria-label="自动补满号码"]'), null);
   await act(() => [...container.querySelectorAll(".sp-tabs button")].find((element) => element.textContent === "设置").click());
   const switchInput = container.querySelector('[role="switch"]');
   await act(() => switchInput.click());
-  await fill(container.querySelector('[aria-label="验证成功扣次"]'), "1.5");
-  assert.equal(button("保存池规则").disabled, true, "fractional CDK fees cannot be saved");
-  for (const [label, value] of [["验证成功扣次", "4"], ["连续无号暂停阈值", "5"], ["首次冷却分钟", "8"], ["单次取号尝试上限", "7"], ["池并发上限", "3"]]) await fill(container.querySelector(`[aria-label="${label}"]`), value);
+  await fill(container.querySelector('[aria-label="取号请求并发"]'), "1.5");
+  assert.equal(button("保存池规则").disabled, true, "fractional request concurrency cannot be saved");
+  for (const [label, value] of [["连续无号暂停阈值", "5"], ["首次冷却分钟", "8"], ["单次取号尝试上限", "7"], ["取号请求并发", "3"]]) await fill(container.querySelector(`[aria-label="${label}"]`), value);
   await click("保存池规则");
   const submittedRules = calls.find((row) => row.path === "/rules");
-  assert.deepEqual(submittedRules.body, { enabled: false, fee: 4, noStockThreshold: 5, cooldownMinutes: 8, maxAttempts: 7, maxConcurrent: 3, buffer: { enabled: true, forceRefill: false, target: 3 } });
+  assert.deepEqual(submittedRules.body, { enabled: false, noStockThreshold: 5, cooldownMinutes: 8, maxAttempts: 7, requestConcurrency: 3 });
   assert.match(container.textContent, /接码池已关闭/);
   check(container.querySelector('[aria-label="单次取号尝试上限"]').max === "20", "UI maximum attempts must match server limit 20");
+
+  assert.equal(container.querySelector('[aria-label="验证成功扣次"]'), null, "global rules have no category fee");
+  await click("管理分类");
+  await click("编辑 美区");
+  await fill(container.querySelector('[aria-label="分类验证成功扣次"]'), "2.5"); assert.equal(button("保存分类").disabled, true);
+  await fill(container.querySelector('[aria-label="分类名称"]'), "美国专用"); await fill(container.querySelector('[aria-label="分类验证成功扣次"]'), "7");
+  await act(() => container.querySelector('.sp-dialog input[type="checkbox"]').click()); await click("保存分类");
+  assert.deepEqual(calls.findLast((row) => row.path === "/categories/us").body, { name: "美国专用", fee: 7, enabled: true });
+  await click("新增分类"); await fill(container.querySelector('[aria-label="分类名称"]'), "VIP"); await fill(container.querySelector('[aria-label="分类验证成功扣次"]'), "12"); await click("保存分类");
+  assert.deepEqual(calls.findLast((row) => row.path === "/categories").body, { name: "VIP", fee: 12, enabled: true });
+  await fill(container.querySelector('[aria-label="当前接码池分类"]'), "other");
+  await act(() => [...container.querySelectorAll('.sp-tabs button')].find((row) => row.textContent.startsWith("国家报价")).click());
+  await click("复制到分类"); await fill(container.querySelector('[aria-label="复制报价目标分类"]'), "us"); await click("确认复制");
+  assert.equal(calls.findLast((row) => row.path === "/entries").body.entries[0].categoryId, "us");
+  await fill(container.querySelector('[aria-label="当前接码池分类"]'), "us"); assert.equal(container.querySelectorAll('.sp-entry-table tbody tr').length, 1);
+  assert.match(container.querySelector('.sp-pool-fee').textContent, /美国专用.*7/);
+  await act(() => container.querySelector('[aria-label="编辑 Country A"]').click()); await fill(container.querySelector('[aria-label="报价所属分类"]'), "vip"); await click("保存");
+  assert.equal(calls.findLast((row) => row.path.startsWith("/entries/")).body.categoryId, "vip");
+  assert.equal(container.querySelectorAll('.sp-entry-table tbody tr').length, 0, "moving a quote removes it from the old category");
+  const usManagerRow = [...container.querySelectorAll('.sp-category-row')].find((row) => row.textContent.includes("美国专用"));
+  await click("归档", usManagerRow); await click("确认归档");
+  assert.equal(container.querySelector('[aria-label="当前接码池分类"]').value, "us", "archiving the current category never silently switches categories");
+  assert.match(container.querySelector('.sp-category-notice').textContent, /已归档/);
 
   const closeEvents = []; const savedCredentials = [];
   await render(CredentialDialog, { row: { ...credentials[0], apiKey: "fixture-secret-never-render" }, onClose: () => closeEvents.push("close"), onSave: async (body) => savedCredentials.push(body), onSaved: async () => {} });
@@ -78,7 +112,7 @@ try {
   const entryCalls = []; let entrySaved = 0;
   const quotes = [{ country: "6", title: "Country A", price: 0.3, count: 4, providerIds: "1", grade: "gold" }, { country: "6", name: "Country A", price: 0.4, count: 7, providerIds: "2" }, { country: "16", name: { eng: "Unexpected object" }, price: 0.5, count: 8, providerIds: "3" }];
   const request = async (path, method, body) => { entryCalls.push({ path, method, body }); return path.endsWith("/options") ? { options: quotes } : {}; };
-  await render(EntryDialog, { credentials, request, onClose() {}, onSaved: () => { entrySaved++; } });
+  await render(EntryDialog, { categoryId: "other", categoryName: "其他", credentials, request, onClose() {}, onSaved: () => { entrySaved++; } });
   assert.equal(button("加入接码池").disabled, true);
 
   await click("查询国家报价");
@@ -99,24 +133,32 @@ try {
   assert.equal(button("加入接码池").disabled, true);
 
   const confirmations = [];
-  await render(SmsPoolChargeDialog, { quote: { fee: 3, count: 2 }, onClose: (value) => confirmations.push(value) });
+  await render(SmsPoolChargeDialog, { quote: { categoryId: "other", categoryName: "其他", feeVersion: 1, fee: 3, count: 2 }, onClose: (value) => confirmations.push(value) });
   assert.match(container.textContent, /最多扣 6 次/);
   await click("确认开始接码");
-  assert.deepEqual(confirmations[0], { id: "pool", config: { quotedFee: 3 } });
+  assert.deepEqual(confirmations[0], { id: "pool", config: { categoryId: "other", quotedFee: 3, feeVersion: 1 } });
 
   let resolveSummary;
   publicRequest = () => new Promise((resolve) => { resolveSummary = resolve; });
-  await render(SmsPoolChoice, { token: "fixture" });
+  await render(SmsPoolChoice, { value: "other", token: "fixture" });
   check(container.querySelector(".sp-choice-fee strong").textContent.trim().startsWith("—"), "Loading must not invent a default fee");
   check(!container.querySelector(".sp-choice-footer").textContent.includes("0 个可用条目"), "Loading must not claim zero available entries");
-  await act(async () => resolveSummary(Response.json({ enabled: false, available: false, fee: 4, status: "ready", hasNumbers: true })));
+  await act(async () => resolveSummary(Response.json({ enabled: false, categories: [{ id: "other", name: "其他", enabled: true, available: false, fee: 4, feeVersion: 1 }] })));
   assert.match(container.querySelector(".sp-choice-heading").textContent, /暂未开放/);
   assert.match(container.querySelector(".sp-choice-fee").textContent, /4 次/);
 
   publicRequest = async () => Response.json({ error: "fixture unavailable" }, { status: 503 });
-  await render(SmsPoolChoice, { token: "fixture" });
+  await render(SmsPoolChoice, { value: "other", token: "fixture" });
   assert.match(container.querySelector('[role="alert"]').textContent, /fixture unavailable/);
   check(!container.querySelector(".sp-choice-heading").textContent.includes("正在读取"), "Failed public summary must not stay in a perpetual loading state");
+
+  const changes = []; const publicCategories = [{ id: "us", name: "美区", enabled: false, available: false, fee: 8, feeVersion: 1 }, { id: "other", name: "其他", enabled: true, available: true, fee: 3, feeVersion: 1, secret: "private-not-rendered" }];
+  await render(SmsPoolChoice, { value: "us", summary: { enabled: true, categories: publicCategories }, onChange: (value) => changes.push(value) });
+  assert.equal(container.querySelector('[aria-label="选择接码池分类"]').value, "us"); assert.match(container.querySelector('[role="alert"]').textContent, /重新选择/); assert.deepEqual(changes, []);
+  await fill(container.querySelector('[aria-label="选择接码池分类"]'), "other"); assert.deepEqual(changes, ["other"]);
+  await render(SmsPoolChoice, { value: "other", summary: { enabled: true, categories: publicCategories } });
+  assert.match(container.querySelector('.sp-choice-fee').textContent, /其他.*3 次/); assert.doesNotMatch(container.innerHTML, /private-not-rendered/);
+  await render(SmsPoolChoice, { value: "archived", summary: { enabled: true, categories: publicCategories } }); assert.match(container.textContent, /原分类已失效/); assert.equal(container.querySelector('[aria-label="选择接码池分类"]').value, "archived");
 
   let resolveAdmin;
   await render(SmsPoolWorkspace, { api: () => new Promise((resolve) => { resolveAdmin = resolve; }) });

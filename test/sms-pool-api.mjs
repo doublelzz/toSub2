@@ -8,7 +8,7 @@ import { startCdkServer } from "../src/cdk-server.mjs";
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "tosub2-sms-pool-api-"));
 process.env.TOSUB2_ENCRYPTION_KEY = crypto.randomBytes(32).toString("base64");
 process.env.TOSUB2_ADMIN_CDK = "synthetic-sms-pool-api-admin-only";
-let app; let base; const scopes = new Map(); let optionsCalls = 0;
+let app; let base; const scopes = new Map(); let optionsCalls = 0; let numberCount = 0;
 function client() {
   let cookie = ""; let token = "";
   return async (url, method = "GET", body, headers = {}) => {
@@ -20,7 +20,7 @@ function client() {
 try {
   app = await startCdkServer({ root, listen: false, smsPoolOptions: { createProvider: (id, config) => ({ listNumberOptions: async () => {
     optionsCalls++; assert.equal(config.apiKey, "synthetic-pool-key"); return [{ country: "1", title: "Synthetic country", price: 0.25, count: 5 }];
-  }, getNumber: async () => ({ requestId: crypto.randomUUID(), number: "+12025550123", cost: { amount: "0.25", currency: "USD", source: "order" } }) }) }, createWorkspace: async (options) => {
+  }, getNumber: async () => ({ requestId: crypto.randomUUID(), number: `+1202555${String(++numberCount).padStart(4, "0")}`, cost: { amount: "0.25", currency: "USD", source: "order" } }) }) }, createWorkspace: async (options) => {
     scopes.set(options.cdkId, options.smsPool);
     return { activeCount: () => 0, tick: () => 0, inventory: () => [], pause() {}, resume() {}, stop: async () => {}, shutdown: async () => {},
       dispatch: async () => ({ body: Buffer.from(JSON.stringify({ features: {} })) }), handle: async (req, res) => { res.writeHead(404); res.end("{}"); } };
@@ -37,11 +37,28 @@ try {
   assert.equal((await user("/api/admin/sms-pool/analytics")).status, 403);
   assert.equal((await user("/api/admin/sms-pool/inventory")).status, 403);
   assert.equal((await user("/api/admin/sms-pool/rules", "PUT", { enabled: true })).status, 403);
-  let response = await admin("/api/admin/sms-pool/rules", "PUT", { enabled: true, fee: 2, noStockThreshold: 3, cooldownMinutes: 15, maxAttempts: 5, maxConcurrent: 3, buffer: { forceRefill: true } });
-  assert.equal(response.status, 200); assert.equal(response.data.rules.fee, 2); assert.equal(response.data.rules.buffer.forceRefill, true);
-  assert.equal((await admin("/api/admin/sms-pool/rules", "PUT", { buffer: { forceRefill: "true" } })).status, 422);
-  assert.equal((await admin("/api/admin/sms-pool")).data.rules.buffer.forceRefill, true, "invalid boolean never changes saved force-refill rules");
+  let response = await admin("/api/admin/sms-pool/rules", "PUT", { enabled: true, fee: 2, noStockThreshold: 3, cooldownMinutes: 15, maxAttempts: 5, requestConcurrency: 3, buffer: { forceRefill: true } });
+  assert.equal(response.status, 200); assert.equal(response.data.categories.find((row) => row.id === "other").fee, 2); assert.equal(response.data.rules.buffer, undefined);
+  assert.equal(response.data.rules.requestConcurrency, 3); assert.equal(response.data.rules.maxConcurrent, undefined);
+  assert.equal((await admin("/api/admin/sms-pool/rules", "PUT", { requestConcurrency: 0 })).status, 422);
+  assert.equal((await admin("/api/admin/sms-pool")).data.rules.requestConcurrency, 3);
   assert.equal((await admin("/api/admin/sms-pool/rules", "PUT", { fee: -1 })).status, 422);
+  assert.equal((await user("/api/admin/sms-pool/categories", "POST", { name: "forged", fee: 1 })).status, 403);
+  response = await admin("/api/admin/sms-pool/categories", "POST", { name: "自建池", fee: 4 });
+  assert.equal(response.status, 200); const categoryId = response.data.savedCategory.id;
+  assert.equal((await user(`/api/sms-pool?categoryId=${categoryId}`)).data.fee, 4);
+  assert.equal((await admin(`/api/admin/sms-pool/categories/${categoryId}`, "PATCH", { fee: 6 })).data.savedCategory.feeVersion, 2);
+  assert.equal((await admin(`/api/admin/sms-pool/categories/${categoryId}`, "PATCH", { archived: true })).status, 200);
+  assert.equal((await user(`/api/sms-pool?categoryId=${categoryId}`)).status, 409);
+  assert.equal((await admin(`/api/admin/sms-pool/categories/${categoryId}`, "PATCH", { enabled: true })).status, 409);
+  const smsKey = "chatgpt-onboarding.sms-provider-settings-v1";
+  const settings = (selectedProviderId, pool) => user("/api/settings/workspace", "PUT", { workspaceId: owner.id, settings: { [smsKey]: JSON.stringify({ selectedProviderId, configs: { custom: {}, pool } }) } });
+  assert.equal((await settings("custom", {})).status, 200, "unused pool draft cannot prevent saving custom SMS configuration");
+  assert.equal((await settings("custom", { categoryId })).status, 200, "an archived previous selection may remain stored while another provider is selected");
+  assert.equal((await settings("pool", {})).status, 422);
+  assert.equal((await settings("pool", { categoryId })).status, 409);
+  assert.equal((await settings("pool", { categoryId: "us" })).status, 409);
+  assert.equal((await settings("pool", { categoryId: "other" })).status, 200);
   response = await admin("/api/admin/sms-pool/credentials", "POST", { providerId: "herosms", name: "Synthetic account", apiKey: "synthetic-pool-key" });
   assert.equal(response.status, 200); const credentialId = response.data.credentials[0].id;
   assert.equal(JSON.stringify(response.data).includes("synthetic-pool-key"), false);
@@ -53,14 +70,13 @@ try {
   response = await user("/api/sms-pool"); assert.equal(response.status, 200); assert.equal(response.data.available, true); assert.equal(response.data.fee, 2);
   assert.equal(response.data.credentials, undefined); assert.equal(response.data.entries, undefined); assert.equal(response.data.operations, undefined);
   for (const field of ["countries", "country", "countryLabel", "availableEntries", "cost", "costOrders", "costSummary", "analytics", "stats", "byEntry", "byCountry", "byProvider", "quote", "maxPrice"]) assert.equal(response.data[field], undefined, `ordinary CDKs cannot read internal ${field}`);
-  assert.equal(typeof response.data.hasNumbers, "boolean");
+  assert.equal(response.data.hasNumbers, undefined); assert.equal(response.data.status, "available_on_demand");
   assert.equal((await user("/api/admin/sms-pool/buffer/warmup", "POST", {})).status, 403);
   assert.equal((await user("/api/admin/sms-pool/buffer/pause", "POST", {})).status, 403);
   assert.equal((await user("/api/admin/sms-pool/buffer/drain", "POST", {})).status, 403);
   assert.equal((await user(`/api/admin/sms-pool/inventory/${crypto.randomUUID()}/reconcile`, "POST", { action: "close", note: "forged" })).status, 403);
   response = await admin("/api/admin/sms-pool/buffer/warmup", "POST", {});
-  assert.equal(response.status, 200);
-  assert.equal(response.data.buffer.rules.enabled, true, "an explicit administrator warmup enables the hidden buffer capability");
+  assert.equal(response.status, 409); assert.equal(response.data.code, "SMS_POOL_PREFETCH_REMOVED");
   assert.equal((await admin("/api/admin/sms-pool/buffer/drain", "POST", {})).status, 200);
   assert.equal((await admin(`/api/admin/sms-pool/entries/${entryId}`, "PATCH", { enabled: false })).status, 200);
   assert.equal((await user("/api/sms-pool")).data.available, false);
@@ -105,6 +121,7 @@ try {
   assert.equal((await user("/api/admin/sms-pool/analytics?result=verified")).status, 403);
   assert.equal((await admin("/api/admin/sms-pool/analytics?start=bad-date")).status, 422);
   const inventoryRules = { simplified: true, target: 20, maxOutstanding: 30, perEntry: 1, maxPerMinute: 1 };
+  app.smsPool.pause(); // Freeze maintenance while exercising historical inventory pagination.
   const purchasedAt = Date.now();
   const addInventory = (country, state, phone, cost = null) => {
     const id = crypto.randomUUID(); const route = app.smsPool.adminSnapshot().entries.find((item) => item.country === country);
@@ -124,14 +141,14 @@ try {
     config: { apiKey: "synthetic-pool-key", service: "dr", country: "1" }, createdAt: purchasedAt + 10 }, inventoryRules);
   app.store.updateInventory(failedAttempt.id, (item) => ({ ...item, state: "closed", lastError: "no_stock" }));
   response = await admin("/api/admin/sms-pool/inventory?page=1&pageSize=1");
-  assert.equal(response.status, 200); assert.equal(response.data.total, 2); assert.equal(response.data.items.length, 1); assert.equal(response.data.pages, 2);
+  assert.equal(response.status, 200); assert.equal(response.data.total, 3); assert.equal(response.data.items.length, 1); assert.equal(response.data.pages, 3);
   assert.equal(response.data.items[0].phone, unknownCost.order.number, "administrator inventory returns a complete copyable number");
   assert.equal(response.data.items[0].countryLabel, "Purchased country 2");
   assert.equal(response.data.items[0].cost, null, "an unconfirmed actual cost stays unknown");
   assert.equal(response.data.items[0].quote.amount, "0.25");
   assert.equal(JSON.stringify(response.data).includes("synthetic-pool-key"), false, "inventory responses never expose provider credentials");
   response = await admin("/api/admin/sms-pool/inventory?scope=current&country=herosms%3A1&pageSize=1");
-  assert.equal(response.data.total, 1); assert.equal(response.data.items[0].id, zeroCost.id);
+  assert.equal(response.data.total, 2); assert.equal(response.data.items[0].id, zeroCost.id);
   assert.equal(response.data.items[0].cost.amount, "0", "a platform-confirmed zero price is valid");
   response = await admin("/api/admin/sms-pool/inventory?scope=history&pageSize=1&page=2");
   assert.equal(response.data.total, 2); assert.equal(response.data.items.length, 1); assert.ok(["closed", "consumed"].includes(response.data.items[0].state));
@@ -140,7 +157,7 @@ try {
   response = await admin("/api/admin/sms-pool/inventory?scope=all&state=ready&country=2&providerId=herosms");
   assert.equal(response.data.total, 1); assert.equal(response.data.items[0].id, unknownCost.id);
   response = await admin("/api/admin/sms-pool/inventory?scope=all&costStatus=known&pageSize=1&page=2");
-  assert.equal(response.data.total, 3); assert.equal(response.data.items.length, 1); assert.equal(response.data.pages, 3);
+  assert.equal(response.data.total, 4); assert.equal(response.data.items.length, 1); assert.equal(response.data.pages, 4);
   response = await admin("/api/admin/sms-pool/inventory?scope=all&costStatus=known&search=5551001");
   assert.equal(response.data.total, 1); assert.equal(response.data.items[0].cost.amount, "0", "known-cost filtering includes a confirmed zero amount");
   response = await admin("/api/admin/sms-pool/inventory?scope=all&costStatus=unknown");
@@ -148,7 +165,7 @@ try {
   response = await admin("/api/admin/sms-pool/inventory?scope=all&refundStatus=confirmed");
   assert.equal(response.data.total, 1); assert.equal(response.data.items[0].id, refundedCost.id);
   response = await admin("/api/admin/sms-pool/inventory?scope=all&refundStatus=unconfirmed");
-  assert.equal(response.data.total, 3); assert.ok(response.data.items.every((item) => item.id !== refundedCost.id));
+  assert.equal(response.data.total, 4); assert.ok(response.data.items.every((item) => item.id !== refundedCost.id));
   assert.equal((await admin("/api/admin/sms-pool/inventory?scope=invalid")).status, 422);
   assert.equal((await admin("/api/admin/sms-pool/inventory?page=0")).status, 422);
   assert.equal((await admin("/api/admin/sms-pool/inventory?pageSize=0")).status, 422);
@@ -158,10 +175,10 @@ try {
   response = await admin("/api/admin/sms-pool/inventory?country=1");
   assert.equal(response.data.items[0].countryLabel, "Purchased country 1", "inventory labels use the original purchase snapshot after quote edits");
   response = await admin("/api/admin/sms-pool");
-  assert.equal(response.data.buffer.items.find((item) => item.id === zeroCost.id).phone, zeroCost.order.number);
+  assert.equal(response.data.legacyInventory.items.find((item) => item.id === zeroCost.id).phone, zeroCost.order.number);
   response = await admin("/api/admin/sms-pool/buffer/pause", "POST", {});
-  assert.equal(response.status, 200); assert.equal(response.data.buffer.rules.forceRefill, false); assert.equal(response.data.buffer.progress.state, "paused");
-  assert.equal(app.store.inventoryItem(zeroCost.id).state, "ready", "pausing replenishment retains already purchased numbers");
+  assert.equal(response.status, 409); assert.equal(response.data.code, "SMS_POOL_PREFETCH_REMOVED");
+  assert.equal(app.store.inventoryItem(zeroCost.id).state, "ready", "obsolete pause request never mutates retained legacy orders");
   response = await user("/api/sms-pool");
   assert.doesNotMatch(JSON.stringify(response.data), /Purchased country|1202555100|synthetic-pool-key/);
   for (const field of ["items", "progress", "phone", "countryLabel", "cost", "quote"]) assert.equal(response.data[field], undefined);

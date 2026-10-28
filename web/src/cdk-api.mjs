@@ -109,16 +109,18 @@ export async function cdkFetch(url, options = {}) {
     if (!quote.canImport) throw new Error(`可用次数不足：新增 ${quote.added} 个账号需要 ${quote.charge} 次，当前可用 ${quote.balance} 次`);
     const phoneMode = payload.phoneBindingMode ?? (Object.hasOwn(payload, "phoneBindingEnabled") ? payload.phoneBindingEnabled ? "automatic" : "manual" : "automatic");
     if (["single", "authorization"].includes(mode) && phoneMode === "automatic" && payload.smsProvider?.id === "pool") {
-      const response = await fetch("/api/sms-pool", { headers, signal: options.signal });
+      const categoryId = String(payload.smsProvider?.config?.categoryId || "").trim();
+      if (!categoryId) throw new Error("请选择接码池分类，再确认导入");
+      const response = await fetch(`/api/sms-pool?categoryId=${encodeURIComponent(categoryId)}`, { headers, signal: options.signal });
       const pool = await response.json();
       if (!response.ok) { handleSessionStatus(response, pool); throw new Error(pool.error || "无法读取接码池费用"); }
-      if (!pool.enabled || !pool.available) throw new Error("接码池暂时无法取号，请稍后重试或选择自己的接码平台");
-      if (!Number.isSafeInteger(pool.fee) || pool.fee < 1 || !Number.isSafeInteger(quote.count) || quote.count < 1) throw new Error("接码池费用尚未确认，请刷新后重试");
+      if (pool.id !== categoryId || !pool.enabled || !pool.available) throw new Error("所选接码池分类已停用或暂时无法取号，请重新选择");
+      if (!Number.isSafeInteger(pool.fee) || pool.fee < 1 || !Number.isSafeInteger(pool.feeVersion) || pool.feeVersion < 1 || !Number.isSafeInteger(quote.count) || quote.count < 1) throw new Error("接码池费用尚未确认，请刷新后重试");
       const admin = quote.balance === null;
       if (!admin && quote.balance < pool.fee) throw new Error(`接码池需要预留 ${pool.fee} 次，当前可用 ${quote.balance} 次`);
       const fee = admin ? 0 : pool.fee;
-      quote.smsPool = { count: quote.count, fee, maximum: quote.count * fee, admin };
-      payload.smsProvider = { id: "pool", config: { quotedFee: pool.fee } };
+      quote.smsPool = { categoryId, categoryName: pool.name, feeVersion: pool.feeVersion, count: quote.count, fee, maximum: quote.count * fee, admin };
+      payload.smsProvider = { id: "pool", config: { categoryId, quotedFee: pool.fee, feeVersion: pool.feeVersion } };
       requestOptions = { ...options, body: JSON.stringify(payload) };
     }
     if (!confirmationHandler) throw new Error("导入确认尚未准备好，请稍后重试");

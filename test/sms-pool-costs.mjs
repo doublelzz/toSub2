@@ -20,6 +20,35 @@ check(decimals.byCurrency.find((row) => row.currency === "RUB").confirmedPurchas
 check(decimals.byCurrency.length === 2 && decimals.unknownCostCount === 2 && decimals.unknownCurrencyCount === 1, "currencies stay separate and missing actual/unknown currency are explicit");
 check(descriptor().cost === null && descriptor().quote.amount === "9" && descriptor().maxPrice.amount === "10", "quote and price ceiling never become actual order cost");
 
+const successOrder = (id, { cost, quote, currency = "USD", providerId = "smsbower" } = {}) => poolCostOrder({ providerId,
+  order: { requestId: id, number: "+12025550123", cost }, config: { quotedPrice: quote, maxPrice: "99", currency } },
+{ state: "verified", verifiedAt: "2026-10-28T02:00:00.000Z" });
+const estimates = summarizePoolCosts([
+  successOrder("actual", { cost: actual("0.1", "USD"), quote: "9" }),
+  successOrder("estimate-a", { quote: "0.1" }), successOrder("estimate-b", { quote: "0.2" }),
+  successOrder("unknown-currency-a", { quote: "0", currency: null }),
+  successOrder("unknown-currency-b", { quote: "0.074", currency: null, providerId: "herosms" }),
+  successOrder("actual-missing-currency", { cost: actual("2", null), quote: "9" }),
+  successOrder("ceiling-only"),
+]);
+const estimatedUsd = estimates.byCurrency.find((row) => row.currency === "USD");
+check(estimatedUsd.verifiedPurchaseAmount === "0.1" && estimatedUsd.estimatedVerifiedAmount === "0.3" && estimatedUsd.estimatedVerifiedOrderCount === 2,
+  "known actual success cost and exact quote estimates stay separate without estimating orders with actual cost");
+check(estimates.estimatedVerifiedCount === 4 && estimates.unknownVerifiedEstimateCurrencyCount === 2 && estimates.missingVerifiedEstimateCount === 1,
+  "estimated success counts distinguish missing quote amounts from unknown estimate currencies");
+check(estimates.estimatesByProviderCurrency.filter((row) => row.currency === null).length === 2
+  && estimates.estimatesByProviderCurrency.find((row) => row.providerId === "smsbower" && row.currency === null).estimatedVerifiedAmount === "0"
+  && estimates.estimatesByProviderCurrency.find((row) => row.providerId === "herosms" && row.currency === null).estimatedVerifiedAmount === "0.074",
+"unknown-currency quote estimates retain zero and stay separate for each provider");
+check(estimates.unknownVerifiedCurrencyCount === 1 && estimates.byCurrency.every((row) => row.estimatedVerifiedAmount !== "9"),
+  "an actual amount lacking currency never falls back to its quote or price ceiling");
+const categorySource = poolCostOrder({ categoryId: "us", categoryName: "美区购买快照", categoryFeeVersion: 2, providerId: "smsbower",
+  order: { requestId: "category-snapshot", number: "+12025550123" }, config: { categoryId: "other", categoryName: "其他配置", categoryFeeVersion: 9 } });
+check(categorySource.categoryId === "us" && categorySource.categoryName === "美区购买快照" && categorySource.categoryFeeVersion === 2,
+  "purchase source category snapshot takes precedence over provider config");
+check(poolCostOrder({ order: {}, config: { categoryId: "vip", categoryName: "专线", categoryFeeVersion: 3 } }).categoryFeeVersion === 3
+  && descriptor().categoryId === "legacy" && descriptor().categoryName === "原接码池", "config snapshots are retained while uncategorized historical costs remain legacy");
+
 process.env.TOSUB2_ENCRYPTION_KEY = crypto.randomBytes(32).toString("base64"); process.env.TOSUB2_ADMIN_CDK = "synthetic-pool-cost-admin-only";
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "tosub2-pool-costs-"));
 const vault = await createCdkVault(root); let store = await createCdkStore(root, vault); let pool; let clock = Date.now(); let serial = 0;
@@ -50,12 +79,13 @@ try {
   const missingCurrency = input(); user.begin(missingCurrency); await user.getNumber(missingCurrency); user.release(missingCurrency);
   summary = pool.adminSnapshot().costSummary;
   check(summary.unknownCostCount === 1 && summary.unknownCurrencyCount === 1 && summary.orderCount === 5, "legacy no-cost responses and actual amount without currency stay explicitly unknown");
-  pool.saveRules({ buffer: { enabled: true, target: 1, lowWater: 0, perEntry: 1 } }, admin); await pool.warmup(admin); pool.pause();
-  const inventory = store.inventoryItems().find((item) => item.state === "ready");
-  check(inventory && pool.adminSnapshot().buffer.items.find((item) => item.id === inventory.id).cost.amount === "1.25", "prefetched order cost available on administrator inventory before assignment");
-  const beforeClaim = pool.adminSnapshot().costSummary.orderCount; const buffered = input(); user.begin(buffered); const allocation = await user.getNumber(buffered);
-  check(allocation.inventoryId === inventory.id && pool.adminSnapshot().costSummary.orderCount === beforeClaim, "same provider order is counted once across inventory and operation allocation");
-  user.abandon({ ...buffered, allocationId: allocation.allocationId }); user.release(buffered); clock += 121000; await pool.tick();
+  const beforeAcquire = pool.adminSnapshot().costSummary.orderCount; const direct = input(); user.begin(direct); const allocation = await user.getNumber(direct);
+  check(allocation.order.cost.amount === "1.25" && !allocation.inventoryId, "on-demand order retains its provider cost without using prefetched inventory");
+  const repeated = await user.getNumber(direct);
+  store.recordSmsCostOrder(allocation, { state: "assigned", createdAt: clock + 1000 });
+  check(repeated.allocationId === allocation.allocationId && pool.adminSnapshot().costSummary.orderCount === beforeAcquire + 1,
+    "repeated acquisition and lifecycle recording retain one provider order in costs and acquisition counts");
+  user.abandon({ ...direct, allocationId: allocation.allocationId }); user.release(direct); clock += 121000; await pool.tick();
   summary = pool.adminSnapshot().costSummary;
   check(summary.byCurrency.find((group) => group.currency === "EUR").refundUnconfirmedAmount === "1.25", "strict cancellation still leaves monetary refund unconfirmed");
   const publicSummary = JSON.stringify(pool.publicSummary());
@@ -85,5 +115,5 @@ try {
   const afterResolution = pool.adminSnapshot().costSummary;
   check(afterResolution.orderCount === beforeResolution.orderCount && afterResolution.unknownCostCount === beforeResolution.unknownCostCount - 1,
     "late exact order evidence replaces its unknown attempt without counting both unknown and actual purchase");
-  console.log(`[ok] SMS pool costs: ${checks} assertions; exact currency totals, rotation history, buffer deduplication, zero/unknown costs, refund distinction, persistence and public privacy; local stubs only.`);
+  console.log(`[ok] SMS pool costs: ${checks} assertions; exact actual/estimated currency totals, rotation history, order deduplication, zero/unknown costs, refund distinction, persistence and public privacy; local stubs only.`);
 } finally { await pool?.close(); store.close(); await fs.rm(root, { recursive: true, force: true }); }

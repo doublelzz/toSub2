@@ -17,7 +17,7 @@ export default function ImportChargeDialog({ quote, onClose }) {
       {pool ? <>
         <dl className="cdk-charge-lines">
           <div><dt>账号导入<small>新增 {quote.added} 个账号入库时扣除，已有账号不重复扣。</small></dt><dd>{quote.charge}<span> 次</span></dd></div>
-          <div><dt>接码池<small>每个账号手机验证成功扣 {pool.fee} 次，最多 {pool.count} 个账号。</small></dt><dd><small>最多 </small>{pool.maximum}<span> 次</span></dd></div>
+          <div><dt>接码池 · {pool.categoryName || "所选分类"}<small>每个账号手机验证成功扣 {pool.fee} 次，最多 {pool.count} 个账号。</small></dt><dd><small>最多 </small>{pool.maximum}<span> 次</span></dd></div>
         </dl>
         <div className="cdk-charge-total"><span>本次最高合计<small>导入与接码分别结算</small></span><strong>{maximum}<small> 次</small></strong></div>
         <p className="cdk-charge-balance">当前可用 {quote.balance ?? "不限"}{quote.balance !== null && " 次"}，导入后可用 {quote.after ?? "不限"}{quote.after !== null && " 次"}。</p>

@@ -13,11 +13,11 @@ const roots = []; let checks = 0;
 const ok = (condition, message) => { assert.ok(condition, message); checks++; };
 async function fixture(provider) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "tosub2-sms-pool-")); roots.push(root);
-  const vault = await createCdkVault(root); const store = await createCdkStore(root, vault); let tick = Date.now();
+  const vault = await createCdkVault(root); const store = await createCdkStore(root, vault); let tick = Date.now(); let numberCount = 0;
   const adminId = store.adminId; const [first, second] = store.generate({ count: 2, quota: 30, note: "synthetic" }, adminId);
   store.inventory(first.id, ["same@example.invalid"]); store.inventory(second.id, ["same@example.invalid"]); store.inventory(adminId, ["same@example.invalid"]);
-  const pool = createSmsPool({ store, createProvider: provider || (() => ({ getNumber: async () => ({ requestId: crypto.randomUUID(), number: "+12025550123" }) })), now: () => tick });
-  pool.saveRules({ enabled: true, fee: 3, maxConcurrent: 4 }, adminId);
+  const pool = createSmsPool({ store, createProvider: provider || (() => ({ getNumber: async () => ({ requestId: crypto.randomUUID(), number: `+1202555${String(++numberCount).padStart(4, "0")}` }) })), now: () => tick, retryDelayMs: 0 });
+  pool.saveRules({ enabled: true, fee: 3, requestConcurrency: 4 }, adminId);
   pool.saveCredential({ name: "Synthetic Hero", providerId: "herosms", apiKey: "synthetic-key-123" }, adminId);
   const credentialId = pool.adminSnapshot().credentials[0].id;
   pool.saveEntry({ credentialId, country: "1", countryLabel: "Synthetic country", maxPrice: "0.25", priority: 1 }, adminId);
@@ -65,7 +65,8 @@ try {
   let noStockCalls = 0;
   const noStock = await fixture(() => ({ getNumber: async () => { noStockCalls++; throw Object.assign(new Error("fixture no stock"), { code: "NO_NUMBERS" }); } }));
   try {
-    for (let index = 0; index < 3; index++) { const input = noStock.begin(); await assert.rejects(noStock.user.getNumber(input), (error) => error.code === "SMS_POOL_NO_NUMBERS"); }
+    noStock.pool.saveRules({ maxAttempts: 1 }, noStock.adminId);
+    for (let index = 0; index < 3; index++) { const input = noStock.begin(); await assert.rejects(noStock.user.getNumber(input), (error) => error.code === "SMS_POOL_LIMIT"); }
     ok(noStockCalls === 3 && noStock.pool.adminSnapshot().entries[0].state === "cooling", "consecutive NO_NUMBERS trips only entry breaker");
     noStock.pool.patchEntry(noStock.pool.adminSnapshot().entries[0].id, { priority: 9 }, noStock.adminId);
     ok(noStock.pool.adminSnapshot().entries[0].noStockCount === 3 && noStock.pool.adminSnapshot().entries[0].state === "cooling", "priority edit does not clear no-stock breaker");
@@ -127,10 +128,25 @@ try {
     ok(unknown.store.get(unknown.first.id).reserved === 0 && unknown.store.get(unknown.first.id).balance === 30, "audited reconciliation can release confirmed failure");
   } finally { unknown.store.close(); }
 
+  let finishOverpriced;
+  const overpriced = await fixture(() => ({ getNumber: () => new Promise((resolve) => { finishOverpriced = resolve; }) }));
+  try {
+    const input = overpriced.begin(); const purchase = overpriced.user.getNumber(input);
+    const operationStartedAt = overpriced.store.smsOperation(overpriced.first.id, input.operationId).createdAt;
+    overpriced.advance(24 * 60 * 60000);
+    finishOverpriced({ requestId: "overpriced-next-day", number: "+12025550888", cost: { amount: "0.5", currency: "USD", source: "order" } });
+    await assert.rejects(purchase, (error) => error.code === "SMS_POOL_UNKNOWN");
+    const allocation = overpriced.user.recover(input.operationId).allocation;
+    ok(allocation.createdAt >= operationStartedAt + 24 * 60 * 60000 - 1000, "a known order returned with an error records its acquisition date rather than the reservation date");
+    ok(overpriced.store.smsOperationCostOrders(overpriced.store.smsOperation(overpriced.first.id, input.operationId))[0].createdAt === allocation.createdAt, "abnormal purchased order cost history keeps the actual acquisition day");
+  } finally { overpriced.store.close(); }
+
   const limit = await fixture();
   try {
-    limit.pool.saveRules({ maxAttempts: 1, maxConcurrent: 1 }, limit.adminId);
-    const first = limit.begin(); assert.throws(() => limit.begin(), (error) => error.code === "SMS_POOL_BUSY");
+    limit.pool.saveRules({ maxAttempts: 1, requestConcurrency: 1 }, limit.adminId);
+    const first = limit.begin(); const additional = limit.begin();
+    ok(limit.user.recover(additional.operationId).state === "reserved", "another operation is accepted while an earlier operation remains unsettled");
+    limit.user.release(additional);
     const allocation = await limit.user.getNumber(first);
     limit.user.noteSubmitted({ operationId: first.operationId, allocationId: allocation.allocationId });
     assert.throws(() => limit.user.abandon({ operationId: first.operationId, allocationId: allocation.allocationId }), (error) => error.uncertain);
@@ -179,7 +195,7 @@ try {
   } finally { fallback.store.close(); }
 
   const selectedCountries = [];
-  const roundRobin = await fixture((id, config) => ({ getNumber: async () => { selectedCountries.push(config.country); return { requestId: crypto.randomUUID(), number: "+12025550123" }; } }));
+  const roundRobin = await fixture((id, config) => ({ getNumber: async () => { selectedCountries.push(config.country); return { requestId: crypto.randomUUID(), number: `+1202555${String(selectedCountries.length).padStart(4, "0")}` }; } }));
   try {
     roundRobin.pool.saveEntry({ credentialId: roundRobin.credentialId, country: "2", maxPrice: "0.25", priority: 1 }, roundRobin.adminId);
     for (let index = 0; index < 4; index++) { const input = roundRobin.begin(); await roundRobin.user.getNumber(input); roundRobin.user.release({ operationId: input.operationId }); }
@@ -200,11 +216,12 @@ try {
   let finishShutdownPurchase;
   const shutdown = await fixture(() => ({ getNumber: () => new Promise((resolve) => { finishShutdownPurchase = resolve; }) }));
   try {
-    const input = shutdown.begin(); const purchase = shutdown.user.getNumber(input); let closed = false;
+    const input = shutdown.begin(); const purchase = shutdown.user.getNumber(input).catch((error) => error); let closed = false;
     const closing = shutdown.pool.close().then(() => { closed = true; });
     await new Promise((resolve) => setTimeout(resolve, 30)); ok(!closed, "central shutdown waits for in-flight purchase before store can close");
     finishShutdownPurchase({ requestId: "shutdown-order", number: "+12025550123" });
-    await purchase; await closing;
+    const outcome = await purchase; await closing;
+    ok(outcome.code === "SMS_POOL_CLOSED" && shutdown.store.inventoryItems().some((row) => row.order?.requestId === "shutdown-order"), "in-flight purchase finishing after shutdown is durably queued for cancellation");
     shutdown.user.release({ operationId: input.operationId, reason: "shutdown before submission" });
     ok(shutdown.store.get(shutdown.first.id).reserved === 0, "known unsubmitted order remains releasable during shutdown");
     await assert.rejects(shutdown.user.getNumber(input), (error) => error.code === "SMS_POOL_DISABLED");

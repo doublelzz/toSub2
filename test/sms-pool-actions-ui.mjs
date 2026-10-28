@@ -30,6 +30,7 @@ globalThis.matchMedia = window.matchMedia = () => ({ matches: false, addEventLis
 const auth = { authenticated: true, token: "fixture-pool-token", account: { id: "fixture-user", role: "user" }, workspace: { id: "fixture-user", role: "user", balance: 12, reserved: 0 },
   features: { smsProviders: [{ id: "pool", name: "接码池", fields: [] }], bulkActions: true, batchPhoneBinding: true }, logout: async () => {}, reload: async () => {} };
 const baseJob = { id: "fixture-pool-job", email: "pool-actions@example.invalid", status: "phone_skipped", prompt: "等待开始接码", canStartPhoneBinding: true, phoneBindingEnabled: false, phoneBindingMode: "manual", smsStatus: "idle", createdAt: "2026-10-25T01:00:00Z", lastOperationAt: "2026-10-25T01:00:00Z", smsSummary: { verificationStatus: "not_started", historyCount: 0, orders: [] } };
+let selectedCategoryId = "other"; let usEnabled = true;
 let job = baseJob; const calls = []; let summaryAvailable = true; let previewOverride = null;
 globalThis.fetch = async (url, options = {}) => {
   const method = options.method || "GET"; const body = options.body ? JSON.parse(options.body) : null;
@@ -43,7 +44,9 @@ globalThis.fetch = async (url, options = {}) => {
   }
   if (url.startsWith("/api/jobs?")) return Response.json({ jobs: [job], selection: [job], stats: { total: 1, today: 1 }, pagination: { page: 1, pageSize: 20, total: 1, totalPages: 1 } });
   if (url === "/api/mail-request-config") return Response.json({ ok: true });
-  if (url === "/api/sms-pool") return Response.json({ enabled: true, available: summaryAvailable, fee: 3, status: summaryAvailable ? "available_on_demand" : "unavailable", hasNumbers: false, refilling: false });
+  if (url === "/api/sms-pool") return Response.json({ enabled: true, categories: [{ id: "other", name: "其他", enabled: true, available: summaryAvailable, fee: 3, feeVersion: 1 }, { id: "us", name: "美区", enabled: usEnabled, available: summaryAvailable, fee: 7, feeVersion: 4 }] });
+  if (url === "/api/sms-pool?categoryId=other") return Response.json({ id: "other", name: "其他", enabled: true, available: summaryAvailable, fee: 3, feeVersion: 1 });
+  if (url === "/api/sms-pool?categoryId=us") return Response.json({ id: "us", name: "美区", enabled: usEnabled, available: summaryAvailable, fee: 7, feeVersion: 4 });
   if (url === "/api/jobs/start-phone-batch") return Response.json({ started: 1, skipped: 0, failed: 0 });
   if (/\/api\/jobs\/[^/]+\/(?:start-phone|sms-number)$/.test(url)) return Response.json({ job });
   if (url === "/api/jobs") return Response.json({ job });
@@ -52,14 +55,14 @@ globalThis.fetch = async (url, options = {}) => {
   throw Error(`Unexpected action UI request: ${method} ${url}`);
 };
 const ui = await load("../web/src/WorkspaceUi.jsx", ["Drawer", "MoreActions", "TaskFilters", "TaskOverview", "ThemeControl", "useCalendarDay", "useDialogFocus"], filters);
-const { SmsPoolChargeDialog } = await load("../web/src/SmsPoolWorkspace.jsx", ["SmsPoolChargeDialog"], { ...ui, cdkFetch });
+const { SmsPoolChargeDialog, SmsPoolChoice } = await load("../web/src/SmsPoolWorkspace.jsx", ["SmsPoolChargeDialog", "SmsPoolChoice"], { ...ui, cdkFetch });
 const { ImportChargeDialog } = await load("../web/src/ImportChargeDialog.jsx", ["ImportChargeDialog"], ui);
 const { CdkGate } = await load("../web/src/CdkGate.jsx", ["CdkGate"], { ...ui, ImportChargeDialog, clearWorkspaceSettings, flushWorkspaceSettings, hydrateWorkspaceSettings, setImportConfirmation });
 const empty = () => null;
-const { App } = await load("../web/src/main.jsx", ["App"], {
+const { App, resolveSmsProvider } = await load("../web/src/main.jsx", ["App", "resolveSmsProvider"], {
   ...filters, ...smsOptions, ...ui, cdkFetch, SmsPoolChargeDialog,
-  MfaWorkspace: empty, EmailRebindWorkspace: empty, OfferWorkspace: empty, SmsPoolWorkspace: empty, SmsPoolChoice: empty, CdkWorkspace: empty, CurrentCdk: empty, SmsPriceSelector: empty,
-  readWorkspaceValue: (key) => key === "chatgpt-onboarding.sms-provider-settings-v1" ? JSON.stringify({ selectedProviderId: "pool", configs: { pool: { apiKey: "stale-secret-must-not-submit" } } }) : null,
+  MfaWorkspace: empty, EmailRebindWorkspace: empty, OfferWorkspace: empty, SmsPoolWorkspace: empty, SmsPoolChoice, CdkWorkspace: empty, CurrentCdk: empty, SmsPriceSelector: empty,
+  readWorkspaceValue: (key) => key === "chatgpt-onboarding.sms-provider-settings-v1" ? JSON.stringify({ selectedProviderId: "pool", configs: { pool: { categoryId: selectedCategoryId, apiKey: "stale-secret-must-not-submit" } } }) : null,
   writeWorkspaceValue() {}, flushWorkspaceSettings: async () => {},
 }, "const appRoot =");
 const { createRoot } = await import("react-dom/client"); const container = document.getElementById("root"); const root = createRoot(container);
@@ -77,7 +80,7 @@ async function startSingle() {
 }
 async function checkConfirmation(action, expectedUrl, expectedBody) {
   await action();
-  assert.equal(calls.at(-1).url, "/api/sms-pool", "the current pool quote is fetched before confirmation");
+  assert.equal(calls.at(-1).url, "/api/sms-pool?categoryId=other", "the current pool quote is fetched before confirmation");
   assert.ok(dialog()); assert.match(dialog().textContent, /每个账号验证成功扣除3 次/);
   assert.equal(purchaseCalls().length, 0, "opening confirmation must not start phone binding or acquire a number");
   await click("取消", dialog());
@@ -118,20 +121,20 @@ async function checkImportConfirmation(action, expectedUrl, expectedBody, count)
 
 try {
   await render();
-  await checkConfirmation(startSingle, `/api/jobs/${baseJob.id}/start-phone`, { smsProvider: { id: "pool", config: { quotedFee: 3 } } });
+  await checkConfirmation(startSingle, `/api/jobs/${baseJob.id}/start-phone`, { smsProvider: { id: "pool", config: { categoryId: "other", quotedFee: 3, feeVersion: 1 } } });
 
   await render({ status: "phone", canStartPhoneBinding: false, phoneBindingEnabled: true });
-  await checkConfirmation(() => click("接码池取号"), `/api/jobs/${baseJob.id}/sms-number`, { providerId: "pool", config: { quotedFee: 3 } });
+  await checkConfirmation(() => click("接码池取号"), `/api/jobs/${baseJob.id}/sms-number`, { providerId: "pool", config: { categoryId: "other", quotedFee: 3, feeVersion: 1 } });
 
   await render();
   await act(() => container.querySelector(`[aria-label="选择 ${baseJob.email}"]`).click());
-  await checkConfirmation(() => click("批量接码（1）"), "/api/jobs/start-phone-batch", { ids: [baseJob.id], smsProvider: { id: "pool", config: { quotedFee: 3 } } });
+  await checkConfirmation(() => click("批量接码（1）"), "/api/jobs/start-phone-batch", { ids: [baseJob.id], smsProvider: { id: "pool", config: { categoryId: "other", quotedFee: 3, feeVersion: 1 } } });
 
   summaryAvailable = false;
   await render();
   await startSingle();
   assert.equal(dialog(), null); assert.equal(purchaseCalls().length, 0);
-  assert.match(container.textContent, /接码池暂时无法取号/);
+  assert.match(container.textContent, /分类已停用或暂时无法取号/);
 
   summaryAvailable = true;
   auth.workspace.balance = 2;
@@ -145,7 +148,7 @@ try {
   const emailInput = container.querySelector('input[type="email"]');
   await act(() => { Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set.call(emailInput, "new-pool-account@example.invalid"); emailInput.dispatchEvent(new window.Event("input", { bubbles: true })); });
   await act(() => container.querySelector('[aria-label="允许手机号接码"]').click());
-  await checkImportConfirmation(() => click("添加任务"), "/api/jobs", { email: "new-pool-account@example.invalid", proxyUrl: "", phoneBindingMode: "automatic", phoneBindingEnabled: true, smsProvider: { id: "pool", config: { quotedFee: 3 } } }, 1);
+  await checkImportConfirmation(() => click("添加任务"), "/api/jobs", { email: "new-pool-account@example.invalid", proxyUrl: "", phoneBindingMode: "automatic", phoneBindingEnabled: true, smsProvider: { id: "pool", config: { categoryId: "other", quotedFee: 3, feeVersion: 1 } } }, 1);
   await render();
   await click("新建任务");
   await click("批量导入");
@@ -161,9 +164,43 @@ try {
   assert.equal(importDialog(), null, "Escape cancels the pending fee confirmation");
   assert.equal(container.querySelector("#batch-input").value, batchText, "canceling preserves batch input");
   assert.equal(button("创建 2 条任务").disabled, false, "canceling clears the pending busy state");
-  await checkImportConfirmation(() => click("创建 2 条任务"), "/api/jobs/batch", { text: batchText, proxyUrl: "", phoneBindingMode: "automatic", phoneBindingEnabled: true, smsProvider: { id: "pool", config: { quotedFee: 3 } } }, 2);
+  await checkImportConfirmation(() => click("创建 2 条任务"), "/api/jobs/batch", { text: batchText, proxyUrl: "", phoneBindingMode: "automatic", phoneBindingEnabled: true, smsProvider: { id: "pool", config: { categoryId: "other", quotedFee: 3, feeVersion: 1 } } }, 2);
   assert.equal(container.querySelector("#batch-input"), null, "successful batch creation closes its drawer");
   assert.equal(document.body.style.overflow, "", "closing all batch confirmations restores scrolling");
+  const categories = [{ id: "us", name: "美区", enabled: true, fee: 7 }, { id: "other", name: "其他", enabled: true, fee: 3 }];
+  assert.equal(resolveSmsProvider(auth.features.smsProviders, { selectedProviderId: "pool", configs: { pool: {} } }, categories).ready, false, "empty provider fields do not bypass required category selection");
+  assert.equal(resolveSmsProvider(auth.features.smsProviders, { selectedProviderId: "pool", configs: { pool: { categoryId: "missing" } } }, categories).ready, false);
+  selectedCategoryId = "us"; await render();
+  await startSingle(); assert.match(dialog().textContent, /接码池 · 美区/); assert.match(dialog().textContent, /验证成功扣除7 次/); await click("确认开始接码", dialog());
+  assert.deepEqual(purchaseCalls()[0].body.smsProvider.config, { categoryId: "us", quotedFee: 7, feeVersion: 4 });
+
+  selectedCategoryId = "other"; await render();
+  await click("配置", container.querySelector(".workspace-tabs")); await click("配置", container.querySelector(".sms-provider-toolbar"));
+  const categorySelect = container.querySelector('[aria-label="选择接码池分类"]');
+  await act(() => { Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, "value").set.call(categorySelect, "us"); categorySelect.dispatchEvent(new window.Event("change", { bubbles: true })); });
+  assert.match(container.querySelector('.sp-choice-fee').textContent, /美区.*7 次/); await click("保存配置");
+  await startSingle(); assert.match(dialog().textContent, /接码池 · 美区/); await click("确认开始接码", dialog()); assert.equal(purchaseCalls()[0].body.smsProvider.config.categoryId, "us");
+
+  selectedCategoryId = "us"; usEnabled = false; await render();
+  const startButton = [...container.querySelectorAll('.more-actions button')].find((row) => row.textContent.trim() === "开始接码"); assert.equal(startButton.disabled, true, "a disabled category cannot silently fall back to another enabled category");
+  await click("配置", container.querySelector(".workspace-tabs")); await click("配置", container.querySelector(".sms-provider-toolbar"));
+  assert.equal(container.querySelector('[aria-label="选择接码池分类"]').value, "us"); assert.match(container.querySelector('.sp-choice [role="alert"]').textContent, /重新选择/);
+  await click("保存配置"); assert.match(container.querySelector('.sms-settings-dialog .dialog-error').textContent, /所选分类已停用或归档/); await click("取消", container.querySelector('.sms-settings-dialog'));
+
+  usEnabled = true; selectedCategoryId = "us";
+  await render({ status: "phone", canStartPhoneBinding: false, phoneBindingEnabled: true, smsPoolBilling: { state: "allocated", categoryId: "other", categoryName: "历史其他", categoryFeeVersion: 2, fee: 5, reserved: 5 } });
+  await click("接码池 · 历史其他取号");
+  assert.match(dialog().textContent, /接码池 · 历史其他/); assert.match(dialog().textContent, /验证成功扣除5 次/); assert.match(dialog().textContent, /沿用开始时的分类与费率/);
+  await click("确认开始接码", dialog()); assert.deepEqual(purchaseCalls()[0].body, { providerId: "pool", config: { categoryId: "other", quotedFee: 5, feeVersion: 2 } });
+  auth.account.role = "admin"; auth.workspace.role = "admin";
+  await render({ status: "phone", canStartPhoneBinding: false, phoneBindingEnabled: true, smsPoolBilling: { state: "allocated", categoryId: "other", categoryName: "历史其他", categoryFeeVersion: 2, categoryFee: 5, fee: 0, reserved: 0 } });
+  await click("账号授权", container.querySelector('.workspace-tabs')); await click("接码池 · 历史其他取号");
+  assert.match(dialog().textContent, /验证成功扣除0 次/); assert.match(dialog().textContent, /不扣 CDK 次数/); await click("确认开始接码", dialog());
+  assert.deepEqual(purchaseCalls()[0].body, { providerId: "pool", config: { categoryId: "other", quotedFee: 5, feeVersion: 2 } }, "administrator retries submit the frozen category list fee while billing remains free");
+  await render({ status: "phone", canStartPhoneBinding: false, phoneBindingEnabled: true, smsPoolBilling: { state: "allocated", categoryId: "other", categoryName: "历史其他", categoryFeeVersion: 2, fee: 0, reserved: 0 } });
+  await click("账号授权", container.querySelector('.workspace-tabs')); await click("接码池 · 历史其他取号"); await click("确认开始接码", dialog());
+  assert.equal(purchaseCalls()[0].body.config.quotedFee, 3, "older free administrator operations fall back to the same category's current list fee");
+  auth.account.role = "user"; auth.workspace.role = "user";
   console.log("SMS pool action UI passed (real Gate/App/API, single and batch combined fees, unchanged separate phone actions, Escape recovery, cancellation and secret-free payloads)");
 } finally {
   await act(() => root.unmount()); dom.window.close(); globalThis.matchMedia = originalMedia;

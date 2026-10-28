@@ -1,0 +1,86 @@
+import assert from "node:assert/strict";
+import crypto from "node:crypto";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { createCdkStore } from "../src/cdk-store.mjs";
+import { createCdkVault } from "../src/cdk-vault.mjs";
+import { createSmsPool } from "../src/sms-pool.mjs";
+
+process.env.TOSUB2_ENCRYPTION_KEY = crypto.randomBytes(32).toString("base64");
+process.env.TOSUB2_ADMIN_CDK = "synthetic-category-pool-administrator";
+const root = await fs.mkdtemp(path.join(os.tmpdir(), "tosub2-category-pool-"));
+const vault = await createCdkVault(root); const store = await createCdkStore(root, vault);
+let calls = 0; let unavailableOther = false; let hold; let held = false; const selected = [];
+const provider = (id, config) => ({ async getNumber() {
+  calls++; selected.push({ categoryId: config.categoryId, country: config.country });
+  if (config.categoryId === "other" && unavailableOther) throw Object.assign(new Error("fixture unavailable"), { code: "NO_NUMBERS" });
+  const order = { requestId: `category-${calls}`, number: `+1202555${String(calls).padStart(4, "0")}`, cost: { amount: "0.2", currency: "USD", source: "order" } };
+  if (held && config.categoryId === "other") await new Promise((resolve) => { hold = resolve; }); return order;
+} });
+let pool;
+try {
+  // Persist a former configuration to exercise the real one-time category upgrade.
+  store.mutateSmsPoolConfig(() => ({ version: 1, rules: { enabled: true, fee: 2, maxAttempts: 2, requestConcurrency: 2, noStockThreshold: 3, cooldownMinutes: 10 }, credentials: [{ id: "fixture-credential", providerId: "herosms", name: "Fixture", apiKey: "synthetic-category-key", enabled: true }],
+    entries: [{ id: "former-entry", credentialId: "fixture-credential", country: "1", service: "dr", maxPrice: "0.25", providerIds: "", enabled: true, state: "active", priority: 1, noStockCount: 0 }] }));
+  const admin = store.adminId; const [owner] = store.generate({ count: 1, quota: 100, note: "category fixture" }, admin); store.inventory(owner.id, ["category@example.invalid"]);
+  const legacy = { operationId: crypto.randomUUID(), jobId: crypto.randomUUID(), runId: crypto.randomUUID(), email: "category@example.invalid", fee: 3, maxAttempts: 2 };
+  store.prepareSmsOperation(owner.id, legacy);
+  pool = createSmsPool({ store, createProvider: provider, retryDelayMs: 0 });
+  const user = pool.forOwner(owner.id); const begin = (categoryId = "other", patch = {}) => { const input = { operationId: crypto.randomUUID(), jobId: crypto.randomUUID(), runId: crypto.randomUUID(), email: "category@example.invalid", categoryId, ...patch }; user.begin(input); return input; };
+  assert.deepEqual(pool.adminSnapshot().categories.map((row) => [row.id, row.fee, row.enabled]), [["us", 2, false], ["other", 2, true]]);
+  assert.equal(pool.adminSnapshot().entries[0].categoryId, "other"); assert.equal(pool.adminSnapshot().rules.fee, undefined);
+  pool.saveCategory({ enabled: true, fee: 5 }, admin, "us");
+  pool.saveEntry({ categoryId: "us", credentialId: "fixture-credential", country: "1", maxPrice: "0.25", priority: 1 }, admin);
+  const upgraded = user.recover(legacy.operationId); assert.equal(upgraded.fee, 3); assert.equal(upgraded.categoryId, "other");
+  const upgradedOrder = await user.getNumber(legacy); assert.equal(upgradedOrder.categoryId, "other");
+  assert.equal(selected.at(-1).categoryId, "other", "a migrated old operation cannot acquire a newly added higher-price category"); user.release(legacy);
+  assert.equal(pool.adminSnapshot().entries.length, 2, "the same provider route can be offered independently in two categories");
+  assert.throws(() => pool.patchEntry("former-entry", { categoryId: "us" }, admin), (error) => error.status === 409);
+  const us = begin("us", { expectedFee: 5, feeVersion: 2 }); const allocated = await user.getNumber(us);
+  assert.equal(allocated.categoryId, "us"); assert.equal(allocated.config.categoryName, "美区"); assert.equal(allocated.config.categoryFeeVersion, 2);
+  assert.equal(store.get(owner.id).reserved, 5);
+  assert.throws(() => user.begin({ ...us, categoryId: "other" }), /分类不同/);
+  pool.saveCategory({ fee: 7 }, admin, "us"); assert.equal(pool.publicSummary("us").feeVersion, 3);
+  assert.equal(user.begin(us).fee, 5, "idempotent retries preserve the fee confirmed at reservation");
+  user.noteSubmitted({ operationId: us.operationId, allocationId: allocated.allocationId });
+  user.verified({ ...us, allocationId: allocated.allocationId, evidence: { version: 1, type: "phone_verification", state: "verified", ...us, allocationId: allocated.allocationId,
+    providerId: allocated.providerId, orderId: allocated.order.requestId, eventId: crypto.randomUUID(), verifiedAt: new Date().toISOString() } });
+  assert.equal(store.get(owner.id).consumed, 5); assert.equal(store.get(owner.id).reserved, 0);
+  assert.throws(() => begin("us", { expectedFee: 5, feeVersion: 2 }), (error) => error.code === "SMS_POOL_FEE_CHANGED");
+  const current = begin("us", { expectedFee: 7, feeVersion: 3 }); user.release(current);
+  store.inventory(admin, ["category@example.invalid"]); const adminPool = pool.forOwner(admin);
+  const adminInput = { operationId: crypto.randomUUID(), jobId: crypto.randomUUID(), runId: crypto.randomUUID(), email: "category@example.invalid", categoryId: "us", expectedFee: 7, feeVersion: 3 };
+  const adminBilling = adminPool.begin(adminInput); const adminOrder = await adminPool.getNumber(adminInput);
+  assert.equal(adminBilling.fee, 0); assert.equal(adminBilling.categoryFee, 7);
+  pool.saveCategory({ fee: 9 }, admin, "us");
+  assert.equal(adminPool.begin(adminInput).categoryFee, 7, "administrator fixed-operation quotes retain the category list price after an administrator fee change");
+  adminPool.abandon({ ...adminInput, allocationId: adminOrder.allocationId });
+  const replacement = await adminPool.getNumber(adminInput); assert.equal(replacement.categoryFeeVersion, 3);
+  adminPool.release(adminInput); assert.ok(store.get(admin).smsPoolConsumed === 0);
+  unavailableOther = true; const other = begin("other"); const before = calls;
+  await assert.rejects(user.getNumber(other)); assert.equal(calls - before, 2); assert.ok(selected.slice(-2).every((row) => row.categoryId === "other"), "no-stock retries never fall back into a higher-price category");
+  unavailableOther = false; pool.patchEntry("former-entry", { resetCooldown: true }, admin);
+  const queued = begin("other"); pool.saveCategory({ enabled: false }, admin, "other");
+  const beforeDisabled = calls; await assert.rejects(user.getNumber(queued), (error) => error.code === "SMS_POOL_CATEGORY_UNAVAILABLE"); assert.equal(calls, beforeDisabled); assert.equal(user.recover(queued.operationId).state, "released");
+  pool.saveCategory({ enabled: true }, admin, "other");
+  const running = begin("other"); held = true; const inFlight = user.getNumber(running); assert.equal(typeof hold, "function");
+  const crossCategory = begin("us"); const beforeCross = calls; const crossPurchase = user.getNumber(crossCategory);
+  await new Promise((resolve) => setTimeout(resolve, 25)); assert.equal(calls, beforeCross, "the same provider credential shares one purchase lease across categories");
+  pool.saveCategory({ archived: true }, admin, "other"); hold(); const retained = await inFlight; held = false;
+  const crossOrder = await crossPurchase; assert.equal(crossOrder.categoryId, "us"); user.release(crossCategory);
+  assert.equal(retained.categoryId, "other"); assert.equal((await user.getNumber(running)).order.requestId, retained.order.requestId, "archiving never cancels an already issued request or allocated order");
+  assert.ok(!pool.publicSummary().categories.some((row) => row.id === "other"));
+  assert.throws(() => begin("other"), (error) => error.code === "SMS_POOL_CATEGORY_UNAVAILABLE");
+  assert.throws(() => pool.saveCategory({ archived: false, enabled: true }, admin, "other"), /归档/);
+  user.release(running);
+  const created = pool.saveCategory({ name: "自建分类", fee: 4 }, admin).savedCategory;
+  assert.ok(created.id && created.id !== "us" && created.id !== "other"); assert.equal(created.feeVersion, 1);
+  pool.saveCategory({ name: "新名称" }, admin, created.id); assert.equal(pool.publicSummary(created.id).feeVersion, 1);
+  await pool.close(); pool = createSmsPool({ store, createProvider: provider });
+  assert.equal(pool.adminSnapshot().categories.filter((row) => ["us", "other"].includes(row.id)).length, 2);
+  assert.equal(pool.adminSnapshot().categories.find((row) => row.id === "other").archivedAt > 0, true, "restart never recreates an archived built-in category");
+  assert.equal(user.recover(us.operationId).categoryName, "美区");
+  assert.doesNotMatch(JSON.stringify(pool.publicSummary()), /synthetic-category-key|country|provider|entry|cost/i);
+  console.log("[ok] SMS pool categories: migration, custom classes, isolated routes and fees, fee snapshots, duplicate guards, archive continuity and restart idempotence");
+} finally { await pool?.close(); store.close(); await fs.rm(root, { recursive: true, force: true }); }

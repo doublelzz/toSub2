@@ -2,16 +2,17 @@ import crypto from "node:crypto";
 import { createSmsProvider } from "./sms-providers.mjs";
 import { cdkError } from "./cdk-security.mjs";
 import { moneyAmount, moneyCurrency } from "./sms-orders.mjs";
-import { createSmsBuffer, DEFAULT_BUFFER_RULES } from "./sms-buffer.mjs";
+import { createSmsBuffer } from "./sms-buffer.mjs";
 import { summarizePoolCosts, poolCostAnalytics, matchesCurrentEntry } from "./sms-pool-costs.mjs";
 
-const DEFAULT_RULES = { enabled: false, fee: 2, noStockThreshold: 3, cooldownMinutes: 10, maxAttempts: 10, maxConcurrent: 5 };
+const DEFAULT_RULES = { enabled: false, fee: 2, noStockThreshold: 3, cooldownMinutes: 10, maxAttempts: 10, requestConcurrency: 3 };
 const PROVIDERS = new Set(["smsbower", "herosms"]);
 const CLOSED = new Set(["verified", "released"]);
 const text = (value) => typeof value === "string" ? value.trim() : "";
 const clone = (value) => structuredClone(value);
 const fail = (code, message, options = {}) => Object.assign(cdkError(options.status || 409, message, code), { terminal: true, ...options });
 const initial = () => ({ version: 1, rules: { ...DEFAULT_RULES }, credentials: [], entries: [] });
+const initialCategories = (fee) => [{ id: "us", name: "美区", enabled: false, fee, feeVersion: 1, archivedAt: null }, { id: "other", name: "其他", enabled: true, fee, feeVersion: 1, archivedAt: null }];
 const integer = (value, name, min, max) => {
   const number = Number(value); if (!Number.isSafeInteger(number) || number < min || number > max) throw cdkError(422, `${name}必须为 ${min} 至 ${max} 的整数`); return number;
 };
@@ -28,32 +29,41 @@ export function classifyPoolError(error) {
   return "order_unknown";
 }
 
-export function createSmsPool({ store, createProvider = createSmsProvider, providerOptions = {}, now = Date.now, canUseProvider = () => true } = {}) {
-  const running = new Map(); let closing = false;
+export function createSmsPool({ store, createProvider = createSmsProvider, providerOptions = {}, now = Date.now, canUseProvider = () => true, retryDelayMs = 5000 } = {}) {
+  const running = new Map(); const requestQueue = []; let activeRequests = 0; let closing = false;
   const config = () => store.smsPoolConfig() || initial();
   const mutate = (change, actor = "system", event = null) => store.mutateSmsPoolConfig((previous) => { const value = previous || initial(); change(value); return value; }, actor, event);
   const admin = (actor) => { if (store.get(actor)?.role !== "admin") throw cdkError(403, "需要管理员权限"); };
   const operation = (ownerId, operationId) => { const value = store.smsOperation(ownerId, operationId); if (!value) throw cdkError(404, "接码操作不存在"); return value; };
+  const category = (id, { active = false } = {}) => {
+    const value = config().categories?.find((row) => row.id === id);
+    if (!value || value.archivedAt) throw fail("SMS_POOL_CATEGORY_UNAVAILABLE", "所选接码分类不存在或已归档");
+    if (active && !value.enabled) throw fail("SMS_POOL_CATEGORY_UNAVAILABLE", "所选接码分类已停用");
+    return value;
+  };
   const requirePoolAccess = (ownerId, operationId = null) => {
     if (canUseProvider(ownerId, "pool")) return;
     const current = operationId && store.smsOperation(ownerId, operationId);
     if (current?.state === "reserved" && (!current.allocation || current.allocation.abandoned)) store.settleSmsOperation(ownerId, operationId, { reason: "当前 CDK 的接码池权限已收回" });
     throw fail("SMS_PROVIDER_FORBIDDEN", "当前 CDK 未开通接码池，请联系管理员", { status: 403 });
   };
-  const billing = (value) => ({ operationId: value.operationId, state: value.state, fee: value.fee, reserved: CLOSED.has(value.state) ? 0 : value.fee, maxAttempts: value.maxAttempts, settledAt: value.settledAt || null, reason: value.reason || "", attempts: value.attempts?.length || 0 });
-  const usableEntry = (entry, value, at = now(), ignoreLease = false, options = {}) => {
+  const billing = (value) => ({ operationId: value.operationId, state: value.state, fee: value.fee, reserved: CLOSED.has(value.state) ? 0 : value.fee, maxAttempts: value.maxAttempts, settledAt: value.settledAt || null, reason: value.reason || "", attempts: value.attempts?.length || 0,
+    categoryId: value.categoryId || "legacy", categoryName: value.categoryName || "原接码池", categoryFeeVersion: value.categoryFeeVersion || null, categoryFee: value.categoryFee ?? (value.fee > 0 ? value.fee : config().categories?.find((row) => row.id === value.categoryId)?.fee || null) });
+  const usableEntry = (entry, value, at = now(), ignoreLease = false) => {
     const credential = value.credentials.find((row) => row.id === entry.credentialId);
-    const entryCooldown = options.buffer && entry.lastError === "no_stock" ? entry.bufferRetryAt || 0 : entry.cooldownUntil || 0;
+    const entryCooldown = entry.cooldownUntil || 0;
     return entry.enabled && credential?.enabled && !credential.blockedReason && entry.state !== "disabled" && (ignoreLease || !entry.halfOpen && !entry.inFlight && !credential.inFlight)
       && entryCooldown <= at && (!credential.cooldownUntil || credential.cooldownUntil <= at);
   };
   let buffer;
-  const summary = () => {
-    const value = config(); const entries = value.entries.filter((entry) => usableEntry(entry, value, now(), true));
-    const inventory = buffer?.publicStatus() || { ready: false, refilling: false };
-    const available = value.rules.enabled && (inventory.ready || entries.length > 0);
-    return { enabled: value.rules.enabled, available, fee: value.rules.fee, hasNumbers: inventory.ready, refilling: inventory.refilling,
-      status: inventory.ready ? "ready" : inventory.refilling ? "fetching" : available ? "available_on_demand" : "unavailable", version: value.version };
+  const summary = (categoryId = null) => {
+    const value = config();
+    const describe = (row) => { const available = Boolean(value.rules.enabled && row.enabled && !row.archivedAt && value.entries.some((entry) => entry.categoryId === row.id && usableEntry(entry, value, now(), true)));
+      return { id: row.id, name: row.name, enabled: row.enabled, fee: row.fee, feeVersion: row.feeVersion, available, status: available ? "available_on_demand" : "unavailable" }; };
+    if (categoryId) return { ...describe(category(categoryId)), version: value.version };
+    const categories = value.categories.filter((row) => !row.archivedAt).map(describe); const available = categories.some((row) => row.available);
+    return { enabled: value.rules.enabled, available, status: available ? "available_on_demand" : "unavailable", version: value.version, categories,
+      fee: value.categories.find((row) => row.id === "other")?.fee || value.rules.fee };
   };
   const publicOperation = (value) => { const costOrders = store.smsOperationCostOrders(value);
     const latest = costOrders.find((row) => row.orderId === String(value.allocation?.order?.requestId || "")
@@ -75,21 +85,27 @@ export function createSmsPool({ store, createProvider = createSmsProvider, provi
       if (!byEntry.has(order.entryId)) byEntry.set(order.entryId, []); byEntry.get(order.entryId).push(order);
       if (!byCredential.has(order.credentialId)) byCredential.set(order.credentialId, []); byCredential.get(order.credentialId).push(order);
     }
-    return { rules: value.rules, version: value.version,
+    const { buffer: legacyBuffer, maxConcurrent: legacyConcurrent, fee: legacyFee, ...currentRules } = value.rules;
+    const { fee: defaultLegacyFee, ...publicDefaults } = DEFAULT_RULES;
+    return { rules: { ...publicDefaults, ...currentRules }, categories: value.categories, version: value.version,
       credentials: value.credentials.map(({ apiKey, inFlight, ...row }) => ({ ...row, hasApiKey: Boolean(apiKey), stats: summarizePoolCosts(byCredential.get(row.id) || []) })),
       entries: value.entries.map((entry) => { const { inFlight, halfOpen, lastSelected, ...publicEntry } = entry; const credential = value.credentials.find((row) => row.id === entry.credentialId);
-        const entryCooldown = value.rules.buffer?.enabled && entry.lastError === "no_stock" ? entry.bufferRetryAt || 0 : entry.cooldownUntil || 0;
+        const entryCooldown = entry.cooldownUntil || 0;
         return ({ ...publicEntry, cooldownUntil: entryCooldown, providerId: credential?.providerId,
         stats: summarizePoolCosts((byEntry.get(entry.id) || []).filter((order) => matchesCurrentEntry(order, entry, credential))),
         state: !entry.enabled ? "disabled" : !value.credentials.find((row) => row.id === entry.credentialId)?.enabled || value.credentials.find((row) => row.id === entry.credentialId)?.blockedReason ? "credential_error"
           : entry.halfOpen ? "probing" : Math.max(entryCooldown, value.credentials.find((row) => row.id === entry.credentialId)?.cooldownUntil || 0) > now() ? "cooling" : entry.state === "disabled" ? "disabled" : "available",
         credentialCooldownUntil: value.credentials.find((row) => row.id === entry.credentialId)?.cooldownUntil || 0 }); }),
-      operations: recentOperations().map(publicOperation), costSummary: report.summary, analyticsFilterOptions: report.filterOptions,
-      buffer: buffer?.snapshot() || { rules: { ...DEFAULT_BUFFER_RULES }, counts: {}, items: [] } };
+      operations: recentOperations().map(publicOperation), costSummary: report.summary, today: report.today, analyticsFilterOptions: report.filterOptions,
+      legacyInventory: buffer?.snapshot() || { counts: {}, items: [] } };
   };
 
+  // Existing tasks keep their original fee and route while gaining a stable
+  // category identity. New HTTP requests must choose their category explicitly.
+  mutate((value) => { value.categories ||= initialCategories(value.rules.fee || DEFAULT_RULES.fee); for (const entry of value.entries) entry.categoryId ||= "other"; });
   // Recovery never repeats an interrupted purchase or a submitted verification.
   for (const pending of store.pendingSmsOperations()) {
+    if (!pending.categoryId) store.updateSmsOperation(pending.ownerId, pending.operationId, (value) => ({ ...value, categoryId: "other", categoryName: "其他", categoryFeeVersion: 1, categoryFee: value.fee > 0 ? value.fee : config().categories.find((row) => row.id === "other")?.fee || DEFAULT_RULES.fee }));
     if (["requesting", "submitted"].includes(pending.state)) store.updateSmsOperation(pending.ownerId, pending.operationId, (value) => ({ ...value, state: "unknown", reason: "服务重启，接码结果待核实" }));
   }
   mutate((value) => { for (const entry of value.entries) { entry.halfOpen = null; entry.inFlight = null; } for (const credential of value.credentials) credential.inFlight = null; });
@@ -103,24 +119,28 @@ export function createSmsPool({ store, createProvider = createSmsProvider, provi
       noStockThreshold: integer(body.noStockThreshold ?? previous.noStockThreshold, "连续无号阈值", 1, 100),
       cooldownMinutes: integer(body.cooldownMinutes ?? previous.cooldownMinutes, "冷却分钟数", 1, 1440),
       maxAttempts: integer(body.maxAttempts ?? previous.maxAttempts, "最大取号次数", 1, 20),
-      maxConcurrent: integer(body.maxConcurrent ?? previous.maxConcurrent, "最大并发", 1, 20) };
-    const bufferInput = { ...DEFAULT_BUFFER_RULES, ...previous.buffer, ...body.buffer };
-    if (typeof bufferInput.enabled !== "boolean" || typeof bufferInput.forceRefill !== "boolean" || body.buffer !== undefined && (!body.buffer || typeof body.buffer !== "object" || Array.isArray(body.buffer))) throw cdkError(422, "号码缓冲配置不正确");
-    const target = integer(bufferInput.target, "缓冲目标", 1, 20);
-    const bounded = (value, fallback, min, max) => Number.isSafeInteger(Number(value)) ? Math.max(min, Math.min(max, Number(value))) : fallback;
-    rules.buffer = { enabled: bufferInput.enabled, forceRefill: bufferInput.forceRefill, target,
-      lowWater: bounded(bufferInput.lowWater, 0, 0, target - 1), perEntry: target, refillConcurrency: 3,
-      minRemainingSeconds: bounded(bufferInput.minRemainingSeconds, DEFAULT_BUFFER_RULES.minRemainingSeconds, 60, 1800),
-      idleMinutes: bounded(bufferInput.idleMinutes, DEFAULT_BUFFER_RULES.idleMinutes, 1, 120),
-      maxOutstanding: Math.max(target, bounded(bufferInput.maxOutstanding, DEFAULT_BUFFER_RULES.maxOutstanding, 1, 100)),
-      maxPerMinute: bounded(bufferInput.maxPerMinute, DEFAULT_BUFFER_RULES.maxPerMinute, 1, 60) };
-    if (rules.buffer.forceRefill) rules.buffer.enabled = true;
+      requestConcurrency: integer(body.requestConcurrency ?? previous.requestConcurrency ?? DEFAULT_RULES.requestConcurrency, "取号请求并发", 1, 20) };
     mutate((value) => {
       value.rules = rules; value.version++;
-      if (rules.buffer.forceRefill) value.bufferRefillPaused = false;
-      else if (previous.buffer?.forceRefill) { value.bufferManualRefill = false; value.bufferRefillPaused = true; }
+      // Legacy callers changing the former global fee affect only the migrated
+      // default category; category-specific HTTP clients use saveCategory.
+      if (Object.hasOwn(body, "fee")) { const other = value.categories.find((row) => row.id === "other"); if (other && other.fee !== rules.fee) { other.fee = rules.fee; other.feeVersion++; } }
+      value.bufferManualRefill = false; value.bufferRefillPaused = true;
     }, actor, "sms-pool-rules");
     buffer?.configurationChanged(); return snapshot();
+  }
+  function saveCategory(body, actor, id = null) {
+    admin(actor); const value = config(); const old = id ? value.categories.find((row) => row.id === id) : null;
+    if (id && !old) throw cdkError(404, "接码分类不存在");
+    if (old?.archivedAt) throw cdkError(409, "已归档分类不能重新启用或修改");
+    if (Object.hasOwn(body, "enabled") && typeof body.enabled !== "boolean" || Object.hasOwn(body, "archived") && typeof body.archived !== "boolean") throw cdkError(422, "分类状态格式不正确");
+    const name = text(body.name ?? old?.name); if (!name || name.length > 40) throw cdkError(422, "分类名称请填写 1 至 40 个字符");
+    if (value.categories.some((row) => row.id !== old?.id && !row.archivedAt && row.name.toLocaleLowerCase() === name.toLocaleLowerCase())) throw cdkError(409, "分类名称已存在");
+    const fee = integer(body.fee ?? old?.fee, "分类成功扣次", 1, 1_000_000);
+    const row = { id: old?.id || crypto.randomUUID(), name, fee, feeVersion: (old?.feeVersion || 1) + (old && old.fee !== fee ? 1 : 0), enabled: body.archived === true ? false : body.enabled ?? old?.enabled ?? true,
+      archivedAt: body.archived === true ? now() : null };
+    mutate((state) => { const index = state.categories.findIndex((item) => item.id === row.id); if (index < 0) state.categories.push(row); else state.categories[index] = row; state.version++; }, actor, body.archived ? "sms-pool-category-archive" : "sms-pool-category");
+    return { ...snapshot(), savedCategory: row };
   }
   function saveCredential(body, actor) {
     admin(actor); const value = config(); const old = body.id ? value.credentials.find((row) => row.id === body.id) : null;
@@ -154,6 +174,7 @@ export function createSmsPool({ store, createProvider = createSmsProvider, provi
     if (id && !old) throw cdkError(404, "接码池条目不存在");
     const merged = { ...old, ...body }; const credential = value.credentials.find((row) => row.id === merged.credentialId);
     if (!credential) throw cdkError(422, "请选择已配置的接码凭据");
+    const categoryId = text(merged.categoryId || "other"); category(categoryId);
     const country = String(merged.country ?? ""); const maxPrice = String(merged.maxPrice ?? ""); const providerIds = String(merged.providerIds || "");
     if (!/^\d{1,5}$/.test(country) || !/^\d+(?:\.\d{1,6})?$/.test(maxPrice) || Number(maxPrice) <= 0 || Number(maxPrice) > 10000) throw cdkError(422, "请选择有效国家和价格上限");
     if (credential.providerId === "smsbower" && !/^\d{1,12}(?:,\d{1,12}){0,99}$/.test(providerIds)) throw cdkError(422, "请选择 SMSBower 供应商档位");
@@ -164,13 +185,14 @@ export function createSmsPool({ store, createProvider = createSmsProvider, provi
     if (Object.hasOwn(body, "resetCooldown") && typeof body.resetCooldown !== "boolean") throw cdkError(422, "恢复状态格式不正确");
     const routingChanged = old && ["credentialId", "country", "maxPrice", "providerIds", "service"].some((key) => old[key] !== ({ credentialId: credential.id, country, maxPrice, providerIds, service })[key]);
     const resetHealth = !old || routingChanged || body.resetCooldown === true;
-    const entry = { id: old?.id || crypto.randomUUID(), credentialId: credential.id, country, countryLabel: text(merged.countryLabel).slice(0, 160), maxPrice, providerIds, service,
+    const entry = { id: old?.id || crypto.randomUUID(), categoryId, credentialId: credential.id, country, countryLabel: text(merged.countryLabel).slice(0, 160), maxPrice, providerIds, service,
       quotedPrice: moneyAmount(merged.quotedPrice), currency: moneyCurrency(merged.currency),
       grade, gradeFilter,
       priority: integer(merged.priority ?? 100, "优先级", 0, 10000), enabled: merged.enabled ?? true,
       state: resetHealth ? "active" : old.state, noStockCount: resetHealth ? 0 : old.noStockCount, cooldownUntil: resetHealth ? 0 : old.cooldownUntil,
       lastError: resetHealth ? "" : old.lastError, lastUsedAt: old?.lastUsedAt || 0, lastSelected: old?.lastSelected || 0,
       halfOpen: resetHealth ? null : old.halfOpen, inFlight: resetHealth ? null : old.inFlight };
+    if (value.entries.some((row) => row.id !== entry.id && ["categoryId", "credentialId", "country", "maxPrice", "providerIds", "service"].every((key) => row[key] === entry[key]))) throw cdkError(409, "此分类已添加相同国家报价");
     if (dryRun) return entry;
     mutate((state) => { const index = state.entries.findIndex((row) => row.id === entry.id); if (index < 0) state.entries.push(entry); else state.entries[index] = entry; state.version++; }, actor, "sms-pool-entry");
     buffer?.configurationChanged(); return snapshot();
@@ -179,14 +201,14 @@ export function createSmsPool({ store, createProvider = createSmsProvider, provi
     admin(actor); if (!Array.isArray(body.entries)) return saveEntry(body, actor);
     if (!body.entries.length || body.entries.length > 100) throw cdkError(422, "每次请选择 1 至 100 个报价条目");
     const entries = body.entries.map((row) => { if (!row || typeof row !== "object" || Array.isArray(row)) throw cdkError(422, "池条目格式不正确"); return saveEntry(row, actor, undefined, { dryRun: true }); });
-    const route = (row) => JSON.stringify([row.credentialId, row.service, row.country, row.maxPrice, row.providerIds]);
+    const route = (row) => JSON.stringify([row.categoryId, row.credentialId, row.service, row.country, row.maxPrice, row.providerIds]);
     const routes = new Set(config().entries.map(route));
     for (const entry of entries) { if (routes.has(route(entry))) throw cdkError(409, "所选报价条目重复或已经加入池"); routes.add(route(entry)); }
     mutate((state) => { state.entries.push(...entries); state.version++; }, actor, "sms-pool-entries");
     buffer?.configurationChanged(); return snapshot();
   }
-  const sameEntry = (entry, previous) => entry && ["credentialId", "country", "maxPrice", "providerIds", "service"].every((key) => entry[key] === previous[key]);
-  function recordFailure(choice, kind, attemptId, options = {}) {
+  const sameEntry = (entry, previous) => entry && ["categoryId", "credentialId", "country", "maxPrice", "providerIds", "service"].every((key) => entry[key] === previous[key]);
+  function recordFailure(choice, kind, attemptId) {
     mutate((value) => {
       const entry = value.entries.find((row) => row.id === choice.entry.id); const credential = choice.credential;
       if (sameEntry(entry, choice.entry)) {
@@ -194,8 +216,7 @@ export function createSmsPool({ store, createProvider = createSmsProvider, provi
         entry.lastError = kind;
         if (kind === "no_stock") {
           entry.noStockCount++;
-          if (options.buffer) { entry.bufferRetryAt = now() + 5000; entry.cooldownUntil = entry.bufferRetryAt; }
-          else if (entry.noStockCount >= value.rules.noStockThreshold) entry.cooldownUntil = now() + value.rules.cooldownMinutes * 60000;
+          if (entry.noStockCount >= value.rules.noStockThreshold) entry.cooldownUntil = now() + value.rules.cooldownMinutes * 60000;
         }
         else if (kind === "config_invalid") entry.state = "disabled";
       }
@@ -206,12 +227,12 @@ export function createSmsPool({ store, createProvider = createSmsProvider, provi
       }
     });
   }
-  function selectLease(excluded = new Set(), filter = () => true, options = {}) {
+  function selectLease(excluded = new Set(), categoryId) {
     let choice; const attemptId = crypto.randomUUID();
     const candidateConfig = config();
-    if (candidateConfig.entries.some((entry) => !excluded.has(entry.id) && filter(entry) && usableEntry(entry, candidateConfig, now(), false, options))) mutate((value) => {
-      const candidates = value.entries.filter((entry) => !excluded.has(entry.id) && filter(entry) && usableEntry(entry, value, now(), false, options))
-        .sort((a, b) => (options.buffer ? 0 : a.priority - b.priority) || (a.lastSelected || 0) - (b.lastSelected || 0) || a.id.localeCompare(b.id));
+    if (candidateConfig.entries.some((entry) => entry.categoryId === categoryId && !excluded.has(entry.id) && usableEntry(entry, candidateConfig, now()))) mutate((value) => {
+      const candidates = value.entries.filter((entry) => entry.categoryId === categoryId && !excluded.has(entry.id) && usableEntry(entry, value, now()))
+        .sort((a, b) => a.priority - b.priority || (a.lastSelected || 0) - (b.lastSelected || 0) || a.id.localeCompare(b.id));
       const entry = candidates[0]; if (!entry) return;
       const credential = value.credentials.find((row) => row.id === entry.credentialId);
       if (entry.cooldownUntil) entry.halfOpen = attemptId;
@@ -225,17 +246,17 @@ export function createSmsPool({ store, createProvider = createSmsProvider, provi
     mutate((value) => { const entry = value.entries.find((row) => row.id === choice.entry.id); if (entry?.inFlight === attemptId) entry.inFlight = null; if (entry?.halfOpen === attemptId) entry.halfOpen = null;
       for (const credential of value.credentials) if (credential.inFlight === attemptId) credential.inFlight = null; });
   }
-  function makeProviderConfig(choice, maxAttempts) {
+  function makeProviderConfig(choice, maxAttempts, current) {
     return { apiKey: choice.credential.apiKey, service: choice.entry.service, country: choice.entry.country, countryLabel: choice.entry.countryLabel,
+      categoryId: current.categoryId || "other", categoryName: current.categoryName || "其他", categoryFeeVersion: current.categoryFeeVersion || 1,
       maxPrice: choice.entry.maxPrice, quotedPrice: choice.entry.quotedPrice, currency: choice.entry.currency,
       providerIds: choice.entry.providerIds, maxRotationAttempts: String(maxAttempts), rotationIntervalSeconds: "1" };
   }
   function recordSuccess(choice, attemptId) {
     mutate((value) => { const entry = value.entries.find((row) => row.id === choice.entry.id); if (sameEntry(entry, choice.entry)) { entry.noStockCount = 0; entry.cooldownUntil = 0; entry.bufferRetryAt = 0; entry.lastError = ""; if (entry.halfOpen === attemptId) entry.halfOpen = null; } });
   }
-  buffer = createSmsBuffer({ store, config, mutate, now, createProvider, providerOptions, selectLease, releaseLease, makeConfig: makeProviderConfig,
-    recordFailure, recordSuccess, classifyError: classifyPoolError, foregroundBusy: () => running.size > 0 });
-  async function acquire(ownerId, operationId) {
+  buffer = createSmsBuffer({ store, now, createProvider, providerOptions });
+  async function acquire(ownerId, operationId, canContinue = () => true) {
     if (closing) throw fail("SMS_POOL_DISABLED", "接码池正在停止，请稍后重试");
     const key = `${ownerId}:${operationId}`; if (running.has(key)) return running.get(key);
     const pending = (async () => {
@@ -246,53 +267,89 @@ export function createSmsPool({ store, createProvider = createSmsProvider, provi
       requirePoolAccess(ownerId, operationId);
       if (store.get(ownerId)?.status !== "active") throw fail("SMS_POOL_DISABLED", "当前 CDK 已禁用");
       if (!config().rules.enabled) throw fail("SMS_POOL_DISABLED", "管理员接码池已关闭");
-      buffer.signalDemand();
-      if (config().rules.buffer?.enabled) { const stocked = await buffer.claim(ownerId, operationId, () => canUseProvider(ownerId, "pool")); if (stocked) return stocked; }
+      const categorySnapshot = { categoryId: current.categoryId || "other", categoryName: current.categoryName || "其他", categoryFeeVersion: current.categoryFeeVersion || 1 };
+      const requireCategory = () => { try { category(categorySnapshot.categoryId, { active: true }); } catch (error) { store.settleSmsOperation(ownerId, operationId, { reason: "所选接码分类已停用或归档" }); throw error; } };
+      requireCategory();
       const tried = new Set(); const waitDeadline = Date.now() + Math.max(30000, current.maxAttempts * 15000);
+      const ticket = {}; const removeTicket = () => { const index = requestQueue.indexOf(ticket); if (index >= 0) requestQueue.splice(index, 1); };
+      const sleep = async (milliseconds) => { const until = Date.now() + milliseconds; do {
+        if (closing || !canContinue() || CLOSED.has(operation(ownerId, operationId).state) || !canUseProvider(ownerId, "pool") || store.get(ownerId)?.status !== "active" || !config().rules.enabled) return;
+        await new Promise((resolve) => setTimeout(resolve, Math.min(100, Math.max(0, until - Date.now()))));
+      } while (Date.now() < until); };
+      try {
       while (current.attempts.length < current.maxAttempts) {
         current = operation(ownerId, operationId);
         if (CLOSED.has(current.state)) throw fail("SMS_POOL_CLOSED", "此接码操作已结束");
         if (current.state === "unknown") throw fail("SMS_POOL_UNKNOWN", "此前接码结果待核实，不能重复取号", { uncertain: true });
         requirePoolAccess(ownerId, operationId);
-        if (closing || store.get(ownerId)?.status !== "active" || !config().rules.enabled) break;
-        const selected = selectLease(tried); const choice = selected?.choice; const attemptId = selected?.attemptId;
+        requireCategory();
+        if (closing || !canContinue() || store.get(ownerId)?.status !== "active" || !config().rules.enabled) break;
+        if (!requestQueue.includes(ticket)) requestQueue.push(ticket);
+        if (requestQueue[0] !== ticket || activeRequests >= (config().rules.requestConcurrency || DEFAULT_RULES.requestConcurrency)) {
+          if (Date.now() >= waitDeadline) break;
+          await sleep(100); continue;
+        }
+        const selected = selectLease(tried, categorySnapshot.categoryId); const choice = selected?.choice; const attemptId = selected?.attemptId;
         if (!choice) {
-          const value = config(); const awaitingLease = value.entries.some((entry) => !tried.has(entry.id) && usableEntry(entry, value, now(), true));
-          if (awaitingLease && Date.now() < waitDeadline) { await new Promise((resolve) => setTimeout(resolve, 100)); continue; }
+          removeTicket();
+          const value = config(); const awaitingLease = value.entries.some((entry) => entry.categoryId === categorySnapshot.categoryId && !tried.has(entry.id) && usableEntry(entry, value, now(), true));
+          if (awaitingLease && Date.now() < waitDeadline) { await sleep(100); continue; }
+          const retryable = value.entries.some((entry) => entry.categoryId === categorySnapshot.categoryId && entry.lastError === "no_stock" && entry.enabled && entry.state !== "disabled"
+            && value.credentials.some((credential) => credential.id === entry.credentialId && credential.enabled && !credential.blockedReason && (!credential.cooldownUntil || credential.cooldownUntil <= now()))
+            && (!entry.cooldownUntil || entry.cooldownUntil <= now() + retryDelayMs));
+          if (tried.size && retryable && current.attempts.length < current.maxAttempts && Date.now() + retryDelayMs < waitDeadline) {
+            await sleep(retryDelayMs); tried.clear(); continue;
+          }
           break;
         }
+        removeTicket();
         tried.add(choice.entry.id);
         const providerId = choice.credential.providerId;
-        const providerConfig = makeProviderConfig(choice, current.maxAttempts);
+        const providerConfig = makeProviderConfig(choice, current.maxAttempts, current);
         const { apiKey, ...attemptConfig } = providerConfig;
-        current = store.updateSmsOperation(ownerId, operationId, (value) => { value.state = "requesting"; value.attempts.push({ id: attemptId, entryId: choice.entry.id, credentialId: choice.credential.id,
-          providerId, config: attemptConfig, startedAt: now(), state: "requesting" }); return value; });
-        let order; let providerRequested = false;
+        let order; let providerRequested = false; let requestSlot = false;
         try {
-          const client = createProvider(providerId, providerConfig, providerOptions); providerRequested = true; order = await client.getNumber();
+          requirePoolAccess(ownerId, operationId);
+          requireCategory();
+          current = operation(ownerId, operationId);
+          if (CLOSED.has(current.state)) throw fail("SMS_POOL_CLOSED", "接码操作已停止");
+          if (closing || !canContinue() || store.get(ownerId)?.status !== "active" || !config().rules.enabled) break;
+          const client = createProvider(providerId, providerConfig, providerOptions);
+          current = store.updateSmsOperation(ownerId, operationId, (value) => { value.state = "requesting"; value.attempts.push({ ...categorySnapshot, id: attemptId, entryId: choice.entry.id, credentialId: choice.credential.id,
+            providerId, config: attemptConfig, startedAt: now(), state: "requesting" }); return value; });
+          activeRequests++; requestSlot = true; providerRequested = true; order = await client.getNumber();
           if (!order || !text(String(order.requestId || "")) || !/^\+[1-9]\d{6,14}$/.test(order.number || "")) throw new Error("invalid order");
           if (order.cost?.amount != null && Number(order.cost.amount) > Number(providerConfig.maxPrice)) throw new Error("order price exceeded configured ceiling");
         } catch (error) {
+          if (["SMS_PROVIDER_FORBIDDEN", "SMS_POOL_CLOSED", "SMS_POOL_CATEGORY_UNAVAILABLE"].includes(error.code)) throw error;
           const kind = providerRequested ? classifyPoolError(error) : "config_invalid"; recordFailure(choice, kind, attemptId);
           current = store.updateSmsOperation(ownerId, operationId, (value) => { value.state = kind === "order_unknown" ? "unknown" : "reserved"; value.reason = kind;
-            if (order?.requestId) value.allocation = { allocationId: attemptId, entryId: choice.entry.id, credentialId: choice.credential.id, providerId, config: providerConfig, order: clone(order), configVersion: choice.configVersion, abandoned: false, submitted: false };
-            Object.assign(value.attempts.at(-1), { state: kind, endedAt: now() }); return value; });
+            if (order?.requestId) value.allocation = { ...categorySnapshot, allocationId: attemptId, entryId: choice.entry.id, credentialId: choice.credential.id, providerId, config: providerConfig, order: clone(order), createdAt: now(), configVersion: choice.configVersion, abandoned: false, submitted: false };
+            if (value.attempts.at(-1)?.id === attemptId) Object.assign(value.attempts.at(-1), { state: kind, endedAt: now() }); return value; });
           if (kind === "order_unknown") throw fail("SMS_POOL_UNKNOWN", "取号结果未确认，已保留预留次数，请由管理员核实", { uncertain: true });
           continue;
         } finally {
+          if (requestSlot) activeRequests--;
           releaseLease(choice, attemptId);
         }
-        const allocation = { allocationId: attemptId, entryId: choice.entry.id, credentialId: choice.credential.id, providerId, config: providerConfig,
+        const allocation = { ...categorySnapshot, allocationId: attemptId, entryId: choice.entry.id, credentialId: choice.credential.id, providerId, config: providerConfig,
           order: clone(order), configVersion: choice.configVersion, abandoned: false, submitted: false };
         const allocated = store.allocateSmsOrder(ownerId, operationId, allocation, now());
-        if (!allocated.allocation) { current = operation(ownerId, operationId); if (allocated.conflict === "operation_stopped") throw fail("SMS_POOL_CLOSED", "接码操作已停止"); continue; }
+        if (!allocated.allocation) { current = operation(ownerId, operationId); if (allocated.conflict === "operation_stopped") { store.queueSmsOrderCancellation(allocation, { reason: "operation_stopped", now: now() }); throw fail("SMS_POOL_CLOSED", "接码操作已停止"); } continue; }
+        if (closing || !canContinue() || store.get(ownerId)?.status !== "active") {
+          store.queueSmsOrderCancellation(allocation, { reason: "operation_stopped_after_purchase", now: now() });
+          store.updateSmsOperation(ownerId, operationId, (value) => { value.allocation.abandoned = true; value.state = "reserved"; return value; });
+          store.settleSmsOperation(ownerId, operationId, { reason: "取号完成时任务已停止或接码权限已变化" });
+          throw fail("SMS_POOL_CLOSED", "接码操作已停止，已取号码进入回收处理");
+        }
         recordSuccess(choice, attemptId);
         return { ...clone(allocation), operationId, poolEntryId: allocation.entryId };
       }
       store.settleSmsOperation(ownerId, operationId, { reason: "没有可获取的池号码" });
       throw fail(current.attempts.length >= current.maxAttempts ? "SMS_POOL_LIMIT" : "SMS_POOL_NO_NUMBERS", "接码池暂时无可用号码，本次未扣次数");
+      } finally { removeTicket(); }
     })();
-    running.set(key, pending); try { return await pending; } finally { running.delete(key); if (config().rules.buffer?.enabled) buffer.signalDemand(); }
+    running.set(key, pending); try { return await pending; } finally { running.delete(key); }
   }
   const requireAllocation = (value, input) => {
     const allocation = value.allocation;
@@ -308,23 +365,25 @@ export function createSmsPool({ store, createProvider = createSmsProvider, provi
         if (!validId(input.operationId) || !validId(input.jobId) || !validId(input.runId || "")) throw cdkError(422, "接码操作标识不正确");
         const email = text(input.email).toLowerCase(); if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw cdkError(422, "接码账号邮箱不正确");
         const previous = store.smsOperation(ownerId, input.operationId);
-        if (previous) { if (previous.email !== email || previous.jobId !== input.jobId || previous.runId !== input.runId) throw cdkError(409, "接码操作标识对应任务不同"); if (!previous.allocation || previous.allocation.abandoned) requirePoolAccess(ownerId, input.operationId); return billing(previous); }
+        const categoryId = input.categoryId || "other";
+        if (previous) { if (previous.email !== email || previous.jobId !== input.jobId || previous.runId !== input.runId) throw cdkError(409, "接码操作标识对应任务不同"); if ((previous.categoryId || "other") !== categoryId) throw cdkError(409, "接码操作标识对应分类不同"); if (!previous.allocation || previous.allocation.abandoned) requirePoolAccess(ownerId, input.operationId); return billing(previous); }
         requirePoolAccess(ownerId);
-        const value = config(); if (!summary().available) throw fail("SMS_POOL_DISABLED", "接码池暂时不可用，请稍后重试");
-        if (input.expectedFee !== undefined && input.expectedFee !== value.rules.fee) throw fail("SMS_POOL_FEE_CHANGED", "接码池收费已变更，请重新确认后开始");
+        const value = config(); const selectedCategory = category(categoryId, { active: true }); if (!summary(categoryId).available) throw fail("SMS_POOL_DISABLED", "所选接码分类暂时不可用，请稍后重试");
+        if (input.expectedFee !== undefined && input.expectedFee !== selectedCategory.fee || input.feeVersion !== undefined && input.feeVersion !== selectedCategory.feeVersion) throw fail("SMS_POOL_FEE_CHANGED", "接码分类收费已变更，请重新确认后开始");
         const actorId = input.actorId || ownerId; const actor = actorId === "recovery" ? null : store.get(actorId);
         if (actorId === ownerId && actor?.status !== "active") throw cdkError(403, "CDK 已失效或被禁用");
         if (actorId !== "recovery" && (!actor || actor.status !== "active" || actorId !== ownerId && actor.role !== "admin")) throw cdkError(403, "接码操作人无权访问当前 CDK");
         const prepared = store.prepareSmsOperation(ownerId, { operationId: input.operationId, jobId: input.jobId, runId: input.runId, email, actorId,
-          fee: value.rules.fee, policyVersion: value.version, maxAttempts: value.rules.maxAttempts, maxConcurrent: value.rules.maxConcurrent });
-        buffer.signalDemand(); return billing(prepared);
+          categoryId, categoryName: selectedCategory.name, categoryFee: selectedCategory.fee, categoryFeeVersion: selectedCategory.feeVersion, fee: selectedCategory.fee, policyVersion: value.version, maxAttempts: value.rules.maxAttempts });
+        return billing(prepared);
       },
-      getNumber: (input) => acquire(ownerId, typeof input === "string" ? input : input.operationId),
+      getNumber: (input) => acquire(ownerId, typeof input === "string" ? input : input.operationId, typeof input?.canContinue === "function" ? input.canContinue : undefined),
       acquire: (operationId) => acquire(ownerId, operationId),
       abandon(input) {
         const value = operation(ownerId, input.operationId); if (CLOSED.has(value.state)) return billing(value);
         const allocation = requireAllocation(value, input);
         if ((value.state === "unknown" || allocation.submitted) && input.confirmedFailure !== true) throw fail("SMS_POOL_UNKNOWN", "验证码提交结果待核实，不能直接换号", { uncertain: true });
+        store.queueSmsOrderCancellation(allocation, { reason: text(input.reason) || "allocation_abandoned", now: now() });
         if (allocation.inventoryId) store.inventoryOperationEnd(ownerId, input.operationId, false, now());
         return billing(store.updateSmsOperation(ownerId, input.operationId, (current) => { current.allocation.abandoned = true; current.state = "reserved"; return current; }));
       },
@@ -344,6 +403,7 @@ export function createSmsPool({ store, createProvider = createSmsProvider, provi
       release(input) {
         const value = operation(ownerId, input.operationId); if (CLOSED.has(value.state)) return billing(value);
         if (input.uncertain || ["requesting", "unknown", "submitted"].includes(value.state)) return billing(store.updateSmsOperation(ownerId, value.operationId, (current) => ({ ...current, state: "unknown", reason: "接码结果待核实，预留次数尚未扣除" })));
+        if (value.allocation?.order && !value.allocation.abandoned) store.queueSmsOrderCancellation(value.allocation, { reason: text(input.reason) || "operation_released", now: now() });
         return billing(store.settleSmsOperation(ownerId, value.operationId, { reason: text(input.reason).slice(0, 160) || "接码未成功" }));
       },
       recover(operationId) { const value = operation(ownerId, typeof operationId === "string" ? operationId : operationId.operationId); return { ...billing(value), jobId: value.jobId, runId: value.runId, allocation: clone(value.allocation) }; },
@@ -363,12 +423,13 @@ export function createSmsPool({ store, createProvider = createSmsProvider, provi
     if (value.state !== "unknown" || running.has(`${value.ownerId}:${id}`)) throw cdkError(409, "只能核实已停止的结果待核实操作，请先结束当前请求");
     if (body.action === "verified" && !value.allocation) throw cdkError(409, "没有明确订单，不能确认手机验证成功");
     store.audit(actor, "sms-pool-reconcile", `${value.ownerId}:${id}`, { action: body.action, note });
+    if (body.action === "release" && value.allocation?.order) store.queueSmsOrderCancellation(value.allocation, { reason: `administrator_reconciliation: ${note}`, now: now() });
     store.settleSmsOperation(value.ownerId, id, { success: body.action === "verified", evidence: { type: "admin_reconciliation", note, actor }, reason: note, actor }); return snapshot();
   }
-  return { adminSnapshot: snapshot, publicSummary: summary, operationsPage, analytics, saveRules, saveCredential, credentialOptions, saveEntry, saveEntries,
+  return { adminSnapshot: snapshot, publicSummary: summary, operationsPage, analytics, saveRules, saveCategory, saveCredential, credentialOptions, saveEntry, saveEntries,
     start: () => buffer.start(), pause: () => buffer.pause(), tick: () => buffer.tick(),
-    warmup: async (actor) => { admin(actor); buffer.warmup(actor); return snapshot(); },
-    pauseRefill: async (actor) => { admin(actor); buffer.pauseRefill(actor); return snapshot(); },
+    warmup: async (actor) => { admin(actor); throw fail("SMS_POOL_PREFETCH_REMOVED", "接码池已改为按任务取号，不再支持预购或补满"); },
+    pauseRefill: async (actor) => { admin(actor); throw fail("SMS_POOL_PREFETCH_REMOVED", "接码池已改为按任务取号，无需暂停补号"); },
     inventoryPage: (query = {}) => buffer.inventoryPage(query),
     drain: async (actor) => { admin(actor); await buffer.drain(actor); return snapshot(); },
     reconcileInventory: (id, body, actor) => { admin(actor); buffer.reconcile(id, body, actor); return snapshot(); },

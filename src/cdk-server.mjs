@@ -68,6 +68,7 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
     if (Object.hasOwn(settings, smsSettingsKey)) {
       const original = parseSmsSettings(settings[smsSettingsKey]) || {};
       const configs = Object.fromEntries(Object.entries(original.configs || {}).filter(([id]) => allowed.includes(id)));
+      if (configs.pool && !configs.pool.categoryId) configs.pool = { ...configs.pool, categoryId: "other" };
       const value = { selectedProviderId: allowed.includes(original.selectedProviderId) ? original.selectedProviderId : "custom", configs };
       settings[smsSettingsKey] = typeof settings[smsSettingsKey] === "string" ? JSON.stringify(value) : value;
     }
@@ -85,6 +86,11 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
       if (!supplied || supplied.configs != null && (typeof supplied.configs !== "object" || Array.isArray(supplied.configs))) throw cdkError(422, "接码配置格式不正确");
       if (supplied.selectedProviderId != null) assertSmsProvider(owner, supplied.selectedProviderId);
       for (const id of Object.keys(supplied.configs || {})) if (!allowed.includes(id)) assertSmsProvider(owner, id);
+      if (supplied.selectedProviderId === "pool") {
+        const categoryId = supplied.configs?.pool?.categoryId;
+        if (typeof categoryId !== "string" || !categoryId) throw cdkError(422, "请选择接码池分类");
+        if (!smsPool.publicSummary(categoryId).enabled) throw cdkError(409, "所选接码分类已停用");
+      }
       const stored = parseSmsSettings(previous[smsSettingsKey]) || {};
       const hidden = Object.fromEntries(Object.entries(stored.configs || {}).filter(([id]) => !allowed.includes(id)));
       const value = { selectedProviderId: supplied.selectedProviderId || "custom", configs: { ...hidden, ...supplied.configs } };
@@ -271,7 +277,7 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
       if (cdk) { this.setHeader("x-cdk-id", owner); this.setHeader("x-cdk-balance", String(cdk.balance)); this.setHeader("x-cdk-reserved", String(cdk.reserved)); }
       return writeScopedHead.apply(this, args);
     };
-    if (url.pathname === "/api/sms-pool" && req.method === "GET") { assertSmsProvider(owner, "pool"); send(res, 200, smsPool.publicSummary()); return; }
+    if (url.pathname === "/api/sms-pool" && req.method === "GET") { assertSmsProvider(owner, "pool"); send(res, 200, smsPool.publicSummary(url.searchParams.get("categoryId") || null)); return; }
     if (url.pathname === "/api/auth/me" && req.method === "GET") { send(res, 200, await bootstrap(session)); return; }
     if (url.pathname === "/api/auth/logout" && req.method === "POST") { store.logout(session); res.setHeader("set-cookie", sessionCookie(req, "", true)); send(res, 200, { ok: true }); return; }
     if (url.pathname === "/api/auth/workspace" && req.method === "POST") {
@@ -318,6 +324,9 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
       if (url.pathname === "/api/admin/sms-pool/analytics" && req.method === "GET") { send(res, 200, smsPool.analytics(Object.fromEntries(url.searchParams))); return; }
       if (url.pathname === "/api/admin/sms-pool/inventory" && req.method === "GET") { send(res, 200, smsPool.inventoryPage(Object.fromEntries(url.searchParams))); return; }
       if (url.pathname === "/api/admin/sms-pool/rules" && req.method === "PUT") { send(res, 200, smsPool.saveRules(await readRequestJson(req), actor)); return; }
+      if (url.pathname === "/api/admin/sms-pool/categories" && req.method === "POST") { send(res, 200, smsPool.saveCategory(await readRequestJson(req), actor)); return; }
+      const poolCategoryMatch = /^\/api\/admin\/sms-pool\/categories\/([a-zA-Z0-9_-]+)$/.exec(url.pathname);
+      if (poolCategoryMatch && req.method === "PATCH") { send(res, 200, smsPool.saveCategory(await readRequestJson(req), actor, poolCategoryMatch[1])); return; }
       if (url.pathname === "/api/admin/sms-pool/buffer/warmup" && req.method === "POST") {
         send(res, 200, await smsPool.warmup(actor));
         return;

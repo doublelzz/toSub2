@@ -17,7 +17,7 @@ const dom = new JSDOM('<div id="root"></div>', { url: "http://localhost" });
 globalThis.window = dom.window; globalThis.document = dom.window.document; globalThis.HTMLElement = dom.window.HTMLElement;
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 const { useDialogFocus } = await load("../web/src/WorkspaceUi.jsx", ["useDialogFocus"]);
-let publicRequest = async () => Response.json({ enabled: true, available: true, fee: 3, status: "ready", hasNumbers: true });
+let publicRequest = async () => Response.json({ enabled: true, categories: [{ id: "other", name: "其他", enabled: true, available: true, fee: 3, feeVersion: 1, status: "available_on_demand" }] });
 const { SmsPoolWorkspace, EntryDialog, SmsPoolChoice, SmsPoolChargeDialog } = await load("../web/src/SmsPoolWorkspace.jsx", ["SmsPoolWorkspace", "EntryDialog", "SmsPoolChoice", "SmsPoolChargeDialog"], { useDialogFocus, cdkFetch: (...args) => publicRequest(...args) });
 const { createRoot } = await import("react-dom/client"); const container = document.getElementById("root"); const root = createRoot(container);
 let generation = 0;
@@ -29,8 +29,8 @@ async function fill(element, value) { await act(() => { const prototype = elemen
 
 try {
   const credentials = [{ id: "cred-a", name: "Primary", providerId: "smsbower", enabled: true, hasApiKey: true, blockedReason: "balance_insufficient" }];
-  const rules = { enabled: true, fee: 3, noStockThreshold: 3, cooldownMinutes: 10, maxAttempts: 10, maxConcurrent: 5, buffer: { enabled: false, target: 3, lowWater: 1, perEntry: 1, refillConcurrency: 1, minRemainingSeconds: 480, idleMinutes: 10, maxOutstanding: 10, maxPerMinute: 6 } };
-  let snapshot = { rules, credentials, entries: [{ id: "entry-a", credentialId: "cred-a", country: "6", maxPrice: "0.30", providerIds: "1", state: "credential_error" }], operations: [], version: 1 };
+  const rules = { enabled: true, fee: 3, noStockThreshold: 3, cooldownMinutes: 10, maxAttempts: 10, requestConcurrency: 3 };
+  let snapshot = { categories: [{ id: "other", name: "其他", enabled: true, fee: 3, feeVersion: 1 }], rules, credentials, entries: [{ id: "entry-a", categoryId: "other", credentialId: "cred-a", country: "6", maxPrice: "0.30", providerIds: "1", state: "credential_error" }], operations: [], version: 1 };
   let failMain = false; let failHistory = false;
   const calls = [];
   const history = Array.from({ length: 205 }, (_, index) => ({ operationId: `operation-${index}`, cdkId: index % 2 ? "owner-b" : "owner-a", cdkLabel: `CDK ${index % 2}`, email: `history-${index}@example.invalid`, state: index === 0 ? "unknown" : "verified", fee: 3, reserved: index === 0 ? 3 : 0, createdAt: "2026-10-25T01:00:00Z" }));
@@ -45,19 +45,20 @@ try {
   };
   await render(SmsPoolWorkspace, { api });
   await tab("设置");
-  await fill(container.querySelector('[aria-label="验证成功扣次"]'), "6");
-  snapshot.rules = { ...snapshot.rules, fee: 8 };
+  await fill(container.querySelector('[aria-label="取号请求并发"]'), "6");
+  snapshot.rules = { ...snapshot.rules, requestConcurrency: 8 };
   await click("刷新");
-  assert.equal(container.querySelector('[aria-label="验证成功扣次"]').value, "6", "refresh preserves unsaved rules");
-  assert.equal(container.querySelector(".sp-pool-fee strong").textContent, "8", "the active fee stays distinct from the draft");
-  await fill(container.querySelector('[aria-label="池并发上限"]'), "2.5");
+  assert.equal(container.querySelector('[aria-label="取号请求并发"]').value, "6", "refresh preserves unsaved rules");
+  assert.equal(container.querySelector(".sp-pool-fee strong").textContent, "3", "the category fee is independent of global rules");
+  await fill(container.querySelector('[aria-label="取号请求并发"]'), "2.5");
   assert.equal(button("保存池规则").disabled, true, "all rule fields require integers");
-  await fill(container.querySelector('[aria-label="池并发上限"]'), "4");
+  await fill(container.querySelector('[aria-label="取号请求并发"]'), "4");
   await click("保存池规则");
-  assert.equal(calls.findLast((row) => row.path === "/rules").body.fee, 6);
-  snapshot.rules = { ...snapshot.rules, fee: 9 };
+  assert.equal(calls.findLast((row) => row.path === "/rules").body.requestConcurrency, 4);
+  assert.equal(Object.hasOwn(calls.findLast((row) => row.path === "/rules").body, "fee"), false);
+  snapshot.rules = { ...snapshot.rules, requestConcurrency: 9 };
   await click("刷新");
-  assert.equal(container.querySelector('[aria-label="验证成功扣次"]').value, "9", "an unedited draft adopts current server rules");
+  assert.equal(container.querySelector('[aria-label="取号请求并发"]').value, "9", "an unedited draft adopts current server rules");
   await tab("设置");
   assert.match(container.querySelector(".sp-credential-row").textContent, /凭据异常/);
   assert.match(container.querySelector(".sp-credential-error").textContent, /余额不足/);
@@ -65,9 +66,9 @@ try {
   assert.deepEqual(calls.findLast((row) => row.path === "/credentials").body, { id: "cred-a", name: "Primary", providerId: "smsbower", enabled: true, resetCooldown: true });
   assert.equal(container.querySelector(".sp-credential-error"), null);
 
-  await tab("接码记录");
+  await tab("取号记录");
   assert.equal(container.querySelectorAll(".sp-operation-table tbody tr").length, 20);
-  assert.match(container.querySelector('[aria-label="接码记录分页"]').textContent, /205 条记录/);
+  assert.match(container.querySelector('[aria-label="取号记录分页"]').textContent, /205 条记录/);
   await click("下一页");
   assert.match(container.querySelector(".sp-operation-table tbody tr").textContent, /history-20/);
   assert.ok(calls.some((row) => row.path === "/operations?page=2&pageSize=20"));
@@ -90,7 +91,7 @@ try {
 
   const quotes = [{ country: "6", title: "Country A", price: 0.3, count: 5, providerIds: "1", grade: "gold" }, { country: "6", title: "Country A", price: 0.30, count: 8, providerIds: "1", grade: "gold" }, { country: "6", title: "Country A", price: 0.4, count: 4, providerIds: "2", grade: "unknown" }, { country: "16", title: "Country B", price: 0.5, count: 5, providerIds: "3", grade: "gold" }];
   const entryCalls = [];
-  await render(EntryDialog, { credentials, existingEntries: snapshot.entries, request: async (path, method, body) => { entryCalls.push({ path, method, body }); return path.endsWith("/options") ? { options: quotes } : {}; }, onClose() {}, onSaved() {} });
+  await render(EntryDialog, { categoryId: "other", categoryName: "其他", credentials, existingEntries: snapshot.entries, request: async (path, method, body) => { entryCalls.push({ path, method, body }); return path.endsWith("/options") ? { options: quotes } : {}; }, onClose() {}, onSaved() {} });
   await click("查询国家报价");
   assert.equal(container.querySelectorAll(".sp-quote-option").length, 3, "duplicate routes are listed once");
   assert.equal(container.querySelector(".sp-quote-option input").disabled, true, "already pooled routes cannot be added twice");
@@ -103,15 +104,15 @@ try {
   await click("加入接码池");
   assert.deepEqual(entryCalls.find((row) => row.path === "/entries").body.entries.map((row) => [row.country, row.providerIds, row.grade, row.gradeFilter]), [["16", "3", "gold", "gold"], ["6", "2", "unknown", "unknown"]]);
 
-  await render(SmsPoolChoice, { token: "fixture" });
-  assert.match(container.querySelector(".sp-choice-heading").textContent, /有号码/);
+  await render(SmsPoolChoice, { value: "other", token: "fixture" });
+  assert.match(container.querySelector(".sp-choice-heading").textContent, /可按需取号/);
   publicRequest = async () => { throw Error("fixture public offline"); };
   await click("刷新状态");
   assert.match(container.querySelector(".sp-choice-heading").textContent, /读取失败/);
-  assert.match(container.querySelector(".sp-choice-footer").textContent, /号码状态未知/);
+  assert.match(container.querySelector(".sp-choice-footer").textContent, /接码池状态未知/);
   assert.equal(container.querySelector(".sp-choice-fee strong").textContent.trim(), "— 次");
 
-  await render(SmsPoolChargeDialog, { quote: { fee: 3, count: 4, admin: true }, onClose() {} });
+  await render(SmsPoolChargeDialog, { quote: { categoryId: "other", categoryName: "其他", feeVersion: 1, fee: 3, count: 4, admin: true }, onClose() {} });
   assert.match(container.textContent, /最多扣 0 次/);
   assert.equal(container.querySelector(".sp-choice-fee strong").textContent.trim(), "0 次");
   console.log("SMS pool production UI passed (current versus draft rules, credential recovery, 205-row pagination/retry, owner-scoped reconciliation, grade routes/deduplication and stale availability)");
