@@ -16,7 +16,8 @@ import { createOfferWorkspace } from "./offer-workspace.mjs";
 import { createOfferRunner } from "./offer-runner.mjs";
 import { matchesTaskQuery, normalizeTaskQuery, summarizeTasks } from "./task-query.mjs";
 import { ACCOUNT_SESSION_FILENAME, loadAccountInsights, publicAccountInsights } from "./account-insights.mjs";
-import { withSub2ApiExpiry, validateSub2ApiData, summarizeSub2ApiTokens, summarizeSub2ApiUpload, mergeSub2ApiCredentials } from "./sub2api-export.mjs";
+import { withSub2ApiExpiry, validateSub2ApiData, summarizeSub2ApiTokens, mergeSub2ApiCredentials } from "./sub2api-export.mjs";
+import { createSub2ApiLinker } from "./sub2api-linking.mjs";
 import { phoneVerificationStatus, recordSmsOrder, publicSmsSummary } from "./sms-orders.mjs";
 import { readPhoneEvidence, writePhoneEvidence } from "./phone-verification-evidence.mjs";
 import {
@@ -115,6 +116,28 @@ let mailRequestConfig = { method: "GET", url: null, headers: {} };
 const sub2ApiRequestControllers = new Set();
 const sub2ApiRequestPromises = new Set();
 const sub2ApiAutoRepairPromises = new Set();
+const sub2ApiLocalBindings = new Map();
+const sub2ApiUploadPreviews = new Map();
+const sub2ApiPushPromises = new Set();
+const sub2ApiUploadPreviewTtlMs = Number.isFinite(options.sub2ApiUploadPreviewTtlMs)
+  ? Math.max(0, options.sub2ApiUploadPreviewTtlMs) : 5 * 60_000;
+const sub2ApiLinker = createSub2ApiLinker({
+  request(config, endpoint, requestOptions = {}) {
+    if (!["GET", "HEAD"].includes(String(requestOptions.method || "GET").toUpperCase()) && (shuttingDown || !options.isEnabled())) {
+      throw Object.assign(httpError(409, "工作区已暂停，已停止后续推送"), { code: "SUB2API_REQUEST_FAILED" });
+    }
+    return requestSub2Api(config, endpoint, requestOptions);
+  },
+  ownerId: options.cdkId,
+  async getBindings(config, email) {
+    for (const backend of new Set([sub2ApiConnectionIdentity(config), monitorBackendIdentity(config)])) {
+      const rows = await (options.getRemoteBindings ? options.getRemoteBindings(backend, email) : sub2ApiLocalBindings.get(`${backend}:${email}`) || []);
+      if (rows?.length) return [...new Map(rows.map((row) => [String(row.remoteId ?? row.remote_id ?? row.id), row])).values()];
+    }
+    return [];
+  },
+  bindRemote: bindSub2ApiRemote,
+});
 const directTlsProfileProbe = new DirectTlsProfileProbe({
   explicitProfile: process.env.TOSUB2_TLS_PROFILE,
   validationUrl: `${String(process.env.CHATGPT_BASE || "https://chatgpt.com").replace(/\/$/, "")}/`,
@@ -502,64 +525,100 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
+  if (req.method === "POST" && requestUrl.pathname === "/api/sub2api/links") {
+    const body = await readJson(req);
+    const config = normalizeSub2ApiConfig(body.config);
+    const selected = resolveSelectedJobs(body.ids);
+    const records = await Promise.all(selected.map(async (job) => {
+      let account = null;
+      if (job.resultSaved) {
+        try { account = (await readSub2ApiResult(job)).accounts.find((row) => sub2ApiAccountEmail(row) === job.email.toLowerCase()) || null; } catch {}
+      }
+      return { id: job.id, email: job.email, account };
+    }));
+    sendJson(res, 200, await sub2ApiLinker.inspect(config, records));
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/sub2api/upload-preview") {
+    const body = await readJson(req);
+    const config = normalizeSub2ApiConfig(body.config);
+    const selected = resolveSelectedJobs(body.ids);
+    const { payload, records, digest } = await prepareSub2ApiPush(selected, config);
+    const preview = await sub2ApiLinker.preview(config, records);
+    const previewRows = new Map();
+    for (const [index, item] of preview.items.entries()) {
+      const targetIds = config.groupIds.length ? config.groupIds : item.action === "create"
+        ? records[index].account.group_ids || [] : (item.groups || []).map((group) => group.id);
+      const names = new Map((item.groups || []).map((group) => [group.id, group.name]));
+      item.targetGroups = targetIds.map((id) => ({ id: Number(id), name: names.get(Number(id)) || `分组 ${id}` }));
+      if (!previewRows.has(item.id)) previewRows.set(item.id, []);
+      previewRows.get(item.id).push(item);
+    }
+    const rows = payload.rows.flatMap((row) => row.status === "ready"
+      ? previewRows.get(row.id) || []
+      : [{ id: row.id, email: row.email, action: row.status === "skipped" ? "skipped" : "blocked", groups: [], message: row.message }]);
+    const counts = {
+      created: rows.filter((row) => row.action === "create").length,
+      updated: rows.filter((row) => row.action === "update").length,
+      blocked: rows.filter((row) => row.action === "blocked").length,
+      skipped: rows.filter((row) => row.action === "skipped").length,
+    };
+    const previewToken = crypto.randomBytes(32).toString("hex");
+    const expiresAt = Date.now() + sub2ApiUploadPreviewTtlMs;
+    for (const [key, stored] of sub2ApiUploadPreviews) if (stored.expiresAt <= Date.now()) sub2ApiUploadPreviews.delete(key);
+    while (sub2ApiUploadPreviews.size >= 32) sub2ApiUploadPreviews.delete(sub2ApiUploadPreviews.keys().next().value);
+    const canPush = counts.created + counts.updated > 0;
+    sub2ApiUploadPreviews.set(previewToken, { digest, ids: selected.map((job) => job.id),
+      actorId: req.actorId || null, expiresAt, targets: preview.targets, canPush });
+    sendJson(res, 200, { previewToken, expiresAt: new Date(expiresAt).toISOString(), selected: selected.length,
+      ...counts, rows, canPush });
+    return;
+  }
+
   if (req.method === "POST" && requestUrl.pathname === "/api/sub2api/upload") {
     const body = await readJson(req);
     const config = normalizeSub2ApiConfig(body.config);
     const selected = resolveSelectedJobs(body.ids);
-    const payload = await buildSub2ApiUploadPayload(selected);
-    if (!payload.accounts.length) {
-      sendJson(res, 200, { ...publicExportReport(payload), uploaded: 0, unknown: 0, result: { success: 0, failed: 0, results: [] } });
-      return;
+    const previewToken = typeof body.previewToken === "string" ? body.previewToken : "";
+    const preview = sub2ApiUploadPreviews.get(previewToken);
+    if (!preview || preview.expiresAt <= Date.now() || preview.actorId !== (req.actorId || null)) {
+      if (preview) sub2ApiUploadPreviews.delete(previewToken);
+      throw Object.assign(httpError(409, "推送预检已失效，请重新检查并确认后推送"), { code: "SUB2API_PREVIEW_REQUIRED" });
     }
-    const idempotencyKey = `tosub2-upload-${crypto.randomUUID()}`;
-
-    const accounts = payload.accounts.map((account) => {
-      const { proxy_key: _proxyKey, ...accountData } = account;
-      const credentials = { ...(account.credentials || {}) };
-      const extra = {
-        ...(account.extra && typeof account.extra === "object" ? account.extra : {}),
-        tosub2_cdk_id: options.cdkId,
-        tosub2_config_id: monitorBackendIdentity(config),
-        codex_fingerprint_mode: config.codexFingerprintMode,
-      };
-      if (config.modelWhitelist.length) {
-        credentials.model_mapping = Object.fromEntries(config.modelWhitelist.map((model) => [model, model]));
+    const operation = withSub2ApiPushLocks(selected, async () => {
+      if (shuttingDown || !options.isEnabled()) throw httpError(409, "工作区当前不可推送，请稍后重新预检");
+      const currentSelected = resolveSelectedJobs(body.ids);
+      const { payload, records, digest } = await prepareSub2ApiPush(currentSelected, config);
+      if (preview.digest !== digest || JSON.stringify(preview.ids) !== JSON.stringify(currentSelected.map((job) => job.id))) {
+        sub2ApiUploadPreviews.delete(previewToken);
+        throw Object.assign(httpError(409, "所选账号、授权内容或 Sub2API 配置已变化，请重新预检后确认"), { code: "SUB2API_PREVIEW_CHANGED" });
       }
-      return {
-        ...accountData,
-        credentials,
-        extra,
-        status: "active",
-        schedulable: true,
-        group_ids: config.groupIds.length ? config.groupIds : (account.group_ids || []),
-        ...(config.proxyId ? { proxy_id: config.proxyId } : {}),
-        ...(config.concurrency !== null ? { concurrency: config.concurrency } : {}),
-        ...(config.loadFactor !== null ? { load_factor: config.loadFactor } : {}),
-        ...(config.priority !== null ? { priority: config.priority } : {}),
-      };
-    });
-    const response = await requestSub2Api(config, "/api/v1/admin/accounts/batch", {
-      method: "POST",
-      headers: { "Idempotency-Key": idempotencyKey },
-      body: JSON.stringify({ accounts }),
-    });
-    const upstreamRows = response?.data?.results || response?.results || [];
-    for (const [index, row] of upstreamRows.entries()) {
-      const remoteId = Number(row?.account_id ?? row?.accountId ?? row?.id);
-      const source = payload.sources[index];
-      if (source && row?.success !== false && Number.isSafeInteger(remoteId) && remoteId > 0) options.bindRemote(monitorBackendIdentity(config), remoteId, selected.find((job) => job.id === source.id || job.id === source.jobId)?.email || accounts[index]?.credentials?.email || accounts[index]?.name);
-    }
-    const result = summarizeSub2ApiUpload(response, accounts, [config.adminApiKey]);
-    result.results = result.results.map((row, index) => ({ ...row, ...payload.sources[index] }));
+      if (preview.expiresAt <= Date.now()) {
+        sub2ApiUploadPreviews.delete(previewToken);
+        throw httpError(409, "推送预检已过期，请重新检查并确认");
+      }
+      if (!preview.canPush) throw httpError(409, "预检没有可推送账号，请处理冲突或失败项后重新检查");
+      // Consume before starting asynchronous writes so repeated confirmation cannot submit twice.
+      if (!sub2ApiUploadPreviews.delete(previewToken)) throw httpError(409, "该次推送确认已使用，请重新预检");
+      const pushed = await sub2ApiLinker.push(config, records, { targets: preview.targets });
+      const result = { success: pushed.created + pushed.updated, failed: pushed.failed, unknown: pushed.unknown,
+        results: pushed.results.map((row, index) => ({ ...row, ...payload.sources[index] })) };
 
-    sendJson(res, 200, {
-      ...publicExportReport(payload),
-      uploaded: result.success,
-      failed: payload.errors.length + result.failed,
-      unknown: result.unknown,
-      groupIds: config.groupIds,
-      result,
+      sendJson(res, 200, {
+        ...publicExportReport(payload),
+        uploaded: result.success,
+        created: pushed.created,
+        updated: pushed.updated,
+        linked: result.success,
+        failed: payload.errors.length + result.failed,
+        unknown: result.unknown,
+        groupIds: config.groupIds,
+        result,
+      });
     });
+    sub2ApiPushPromises.add(operation);
+    try { await operation; } finally { sub2ApiPushPromises.delete(operation); }
     return;
   }
 
@@ -3611,6 +3670,33 @@ async function buildSub2ApiUploadPayload(selected) {
   };
 }
 
+async function prepareSub2ApiPush(selected, config) {
+  const payload = await buildSub2ApiUploadPayload(selected);
+  const records = payload.accounts.map((account, index) => {
+    const { proxy_key: _proxyKey, ...accountData } = account;
+    const credentials = { ...(account.credentials || {}) };
+    if (config.modelWhitelist.length) credentials.model_mapping = Object.fromEntries(config.modelWhitelist.map((model) => [model, model]));
+    return { id: payload.sources[index].jobId, email: payload.sources[index].email, account: {
+      ...accountData,
+      credentials,
+      extra: { ...(account.extra && typeof account.extra === "object" ? account.extra : {}),
+        tosub2_cdk_id: options.cdkId, tosub2_config_id: monitorBackendIdentity(config),
+        codex_fingerprint_mode: config.codexFingerprintMode },
+      status: "active",
+      schedulable: true,
+      group_ids: config.groupIds.length ? config.groupIds : (account.group_ids || []),
+      ...(config.proxyId ? { proxy_id: config.proxyId } : {}),
+      ...(config.concurrency !== null ? { concurrency: config.concurrency } : {}),
+      ...(config.loadFactor !== null ? { load_factor: config.loadFactor } : {}),
+      ...(config.priority !== null ? { priority: config.priority } : {}),
+    } };
+  });
+  const digest = crypto.createHash("sha256").update(JSON.stringify({ config, records,
+    jobStates: selected.map((job) => ({ id: job.id, status: job.status, runId: job.runId, queuedMode: job.queuedMode, resultSaved: job.resultSaved })),
+    localRows: payload.rows.map(({ id, email, status, message }) => ({ id, email, status, message })) })).digest("hex");
+  return { payload, records, digest };
+}
+
 function publicExportReport(payload) {
   return { selected: payload.selected, exportable: payload.accounts.length, failed: payload.errors.length,
     skipped: payload.skipped, rows: payload.rows, tokens: summarizeSub2ApiTokens(payload.accounts) };
@@ -3695,6 +3781,7 @@ function parseSub2ApiModelWhitelist(value) {
 }
 
 function requestSub2Api(config, endpoint, options = {}) {
+  if (shuttingDown) throw httpError(503, "服务正在关闭，已停止 Sub2API 请求");
   const requestPromise = performSub2ApiRequest(config, endpoint, options);
   sub2ApiRequestPromises.add(requestPromise);
   void requestPromise.then(
@@ -4071,6 +4158,23 @@ function isSub2ApiAccountInMonitoredGroups(account, groupIds) {
     ...(Array.isArray(account?.account_groups) ? account.account_groups.map((item) => item?.group_id) : []),
   ].map(Number).filter(Number.isSafeInteger);
   return groupIds.some((id) => accountGroupIds.includes(Number(id)));
+}
+
+function sub2ApiConnectionIdentity(config) {
+  const normalized = normalizeSub2ApiConfig(config);
+  const value = JSON.stringify({ cdkId: options.cdkId, baseUrl: normalized.baseUrl, adminApiKey: normalized.adminApiKey });
+  const fingerprint = typeof options.fingerprint === "function" ? options.fingerprint(value) : crypto.createHash("sha256").update(value).digest("hex");
+  return `sub2api-connection-v1:${fingerprint}`;
+}
+
+async function bindSub2ApiRemote(config, remoteId, email) {
+  if (shuttingDown || !options.isEnabled()) throw httpError(409, "工作区已暂停，远端关联结果待核实");
+  const normalizedEmail = email.trim().toLowerCase();
+  for (const backend of new Set([sub2ApiConnectionIdentity(config), monitorBackendIdentity(config)])) {
+    if (options.replaceRemoteBinding) await options.replaceRemoteBinding(backend, remoteId, normalizedEmail);
+    else if (options.bindRemote) await options.bindRemote(backend, remoteId, normalizedEmail);
+    sub2ApiLocalBindings.set(`${backend}:${normalizedEmail}`, [{ remoteId: Number(remoteId), email: normalizedEmail }]);
+  }
 }
 
 function monitorBackendIdentity(config) {
@@ -4556,6 +4660,13 @@ async function withEmailJobLock(email, operation) {
     release();
     if (emailJobLocks.get(key) === current) emailJobLocks.delete(key);
   }
+}
+
+async function withSub2ApiPushLocks(selected, operation) {
+  const emails = [...new Set(selected.map((job) => job.email.toLowerCase()))].sort();
+  const acquire = (index) => index >= emails.length ? operation()
+    : withEmailJobLock(emails[index], () => acquire(index + 1));
+  return acquire(0);
 }
 
 function resolveSelectedJobs(ids) {
@@ -5864,6 +5975,7 @@ async function shutdown() {
   shutdownPromise = (async () => {
     shuttingDown = true;
     queueSchedulingPaused = true;
+    sub2ApiUploadPreviews.clear();
     if (sub2ApiMonitorTimer) {
       clearInterval(sub2ApiMonitorTimer);
       sub2ApiMonitorTimer = null;
@@ -5876,6 +5988,7 @@ async function shutdown() {
       sub2ApiMonitorPromise,
       ...sub2ApiRequestPromises,
       ...sub2ApiAutoRepairPromises,
+      ...sub2ApiPushPromises,
     ].filter(Boolean));
     const activeJobs = [...jobs.values()].filter((job) => isActive(job.status));
     const childWaits = activeJobs
@@ -5987,8 +6100,9 @@ return {
     const id = Number(remoteId); if (!Number.isSafeInteger(id) || id <= 0) throw httpError(422, "远端账号 ID 不正确");
     const local = findJobByEmail(email); if (!local) throw httpError(404, "当前 CDK 下没有此账号");
     const account = await getSub2ApiAccount(config, id);
-    if (!account || sub2ApiAccountEmail(account) !== local.email.toLowerCase()) throw httpError(409, "远端账号与当前邮箱不匹配");
-    options.bindRemote(monitorBackendIdentity(config), id, local.email);
+    if (!account || account.platform !== "openai" || account.type !== "oauth" || sub2ApiAccountEmail(account) !== local.email.toLowerCase()) throw httpError(409, "远端账号与当前邮箱或授权类型不匹配");
+    if (account.extra?.tosub2_cdk_id && account.extra.tosub2_cdk_id !== options.cdkId) throw httpError(409, "远端账号已属于其他 CDK，无法关联");
+    await bindSub2ApiRemote(config, id, local.email);
   },
   inventory() { return [...new Set([...listUniqueJobs().map((job) => job.email.toLowerCase()), ...mfaWorkspace.list().accounts.map((account) => account.email.toLowerCase())])]; },
   publicJobs: () => listUniqueJobs().map(publicJob),

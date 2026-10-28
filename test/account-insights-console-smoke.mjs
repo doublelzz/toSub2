@@ -37,11 +37,17 @@ for (const [target, data] of [[invalidPath, invalid], [expiredPath, expired]]) {
   await fs.mkdir(path.dirname(target));
   await fs.writeFile(target, JSON.stringify(data));
 }
+for (const [target, data] of [[exportPath, JSON.parse(raw)], [invalidPath, invalid], [expiredPath, expired]]) {
+  await fs.writeFile(path.join(path.dirname(target), "job-meta.json"), JSON.stringify({ version: 1,
+    email: data.accounts[0].credentials.email, status: "completed", result_saved: true, created_at: new Date().toISOString() }));
+}
 let fail = false;
 let hold = false;
 let partialUpload = false;
 const requests = [];
 let uploadedAccounts = [];
+const remoteAccounts = new Map();
+let nextRemoteId = 100;
 const backend = http.createServer(async (req, res) => {
   requests.push({ method: req.method, path: new URL(req.url, "http://localhost").pathname });
   if (req.method === "POST" && req.url === "/api/v1/admin/accounts/batch") {
@@ -50,9 +56,37 @@ const backend = http.createServer(async (req, res) => {
     for await (const chunk of req) chunks.push(chunk);
     uploadedAccounts = JSON.parse(Buffer.concat(chunks).toString("utf8")).accounts;
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify(partialUpload ? { code: 0, data: { success: 1, failed: 1, results: uploadedAccounts.map((account, index) => ({
-      name: account.name, success: index === 0, ...(index ? { error: "fixture-refresh-secret group rejected" } : {}),
-    })) } } : { success: uploadedAccounts.length, failed: 0 }));
+    const results = uploadedAccounts.map((account) => {
+      if (partialUpload && account.credentials.email !== email) return { name: account.name, success: false, error: "fixture-refresh-secret group rejected" };
+      const id = nextRemoteId++;
+      remoteAccounts.set(id, { ...account, id });
+      return { name: account.name, id, success: true };
+    });
+    res.end(JSON.stringify({ code: 0, data: { success: results.filter((row) => row.success).length,
+      failed: results.filter((row) => !row.success).length, results } }));
+    return;
+  }
+  if (req.method === "GET" && req.url.startsWith("/api/v1/admin/accounts?")) {
+    assert.equal(req.headers["x-api-key"], "fixture-admin-key");
+    const items = [...remoteAccounts.values()];
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ code: 0, data: { items, total: items.length, page: 1, page_size: 100, pages: 1 } }));
+    return;
+  }
+  const remoteMatch = /^\/api\/v1\/admin\/accounts\/(\d+)$/.exec(req.url);
+  if (remoteMatch) {
+    assert.equal(req.headers["x-api-key"], "fixture-admin-key");
+    const remoteId = Number(remoteMatch[1]);
+    if (!remoteAccounts.has(remoteId)) { res.writeHead(404, { "content-type": "application/json" }); res.end('{"message":"not found"}'); return; }
+    if (req.method === "PUT") {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const patch = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      remoteAccounts.set(remoteId, { ...remoteAccounts.get(remoteId), ...patch });
+      uploadedAccounts = [remoteAccounts.get(remoteId)];
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ code: 0, data: remoteAccounts.get(remoteId) }));
     return;
   }
   if (req.method === "POST" && req.url === "/oauth/token") {
@@ -108,6 +142,15 @@ async function jobWhen(predicate) {
   return waitFor(async () => { const job = (await page()).jobs.find((item) => item.id === id); return job && predicate(job) ? job : null; });
 }
 const post = (action) => fetch(`${base}/api/jobs/${id}/${action}`, { method: "POST", headers, body: "{}" });
+async function confirmedSub2ApiUpload(payload) {
+  const response = await fetch(`${base}/api/sub2api/upload-preview`, { method: "POST", headers, body: JSON.stringify(payload) });
+  const text = await response.text();
+  assert.equal(response.status, 200, text);
+  const preview = JSON.parse(text);
+  assert.equal(preview.canPush, true, text);
+  assert.equal(typeof preview.previewToken, "string");
+  return fetch(`${base}/api/sub2api/upload`, { method: "POST", headers, body: JSON.stringify({ ...payload, previewToken: preview.previewToken }) });
+}
 
 try {
   startConsole();
@@ -155,22 +198,19 @@ try {
     assert.equal(exported.accounts[0].credentials.plan_type, "plus");
     assert.equal(exported.accounts[0].expires_at, undefined);
   }
-  const upload = await fetch(`${base}/api/sub2api/upload`, {
-    method: "POST", headers,
-    body: JSON.stringify({ ids: [id], config: { baseUrl: backendUrl, adminApiKey: "fixture-admin-key" } }),
-  });
+  const upload = await confirmedSub2ApiUpload({ ids: [id], config: { baseUrl: backendUrl, adminApiKey: "fixture-admin-key" } });
   assert.equal(upload.status, 200, await upload.text());
   assert.equal(uploadedAccounts[0].credentials.expires_at, new Date(tokenExp * 1000).toISOString());
   assert.equal(uploadedAccounts[0].credentials.subscription_expires_at, "2099-01-01T00:00:00.000Z");
   assert.equal(await fs.readFile(exportPath, "utf8"), raw, "downloads and uploads cannot rewrite historical authorization files");
-  const mixedUpload = await fetch(`${base}/api/sub2api/upload`, { method: "POST", headers, body: JSON.stringify({ ids: [id, invalidId], config: { baseUrl: backendUrl, adminApiKey: "fixture-admin-key" } }) });
+  const mixedUpload = await confirmedSub2ApiUpload({ ids: [id, invalidId], config: { baseUrl: backendUrl, adminApiKey: "fixture-admin-key" } });
   const mixedResult = await mixedUpload.json();
   assert.equal(mixedResult.uploaded, 1);
   assert.equal(mixedResult.failed, 1);
   assert.equal(uploadedAccounts.length, 1, "invalid identity must not be sent to Sub2API");
   assert.equal(uploadedAccounts[0].extra.codex_fingerprint_mode, "off");
   partialUpload = true;
-  const partialUploadResponse = await fetch(`${base}/api/sub2api/upload`, { method: "POST", headers, body: JSON.stringify({ ids: [id, expiredId], config: { baseUrl: backendUrl, adminApiKey: "fixture-admin-key" } }) });
+  const partialUploadResponse = await confirmedSub2ApiUpload({ ids: [id, expiredId], config: { baseUrl: backendUrl, adminApiKey: "fixture-admin-key" } });
   const partialResult = await partialUploadResponse.json();
   assert.equal(partialResult.uploaded, 1, "wrapped upstream results must determine actual successful count");
   assert.equal(partialResult.failed, 1);
@@ -214,7 +254,7 @@ try {
   assert.equal(completed.accountInsights.status, "error", "previous snapshot survives restart");
   assert.equal(await storedFiles(root).readFile(exportPath, "utf8"), raw);
   assert.equal(requests.filter((item) => item.path === "/oauth/token").length, 1, "only the explicit regenerate operation may refresh OAuth");
-  assert.ok(requests.every((item) => ["/oauth/token", "/api/v1/admin/accounts/batch"].includes(item.path) || (item.method === "GET" && !/consume|authorize|oauth|signin|login/.test(item.path))), "manual checks must never log in or consume a reset");
+  assert.ok(requests.every((item) => ["/oauth/token", "/api/v1/admin/accounts/batch"].includes(item.path) || item.method === "PUT" && /^\/api\/v1\/admin\/accounts\/\d+$/.test(item.path) || (item.method === "GET" && !/consume|authorize|oauth|signin|login/.test(item.path))), "manual checks must never log in or consume a reset; explicit uploads may update the linked account");
   console.log("account insights console smoke passed (concurrency, failure isolation, cancellation, restart, no login)");
 } catch (error) {
   error.message += `\nConsole output:\n${logs}`;

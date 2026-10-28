@@ -752,6 +752,17 @@ export async function createCdkStore(root, vault) {
     bans() { return db.prepare("SELECT * FROM ip_bans ORDER BY created_at DESC LIMIT 200").all().map((row) => ({ id: row.id, ip: row.ip, source: row.source, reason: row.reason, actor: row.actor, createdAt: new Date(row.created_at).toISOString(), expiresAt: row.expires_at ? new Date(row.expires_at).toISOString() : null, active: !row.revoked_at && (!row.expires_at || row.expires_at > Date.now()) })); },
     unban(id, actor) { const row = db.prepare("SELECT * FROM ip_bans WHERE id=?").get(id); if (!row) throw cdkError(404, "封禁记录不存在"); db.prepare("UPDATE ip_bans SET revoked_at=COALESCE(revoked_at,?) WHERE id=?").run(Date.now(), id); audit(actor, "unban-ip", row.ip); },
     bindRemote(id, backend, remoteId, email) { db.prepare("INSERT INTO sub2api_bindings VALUES(?,?,?,?) ON CONFLICT(cdk_id,backend,remote_id) DO UPDATE SET email=excluded.email").run(id, backend, String(remoteId), email.toLowerCase()); },
+    getRemoteBindings(id, backend, email) {
+      return db.prepare("SELECT remote_id,email FROM sub2api_bindings WHERE cdk_id=? AND backend=? AND email=? ORDER BY remote_id").all(id, backend, email.toLowerCase())
+        .map((row) => ({ remoteId: Number(row.remote_id), email: row.email }));
+    },
+    replaceRemoteBinding(id, backend, remoteId, email) {
+      const normalizedEmail = email.trim().toLowerCase();
+      transaction(() => {
+        db.prepare("DELETE FROM sub2api_bindings WHERE cdk_id=? AND backend=? AND email=?").run(id, backend, normalizedEmail);
+        store.bindRemote(id, backend, remoteId, normalizedEmail);
+      });
+    },
     remoteBound(id, backend, remoteId) { return Boolean(db.prepare("SELECT 1 FROM sub2api_bindings WHERE cdk_id=? AND backend=? AND remote_id=?").get(id, backend, String(remoteId))); },
     cleanup() { const now = Date.now(); const rules = store.rules(); db.prepare("DELETE FROM sessions WHERE expires_at<? OR last_seen<?").run(now, now - 2 * 60 * 60000); db.prepare("DELETE FROM verification_attempts WHERE created_at<?").run(now - Math.max(24 * 60, rules.failureWindowMinutes) * 60000); db.prepare("DELETE FROM security_events WHERE last_at<?").run(now - rules.retentionDays * 86400000); },
     close: () => db.close(),

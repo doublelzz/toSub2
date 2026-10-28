@@ -53,6 +53,7 @@ const LUBAN_SERVICE_ID_STORAGE_KEY = "chatgpt-onboarding.luban-service-id";
 const SMS_PROVIDER_SETTINGS_KEY = "chatgpt-onboarding.sms-provider-settings-v1";
 const MAIL_REQUEST_SETTINGS_KEY = "chatgpt-onboarding.mail-request-settings-v1";
 const SUB2API_UPLOAD_SETTINGS_KEY = "chatgpt-onboarding.sub2api-upload-settings-v1";
+const SUB2API_LINKS_VISIBLE_KEY = "tosub2.sub2api-links-visible";
 const ACCOUNT_PROXY_STORAGE_KEY = "chatgpt-onboarding.account-proxy-v1";
 const SMS_PROVIDER_ORDER = ["luban", "smsbower", "herosms", "custom", "pool"];
 const SMS_PROVIDER_EXTERNAL_LINKS = {
@@ -133,6 +134,13 @@ function App({ auth }) {
   const [mailRequestSettingsError, setMailRequestSettingsError] = useState("");
   const [mailRequestSettingsSaving, setMailRequestSettingsSaving] = useState(false);
   const [sub2apiSettings, setSub2apiSettings] = useState(readSub2ApiSettings);
+  const [sub2apiLinksVisible, setSub2apiLinksVisible] = useState(() => readLocalTextSetting(SUB2API_LINKS_VISIBLE_KEY) === "true");
+  const [sub2apiLinks, setSub2apiLinks] = useState({ key: "", loadingIds: [], items: [] });
+  const sub2apiLinksRequest = useRef(null);
+  const [sub2apiPushPreview, setSub2apiPushPreview] = useState(null);
+  const [sub2apiPushBusy, setSub2apiPushBusy] = useState(false);
+  const [sub2apiPushError, setSub2apiPushError] = useState("");
+  const sub2apiPushRequest = useRef(null);
   const [sub2apiSettingsDraft, setSub2apiSettingsDraft] = useState(readSub2ApiSettings);
   const [sub2apiGroups, setSub2apiGroups] = useState([]);
   const [sub2apiProxies, setSub2apiProxies] = useState([]);
@@ -166,6 +174,7 @@ function App({ auth }) {
   useEffect(() => writeLocalJson(SMS_PROVIDER_SETTINGS_KEY, smsSettings), [smsSettings]);
   useEffect(() => writeLocalJson(MAIL_REQUEST_SETTINGS_KEY, mailRequestSettings), [mailRequestSettings]);
   useEffect(() => writeLocalJson(SUB2API_UPLOAD_SETTINGS_KEY, sub2apiSettings), [sub2apiSettings]);
+  useEffect(() => writeLocalTextSetting(SUB2API_LINKS_VISIBLE_KEY, String(sub2apiLinksVisible)), [sub2apiLinksVisible]);
   useEffect(() => writeLocalTextSetting(ACCOUNT_PROXY_STORAGE_KEY, accountProxyUrl.trim()), [accountProxyUrl]);
   useEffect(() => writeLocalTextSetting("tosub2.density", density), [density]);
 
@@ -264,6 +273,17 @@ function App({ auth }) {
   }, [token, features.sub2apiMonitor]);
 
   const pageJobIds = useMemo(() => jobs.map((job) => job.id), [jobs]);
+  const sub2apiConfigured = Boolean(sub2apiSettings.baseUrl.trim() && sub2apiSettings.adminApiKey.trim());
+  const showSub2apiLinks = sub2apiConfigured && sub2apiLinksVisible;
+  const sub2apiLinkConfigKey = JSON.stringify({ ...normalizeSub2ApiSettings(sub2apiSettings), monitorEnabled: undefined });
+  const sub2apiLinkRequestKey = JSON.stringify([token, sub2apiLinkConfigKey]);
+  const sub2apiContext = useRef(sub2apiLinkRequestKey);
+  sub2apiContext.current = sub2apiLinkRequestKey;
+  const currentSub2apiLinks = sub2apiLinks.key === sub2apiLinkRequestKey ? sub2apiLinks : { loadingIds: [], items: [] };
+  const sub2apiLinksById = new Map(currentSub2apiLinks.items.map((item) => [item.id, item]));
+  useEffect(() => {
+    return () => { sub2apiLinksRequest.current?.abort(); sub2apiLinksRequest.current = null; };
+  }, [sub2apiLinkRequestKey]);
   const smsProviderDefinitions = useMemo(() => {
     const order = new Map(SMS_PROVIDER_ORDER.map((id, index) => [id, index]));
     return [...(Array.isArray(features.smsProviders) ? features.smsProviders : [])].sort((left, right) => {
@@ -470,32 +490,90 @@ function App({ auth }) {
     setActiveWorkspace("mfa");
   }
 
+  async function querySelectedSub2apiLinks() {
+    if (!sub2apiConfigured || !selectedJobIds.size || selectedJobIds.size > 500 || sub2apiLinksRequest.current) return;
+    const ids = [...selectedJobIds];
+    const requested = new Set(ids);
+    const context = sub2apiLinkRequestKey;
+    const config = JSON.parse(sub2apiLinkConfigKey);
+    const controller = new AbortController();
+    sub2apiLinksRequest.current = controller;
+    setSub2apiLinks((current) => ({ key: context, loadingIds: ids, items: current.key === context ? current.items : [] }));
+    try {
+      const data = await apiFetch(token, "/api/sub2api/links", { method: "POST", body: JSON.stringify({ ids, config }), signal: controller.signal });
+      if (sub2apiContext.current !== context || sub2apiLinksRequest.current !== controller) return;
+      const values = new Map((Array.isArray(data.items) ? data.items : []).filter((item) => requested.has(item.id)).map((item) => [item.id, item]));
+      setSub2apiLinks((current) => ({ key: context, loadingIds: [], items: [
+        ...(current.key === context ? current.items.filter((item) => !requested.has(item.id)) : []),
+        ...ids.map((id) => values.get(id) || { id, status: "error", message: "未返回此账号的关联结果，请重新查询" }),
+      ] }));
+    } catch (failure) {
+      if (sub2apiContext.current !== context || sub2apiLinksRequest.current !== controller) return;
+      const message = String(failure.message || "关联查询失败").split(config.adminApiKey).join("[redacted]");
+      setSub2apiLinks((current) => ({ key: context, loadingIds: [], items: [
+        ...(current.key === context ? current.items.filter((item) => !requested.has(item.id)) : []),
+        ...ids.map((id) => ({ id, status: "error", message })),
+      ] }));
+    } finally {
+      if (sub2apiLinksRequest.current === controller) sub2apiLinksRequest.current = null;
+    }
+  }
+
   async function uploadSelected(ids) {
     if (!sub2apiSettings.baseUrl || !sub2apiSettings.adminApiKey) {
       openSub2ApiSettings();
       setUploadNotice("请先配置 Sub2API 后端地址、管理员 API Key 和目标号池");
       return;
     }
-    if (batchAction) return;
+    if (batchAction || sub2apiPushRequest.current || sub2apiPushPreview) return;
+    if (!ids.length || ids.length > 500) { setError("每次请选择 1 到 500 个账号进行推送预检"); return; }
+    const request = { context: sub2apiLinkRequestKey, ids: [...ids], config: JSON.parse(sub2apiLinkConfigKey), token };
+    sub2apiPushRequest.current = request;
     setBatchAction("upload");
     setUploadNotice("");
+    setSub2apiPushError("");
     try {
-      await previewExport(ids);
-      const data = await apiFetch(token, "/api/sub2api/upload", {
+      const data = await apiFetch(token, "/api/sub2api/upload-preview", {
         method: "POST",
-        body: JSON.stringify({ ids, config: sub2apiSettings }),
+        body: JSON.stringify({ ids: request.ids, config: request.config }),
       });
+      if (sub2apiContext.current !== request.context) { setError("Sub2API 配置已变化，请重新预检"); return; }
+      setSub2apiPushPreview({ ...request, data });
+      setError("");
+    } catch (requestError) {
+      if (sub2apiContext.current === request.context) setError(String(requestError.message).split(request.config.adminApiKey).join("[redacted]"));
+    } finally {
+      if (sub2apiPushRequest.current === request) sub2apiPushRequest.current = null;
+      setBatchAction("");
+    }
+  }
+
+  async function confirmSub2apiPush() {
+    const preview = sub2apiPushPreview;
+    if (!preview || sub2apiPushRequest.current || !preview.data.canPush || Number(preview.data.created || 0) + Number(preview.data.updated || 0) < 1) return;
+    if (preview.context !== sub2apiContext.current) { setSub2apiPushError("Sub2API 配置已变化，本次预检已失效，请关闭后重新预检"); return; }
+    if (!preview.data.previewToken || sub2apiPreviewExpired(preview.data.expiresAt)) { setSub2apiPushError("预检已过期，请关闭后重新预检"); return; }
+    sub2apiPushRequest.current = preview;
+    setSub2apiPushBusy(true);
+    setSub2apiPushError("");
+    try {
+      const data = await apiFetch(preview.token, "/api/sub2api/upload", { method: "POST", body: JSON.stringify({ ids: preview.ids, config: preview.config, previewToken: preview.data.previewToken }) });
+      if (sub2apiContext.current !== preview.context) return;
       setExportReport(data);
-      setUploadNotice(`已创建 ${data.uploaded} 条${data.failed ? `，失败 ${data.failed} 条` : ""}${data.unknown ? `，结果未确认 ${data.unknown} 条` : ""}${data.skipped ? `，跳过 ${data.skipped} 条` : ""}`);
+      const created = Number(data.created ?? data.uploaded ?? 0);
+      setUploadNotice(`已创建 ${created} 条${data.updated ? `，已更新 ${data.updated} 条` : ""}${data.linked ? `，已关联 ${data.linked} 条` : ""}${data.failed ? `，失败 ${data.failed} 条` : ""}${data.unknown ? `，结果未确认 ${data.unknown} 条` : ""}${data.skipped ? `，跳过 ${data.skipped} 条` : ""}`);
+      setSub2apiLinks((current) => ({ ...current, items: current.items.filter((item) => !preview.ids.includes(item.id)) }));
+      setSub2apiPushPreview(null);
       setSelectedJobIds(new Set([
         ...(data.rows || []).filter((row) => row.status !== "ready").map((row) => row.id),
         ...(data.result?.results || []).filter((row) => row.success !== true).map((row) => row.jobId),
       ].filter(Boolean)));
       setError("");
     } catch (requestError) {
-      setError(requestError.message);
+      if (sub2apiContext.current === preview.context) setSub2apiPushError(String(requestError.message).split(preview.config.adminApiKey).join("[redacted]"));
     } finally {
-      setBatchAction("");
+      if (sub2apiPushRequest.current === preview) sub2apiPushRequest.current = null;
+      setSub2apiPushBusy(false);
     }
   }
 
@@ -1064,7 +1142,7 @@ function App({ auth }) {
               {features.sub2apiUpload && (
                 <button type="button" className="secondary-button bulk-button" onClick={() => uploadSelected([...selectedJobIds])} disabled={!canUploadSelected || Boolean(batchAction)}>
                   {batchAction === "upload" ? <LoaderCircle className="spin" size={16} /> : <Send size={16} />}
-                  上传到 Sub2API
+                  {batchAction === "upload" ? "正在预检" : "上传到 Sub2API"}
                 </button>
               )}
               <MoreActions label="更多">
@@ -1106,14 +1184,17 @@ function App({ auth }) {
         )}
 
         <div className="table-frame task-list-panel">
-          <div className="list-heading"><strong>任务列表</strong><span aria-live="polite">匹配 {pagination.total} 条{emailFilter.length ? ` · 精确邮箱 ${emailFilter.length} 个` : ""}</span><div>{features.cancelAll && <button type="button" className="selection-text-button" onClick={cancelAllRunningJobs} disabled={!(stats.active || stats.queued) || Boolean(batchAction)} title="停止所有运行和排队任务，不受当前筛选影响"><Ban size={14} />停止全部</button>}<button type="button" className="selection-text-button" onClick={clearFilters} disabled={!hasFilters(filters) && !emailFilter.length}>清除筛选</button></div></div>
-          <table className="authorization-table"><thead><tr>
+          <div className="list-heading"><strong>任务列表</strong><span aria-live="polite">匹配 {pagination.total} 条{emailFilter.length ? ` · 精确邮箱 ${emailFilter.length} 个` : ""}</span><div>{sub2apiConfigured && <div className="sub2api-link-controls"><label><input type="checkbox" role="switch" aria-label="显示 Sub2API 关联" checked={sub2apiLinksVisible} onChange={(event) => setSub2apiLinksVisible(event.target.checked)} /><span>显示 Sub2API 关联</span></label>{showSub2apiLinks && <button type="button" className="selection-text-button" onClick={querySelectedSub2apiLinks} disabled={Boolean(currentSub2apiLinks.loadingIds.length) || !selectedJobIds.size || selectedJobIds.size > 500} aria-label={`查询已选关联（${selectedJobIds.size}）`}><RefreshCw size={14} className={currentSub2apiLinks.loadingIds.length ? "spin" : ""} />查询已选关联（{selectedJobIds.size}）</button>}{showSub2apiLinks && selectedJobIds.size > 500 && <small role="status">每次最多查询 500 个账号</small>}</div>}{features.cancelAll && <button type="button" className="selection-text-button" onClick={cancelAllRunningJobs} disabled={!(stats.active || stats.queued) || Boolean(batchAction)} title="停止所有运行和排队任务，不受当前筛选影响"><Ban size={14} />停止全部</button>}<button type="button" className="selection-text-button" onClick={clearFilters} disabled={!hasFilters(filters) && !emailFilter.length}>清除筛选</button></div></div>
+          <table className={`authorization-table${showSub2apiLinks ? " has-sub2api-links" : ""}`}><thead><tr>
             <th className="select-heading"><input type="checkbox" checked={allPageSelected} onChange={toggleAllOnPage} disabled={!features.bulkActions || !pageJobIds.length} aria-label="选择当前页全部任务" /></th>
-            <th>账号</th><th>状态与进度</th><th>额度与订阅</th><th>接码与费用</th><th>时间</th><th className="actions-heading">操作</th>
+            <th>账号</th><th>状态与进度</th><th>额度与订阅</th><th>接码与费用</th><th>时间</th><th className="actions-heading">操作</th>{showSub2apiLinks && <th className="sub2api-link-heading">Sub2API 关联 / 分组</th>}
           </tr></thead><tbody>
-            {!jobs.length && <EmptyState filtered={hasFilters(filters) || emailFilter.length > 0} loaded={loaded} onCreate={() => setSingleOpen(true)} onClear={clearFilters} />}
+            {!jobs.length && <EmptyState filtered={hasFilters(filters) || emailFilter.length > 0} loaded={loaded} onCreate={() => setSingleOpen(true)} onClear={clearFilters} columns={showSub2apiLinks ? 8 : 7} />}
             {jobs.map((job) => <JobRow key={job.id}
                     job={job}
+                    showSub2apiLinks={showSub2apiLinks}
+                    sub2apiLink={sub2apiLinksById.get(job.id)}
+                    sub2apiLinksLoading={currentSub2apiLinks.loadingIds.includes(job.id)}
                     token={token}
                     expanded={expandedJobId === job.id}
                     onToggleLogs={() => setExpandedJobId((current) => current === job.id ? null : job.id)}
@@ -1141,6 +1222,9 @@ function App({ auth }) {
         {expandedJobId && jobs.find((job) => job.id === expandedJobId) && <Drawer title="任务详情" onClose={() => setExpandedJobId(null)} wide>
           {(() => { const job = jobs.find((item) => item.id === expandedJobId); return <JobRow key={job.id} detail
                     job={job}
+                    showSub2apiLinks={showSub2apiLinks}
+                    sub2apiLink={sub2apiLinksById.get(job.id)}
+                    sub2apiLinksLoading={currentSub2apiLinks.loadingIds.includes(job.id)}
                     token={token}
                     expanded={expandedJobId === job.id}
                     onToggleLogs={() => setExpandedJobId((current) => current === job.id ? null : job.id)}
@@ -1706,14 +1790,51 @@ function App({ auth }) {
         try { await flushWorkspaceSettings(); await apiFetch(token, "/api/sub2api/bind", { method: "POST", body: JSON.stringify({ email: values.get("email"), remoteId: Number(values.get("remoteId")) }) }); setRemoteBindingOpen(false); }
         catch (failure) { setRemoteBindingError(failure.message); } finally { setRemoteBindingBusy(false); }
       }}><label className="cdk-field">本地账号邮箱<input name="email" type="email" required /></label><label className="cdk-field">远端账号 ID<input name="remoteId" type="number" min="1" required /></label>{remoteBindingError && <p className="cdk-error" role="alert">{remoteBindingError}</p>}<button className="primary-button" disabled={remoteBindingBusy}>{remoteBindingBusy ? "正在核对" : "核对并关联"}</button></form></Drawer>}
+      {sub2apiPushPreview && <Sub2ApiPushPreview preview={sub2apiPushPreview.data} busy={sub2apiPushBusy} error={sub2apiPushError} invalid={sub2apiPushPreview.context !== sub2apiLinkRequestKey} onClose={() => { if (!sub2apiPushRequest.current) { setSub2apiPushPreview(null); setSub2apiPushError(""); } }} onConfirm={confirmSub2apiPush} />}
       {smsChargeQuote && <SmsPoolChargeDialog quote={smsChargeQuote} onClose={(value) => { const resolve = smsChargeQuote.resolve; setSmsChargeQuote(null); resolve(value); }} />}
       </div>
     </main>
   );
 }
 
-function EmptyState({ filtered = false, loaded, onCreate, onClear }) {
-  return <tr><td colSpan="7"><div className="empty-state"><div><Mail size={24} /></div><h3>{!loaded ? "正在读取任务" : filtered ? "没有匹配的任务" : "暂无授权任务"}</h3><p>{filtered ? "调整邮箱、状态或日期范围。" : "添加一个账号或批量导入，开始第一条任务。"}</p>{loaded && <button type="button" className="secondary-button" onClick={filtered ? onClear : onCreate}>{filtered ? "清除筛选" : "新建任务"}</button>}</div></td></tr>;
+function sub2apiPreviewDeadline(value) {
+  if (typeof value === "number" && Number.isFinite(value)) return value < 1e12 ? value * 1000 : value;
+  return Date.parse(value);
+}
+
+function sub2apiPreviewExpired(value) {
+  const deadline = sub2apiPreviewDeadline(value);
+  return !Number.isFinite(deadline) || deadline <= Date.now();
+}
+
+function Sub2ApiPushPreview({ preview, busy, error, invalid, onClose, onConfirm }) {
+  const dialog = useRef(null);
+  const [expired, setExpired] = useState(() => sub2apiPreviewExpired(preview.expiresAt));
+  useDialogFocus(true, () => { if (!busy) onClose(); }, dialog);
+  useEffect(() => {
+    const remaining = sub2apiPreviewDeadline(preview.expiresAt) - Date.now();
+    setExpired(!Number.isFinite(remaining) || remaining <= 0);
+    if (!Number.isFinite(remaining) || remaining <= 0) return undefined;
+    const timer = window.setTimeout(() => setExpired(true), Math.min(remaining + 10, 2_147_483_647));
+    return () => window.clearTimeout(timer);
+  }, [preview.expiresAt]);
+  const count = Number(preview.created || 0) + Number(preview.updated || 0);
+  const actions = { create: "新增", update: "更新", blocked: "冲突 / 阻止", skipped: "跳过" };
+  return <div className="modal-backdrop sub2api-push-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) onClose(); }}>
+    <section className="batch-dialog sub2api-push-dialog" ref={dialog} role="dialog" aria-modal="true" aria-labelledby="sub2api-push-title">
+      <header className="dialog-header"><div><h2 id="sub2api-push-title">推送 Sub2API 前确认</h2><p>核对新增与更新记录后，再确认执行。本次账号和配置已固定。</p></div><button type="button" className="icon-button" aria-label="关闭推送预检" disabled={busy} onClick={onClose}><X size={18} /></button></header>
+      <dl className="sub2api-push-counts"><div><dt>将新增</dt><dd>{Number(preview.created || 0)}</dd></div><div><dt>将更新</dt><dd>{Number(preview.updated || 0)}</dd></div><div><dt>阻止</dt><dd>{Number(preview.blocked || 0)}</dd></div><div><dt>跳过</dt><dd>{Number(preview.skipped || 0)}</dd></div></dl>
+      <div className="sub2api-push-rows"><table><thead><tr><th>账号</th><th>操作</th><th>远端账号 / 分组</th><th>核对结果</th></tr></thead><tbody>{(preview.rows || []).map((row, index) => <tr key={`${row.id || index}-${index}`}><td data-label="账号">{row.email || row.id}</td><td data-label="操作" className={`sub2api-push-action-${row.action}`}>{actions[row.action] || "待确认"}</td><td data-label="远端账号 / 分组">{row.remoteId ? <span>#{row.remoteId}</span> : <span>—</span>}<small className="sub2api-group-field">{row.action === "update" && <span>当前分组：</span>}<Sub2ApiGroupTags groups={row.groups} emptyLabel={row.action === "create" ? "—" : "未分组"} /></small>{Array.isArray(row.targetGroups) ? <small className="sub2api-group-field"><span>目标分组：</span><Sub2ApiGroupTags groups={row.targetGroups} emptyLabel={row.action === "create" ? "默认 / 未分组" : "未分组"} /></small> : row.action === "create" && <small>按本次推送配置设置分组</small>}</td><td data-label="核对结果">{row.message || "已核对"}</td></tr>)}</tbody></table></div>
+      {invalid ? <p className="dialog-error" role="alert">Sub2API 配置已变化，本次预检已失效，请关闭后重新预检。</p> : expired ? <p className="dialog-error" role="alert">预检已过期，请关闭后重新预检。</p> : <p className="sub2api-push-expiry">预检有效至 {formatInsightDate(new Date(sub2apiPreviewDeadline(preview.expiresAt)).toISOString())}</p>}
+      {error && <p className="dialog-error" role="alert">{error}</p>}
+      {!preview.canPush || count < 1 ? <p className="dialog-hint">没有可执行的记录，请处理冲突或补齐账号资料后重新预检。</p> : null}
+      <footer className="dialog-footer"><button type="button" className="cancel-button" disabled={busy} onClick={onClose}>取消</button><button type="button" className="primary-button" disabled={busy || invalid || expired || !preview.canPush || !preview.previewToken || count < 1} onClick={onConfirm}>{busy && <LoaderCircle size={16} className="spin" />}{busy ? "正在推送" : `确认推送 ${count} 条`}</button></footer>
+    </section>
+  </div>;
+}
+
+function EmptyState({ filtered = false, loaded, onCreate, onClear, columns = 7 }) {
+  return <tr><td colSpan={columns}><div className="empty-state"><div><Mail size={24} /></div><h3>{!loaded ? "正在读取任务" : filtered ? "没有匹配的任务" : "暂无授权任务"}</h3><p>{filtered ? "调整邮箱、状态或日期范围。" : "添加一个账号或批量导入，开始第一条任务。"}</p>{loaded && <button type="button" className="secondary-button" onClick={filtered ? onClear : onCreate}>{filtered ? "清除筛选" : "新建任务"}</button>}</div></td></tr>;
 }
 
 function InsightError({ item }) {
@@ -1796,7 +1917,40 @@ function smsOrderStatusText(status) {
   return ({ acquired: "已取号", submitted: "已提交", complete_pending: "等待完成确认", completed: "已完成", cancel_pending: "等待取消确认", cancel_requested: "已请求取消", cancel_failed: "取消失败", complete_failed: "完成确认失败", error: "失败" })[status] || status || "未知";
 }
 
-function JobRow({ prepareSmsProvider, job, token, expanded, onToggleLogs, onError, onPreviewExport, onDownloadNotice, onMfaStarted, mfaChangeAvailable, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, detail = false }) {
+function Sub2ApiGroupTags({ groups, emptyLabel = "未分组" }) {
+  const tones = ["blue", "teal", "amber", "violet", "rose", "cyan"];
+  if (!Array.isArray(groups) || !groups.length) return <span className="sub2api-group-empty">{emptyLabel}</span>;
+  return <span className="sub2api-group-tags" role="list" aria-label="Sub2API 分组">{groups.map((group, index) => {
+    const label = String(group.name || `分组 ${group.id}`);
+    const identity = String(group.id ?? label);
+    const hash = [...identity].reduce((value, character) => (Math.imul(value, 31) + character.codePointAt(0)) >>> 0, 0);
+    return <span className={`sub2api-group-tag sub2api-group-tag--${tones[hash % tones.length]}`} role="listitem" key={group.id ?? `${label}-${index}`} title={group.id == null ? label : `${label} · ID ${group.id}`}>{label}</span>;
+  })}</span>;
+}
+
+function Sub2ApiLinkSummary({ value, loading, error, detailed = false }) {
+  if (loading) return <div className="sub2api-link-summary" role="status"><span>正在查询关联</span></div>;
+  if (error) return <div className="sub2api-link-summary sub2api-link-error"><strong>查询失败</strong><small>{error}</small></div>;
+  if (!value) return <div className="sub2api-link-summary"><span>未查询，勾选账号后查询</span></div>;
+  const labels = { linked: "已关联", unlinked: "未关联", conflict: "关联冲突", missing: "远端已删除", error: "查询失败" };
+  const status = value?.status || "error";
+  const statusText = { active: "正常", error: "异常", disabled: "已停用", expired: "已过期", unknown: "未知" };
+  return <div className={`sub2api-link-summary sub2api-link-${status}`}><strong>{labels[status] || "关联待确认"}</strong>{status === "linked" && (value.accounts || []).map((account) => <div className={detailed ? "sub2api-link-detail" : ""} key={account.id}>
+    <div className="sub2api-link-remote-id">远端 #{account.id}</div>
+    {detailed ? <dl className="sub2api-link-detail-grid">
+      <div><dt>远端状态</dt><dd className={`sub2api-link-value-status--${account.status}`}>{statusText[account.status] || account.status || "未知"}</dd></div>
+      <div><dt>调度</dt><dd>{account.schedulable === true ? "可调度" : account.schedulable === false ? "已暂停" : "未知"}</dd></div>
+      <div><dt>平台 / 类型</dt><dd>{account.platform === "openai" ? "OpenAI" : account.platform || "未知"} / {account.type === "oauth" ? "OAuth" : account.type || "未知"}</dd></div>
+      <div><dt>代理</dt><dd>{account.proxyId ? `代理 #${account.proxyId}` : "未指定"}</dd></div>
+      <div><dt>并发</dt><dd>{account.concurrency ?? "默认"}</dd></div>
+      <div><dt>负载因子</dt><dd>{account.loadFactor ?? "默认"}</dd></div>
+      <div><dt>优先级</dt><dd>{account.priority ?? "默认"}</dd></div>
+      <div className="sub2api-link-detail-groups"><dt>分组</dt><dd><Sub2ApiGroupTags groups={account.groups} /></dd></div>
+    </dl> : <Sub2ApiGroupTags groups={account.groups} />}
+  </div>)}{status !== "linked" && <small>{value?.message || (status === "unlinked" ? "推送预检时核对远端账号" : "勾选此账号后重新查询")}</small>}</div>;
+}
+
+function JobRow({ prepareSmsProvider, job, token, expanded, onToggleLogs, onError, onPreviewExport, onDownloadNotice, onMfaStarted, mfaChangeAvailable, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, showSub2apiLinks = false, sub2apiLink, sub2apiLinksLoading, sub2apiLinksError, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, detail = false }) {
   const [value, setValue] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
@@ -2153,15 +2307,16 @@ function JobRow({ prepareSmsProvider, job, token, expanded, onToggleLogs, onErro
               <Ban size={17} />取消任务
             </button>
           )}</>;
-  if (detail) return <div className="job-detail-content"><p className="detail-email">{job.email}</p><section className="detail-section"><h3>状态与当前操作</h3><StatusBadge status={job.status} />{stepContent}</section><section className="detail-section"><h3>额度与订阅</h3>{quotaContent}</section><section className="detail-section"><h3>接码与费用</h3><SmsSummary summary={job.smsSummary} billing={job.smsPoolBilling} />{job.smsSummary?.orders?.length > 0 && <div className="sms-order-history">{job.smsSummary.orders.map(order => <div key={order.id}><span>{order.providerName || "接码平台"}</span><span>{smsOrderStatusText(order.status)}</span><span>{order.amount && order.currency ? `${order.amount} ${order.currency}` : order.quote ? `报价 ${order.quote}` : "金额待确认"}</span></div>)}</div>}</section><section className="detail-section"><h3>时间</h3><dl className="detail-dates"><div><dt>创建时间</dt><dd>{formatInsightDate(job.createdAt)}</dd></div><div><dt>最近操作</dt><dd>{formatInsightDate(job.lastOperationAt || job.createdAt)}</dd></div></dl></section><section className="detail-section"><h3>任务操作</h3><div className="detail-actions">{actionContent}</div></section><section className="detail-section"><h3>执行日志</h3><JobLogs token={token} jobId={job.id} /></section></div>;
+  if (detail) return <div className="job-detail-content"><p className="detail-email">{job.email}</p><section className="detail-section"><h3>状态与当前操作</h3><StatusBadge status={job.status} />{stepContent}</section><section className="detail-section"><h3>额度与订阅</h3>{quotaContent}</section><section className="detail-section"><h3>接码与费用</h3><SmsSummary summary={job.smsSummary} billing={job.smsPoolBilling} />{job.smsSummary?.orders?.length > 0 && <div className="sms-order-history">{job.smsSummary.orders.map(order => <div key={order.id}><span>{order.providerName || "接码平台"}</span><span>{smsOrderStatusText(order.status)}</span><span>{order.amount && order.currency ? `${order.amount} ${order.currency}` : order.quote ? `报价 ${order.quote}` : "金额待确认"}</span></div>)}</div>}</section><section className="detail-section"><h3>时间</h3><dl className="detail-dates"><div><dt>创建时间</dt><dd>{formatInsightDate(job.createdAt)}</dd></div><div><dt>最近操作</dt><dd>{formatInsightDate(job.lastOperationAt || job.createdAt)}</dd></div></dl></section>{showSub2apiLinks && <section className="detail-section"><h3>Sub2API 关联 / 分组</h3><Sub2ApiLinkSummary value={sub2apiLink} loading={sub2apiLinksLoading} error={sub2apiLinksError} detailed /></section>}<section className="detail-section"><h3>任务操作</h3><div className="detail-actions">{actionContent}</div></section><section className="detail-section"><h3>执行日志</h3><JobLogs token={token} jobId={job.id} /></section></div>;
   return <tr className={`job-row status-${job.status} ${selected ? "selected-row" : ""}`}>
     <td className="select-cell"><input type="checkbox" checked={selected} onChange={onToggleSelected} disabled={!selectionSupported} aria-label={`选择 ${job.email}`} /></td>
-    <td className="account-column"><div className="account-details"><strong title={job.email}>{job.email}</strong><span>{shortId(job.id)}</span></div><LoginMethodBadge job={job} /><div className="mobile-task-meta">{formatDateTime(job.createdAt)}</div></td>
+    <td className="account-column"><div className="account-details"><strong title={job.email}>{job.email}</strong><span>{shortId(job.id)}</span></div><LoginMethodBadge job={job} /><div className="mobile-task-meta">{formatDateTime(job.createdAt)}</div>{showSub2apiLinks && <div className="sub2api-link-mobile"><Sub2ApiLinkSummary value={sub2apiLink} loading={sub2apiLinksLoading} error={sub2apiLinksError} /></div>}</td>
     <td className="status-step-cell"><StatusBadge status={job.status} />{inputConfig ? <div className="task-inline-step">{stepContent}</div> : <><div className="prompt-line">{job.prompt}</div>{job.lastError && <div className="row-error">{extractResponseMessage(job.lastError)}</div>}</>}</td>
     <td className="insight-cell quota-column">{quotaContent}</td>
     <td className="sms-column"><SmsSummary summary={job.smsSummary} billing={job.smsPoolBilling} /></td>
     <td className="task-time-cell"><div><span>创建</span><time dateTime={job.createdAt} title={formatInsightDate(job.createdAt)}>{formatDateTime(job.createdAt)}</time></div><div><span>操作</span><time dateTime={job.lastOperationAt || job.createdAt} title={formatInsightDate(job.lastOperationAt || job.createdAt)}>{formatDateTime(job.lastOperationAt || job.createdAt)}</time></div><small>{operationLabel(job.lastOperationType)}</small></td>
     <td className="actions-cell"><div className="row-actions"><button type="button" className="text-action" onClick={onToggleLogs} aria-label={`查看 ${job.email} 的任务详情`}>查看</button>{job.canDownload && <button type="button" className="text-action" onClick={download}><Download size={14} />下载</button>}{mfaChangeAvailable && (job.canChangeMfa || job.mfaBusy) && <button type="button" className="text-action" onClick={changeMfa} disabled={submitting || job.mfaBusy} title="复用已有授权，成功后同步账号资料"><ShieldCheck size={14} />{job.mfaBusy ? "MFA 处理中" : "修改 MFA"}</button>}{job.canRetry && !job.canDownload && <button type="button" className="text-action" onClick={retry} disabled={submitting}>{job.canResume ? "继续" : "重试"}</button>}<MoreActions label="更多">{actionContent}</MoreActions></div></td>
+    {showSub2apiLinks && <td className="sub2api-link-column"><Sub2ApiLinkSummary value={sub2apiLink} loading={sub2apiLinksLoading} error={sub2apiLinksError} /></td>}
   </tr>;
 }
 

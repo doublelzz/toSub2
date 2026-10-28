@@ -16,6 +16,8 @@ const sub2apiPort = await findAvailablePort();
 const sub2apiUrl = `http://127.0.0.1:${sub2apiPort}`;
 let uploadedAccounts = [];
 let remoteErrorAccounts = [];
+const remoteUploadedAccounts = new Map();
+let nextRemoteUploadedId = 1000;
 const updatedRemoteAccounts = new Map();
 const clearedRemoteAccountIds = new Set();
 const scheduledRemoteAccounts = new Map();
@@ -44,15 +46,30 @@ const sub2api = http.createServer(async (req, res) => {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-    uploadedAccounts = body.accounts || [];
+    const results = (body.accounts || []).map((account) => {
+      const id = nextRemoteUploadedId++;
+      // v0.2.17 batch creation returns ids but needs a follow-up update for load_factor.
+      const { load_factor: _loadFactor, ...created } = account;
+      remoteUploadedAccounts.set(id, { ...created, id, status: "active", schedulable: true });
+      return { name: account.name, id, success: true };
+    });
+    uploadedAccounts = [...remoteUploadedAccounts.values()];
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ success: uploadedAccounts.length, failed: 0, results: [] }));
+    res.end(JSON.stringify({ code: 0, message: "success", data: { success: results.length, failed: 0, results } }));
     return;
   }
   if (req.method === "GET" && req.url?.startsWith("/api/v1/admin/accounts?")) {
     const requestUrl = new URL(req.url, sub2apiUrl);
     const status = requestUrl.searchParams.get("status");
-    const items = remoteErrorAccounts.filter((account) => !status || account.status === status);
+    const platform = requestUrl.searchParams.get("platform");
+    const type = requestUrl.searchParams.get("type");
+    const search = requestUrl.searchParams.get("search");
+    const group = requestUrl.searchParams.get("group");
+    const allAccounts = [...new Map([...remoteUploadedAccounts.values(), ...remoteErrorAccounts].map((account) => [Number(account.id), account])).values()];
+    const items = allAccounts.filter((account) => (!status || account.status === status)
+      && (!platform || account.platform === platform) && (!type || account.type === type)
+      && (!search || String(account.name).toLowerCase().includes(search.toLowerCase()))
+      && (!group || account.group_ids?.includes(Number(group))));
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
       code: 0,
@@ -64,7 +81,7 @@ const sub2api = http.createServer(async (req, res) => {
   const detailMatch = /^\/api\/v1\/admin\/accounts\/(\d+)$/.exec(req.url || "");
   if (req.method === "GET" && detailMatch) {
     const accountId = Number(detailMatch[1]);
-    const account = remoteErrorAccounts.find((item) => Number(item.id) === accountId);
+    const account = remoteErrorAccounts.find((item) => Number(item.id) === accountId) || remoteUploadedAccounts.get(accountId);
     if (!account) {
       res.writeHead(404, { "content-type": "application/json" });
       res.end(JSON.stringify({ message: "account not found" }));
@@ -81,6 +98,10 @@ const sub2api = http.createServer(async (req, res) => {
     const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
     const accountId = Number(updateMatch[1]);
     updatedRemoteAccounts.set(accountId, body);
+    if (remoteUploadedAccounts.has(accountId)) {
+      remoteUploadedAccounts.set(accountId, { ...remoteUploadedAccounts.get(accountId), ...body });
+      uploadedAccounts = [...remoteUploadedAccounts.values()];
+    }
     remoteErrorAccounts = remoteErrorAccounts.map((account) => (
       Number(account.id) === accountId ? { ...account, ...body } : account
     ));
@@ -657,18 +678,14 @@ try {
   });
   assert.equal(uploadResponse.status, 404);
 
-  const validUploadResponse = await fetch(`${baseUrl}/api/sub2api/upload`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
+  const validUploadResponse = await confirmedSub2ApiUpload(headers, {
       ids: [profileJob.id],
       config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key", groupIds: ["7", "8"], proxyId: "3", concurrency: "10", loadFactor: "100", priority: "1", modelWhitelist: "gpt-5\ngpt-5-mini", codexFingerprintMode: "full" },
-    }),
   });
   const validUploadText = await validUploadResponse.text();
   assert.equal(validUploadResponse.status, 200, validUploadText);
   const uploadResult = JSON.parse(validUploadText);
-  assert.equal(uploadResult.uploaded, 1);
+  assert.equal(uploadResult.uploaded, 1, validUploadText);
   assert.equal(uploadResult.result.success, 1);
   assert.deepEqual(uploadedAccounts[0].group_ids, [7, 8]);
   assert.equal(uploadedAccounts[0].proxy_id, 3);
@@ -681,24 +698,16 @@ try {
   assert.deepEqual(uploadedAccounts[0].credentials.model_mapping, { "gpt-5": "gpt-5", "gpt-5-mini": "gpt-5-mini" });
   assert.equal(uploadedAccounts[0].credentials.email, "account-profile@example.com");
 
-  const legacyUploadResponse = await fetch(`${baseUrl}/api/sub2api/upload`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
+  const legacyUploadResponse = await confirmedSub2ApiUpload(headers, {
       ids: [profileJob.id],
       config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key" },
-    }),
   });
   assert.equal(legacyUploadResponse.status, 200, await legacyUploadResponse.text());
   assert.equal(uploadedAccounts[0].extra.codex_fingerprint_mode, "off", "未填写时应使用 Sub2API 的默认值");
 
-  const disabledFingerprintUploadResponse = await fetch(`${baseUrl}/api/sub2api/upload`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
+  const disabledFingerprintUploadResponse = await confirmedSub2ApiUpload(headers, {
       ids: [profileJob.id],
       config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key", codexFingerprintMode: "off" },
-    }),
   });
   assert.equal(disabledFingerprintUploadResponse.status, 200, await disabledFingerprintUploadResponse.text());
   assert.equal(uploadedAccounts[0].extra.codex_fingerprint_mode, "off", "关闭模式必须显式写入，不能退回默认值");
@@ -1107,6 +1116,16 @@ async function waitForJson(url) {
     await delay(100);
   }
   throw new Error(`console did not start at ${url}`);
+}
+
+async function confirmedSub2ApiUpload(headers, payload) {
+  const preflight = await fetch(`${baseUrl}/api/sub2api/upload-preview`, { method: "POST", headers, body: JSON.stringify(payload) });
+  const text = await preflight.text();
+  assert.equal(preflight.status, 200, text);
+  const preview = JSON.parse(text);
+  assert.equal(preview.canPush, true, text);
+  assert.equal(typeof preview.previewToken, "string");
+  return fetch(`${baseUrl}/api/sub2api/upload`, { method: "POST", headers, body: JSON.stringify({ ...payload, previewToken: preview.previewToken }) });
 }
 
 async function waitForJob(headers, jobId, predicate) {
