@@ -31,6 +31,7 @@ const started = [];
 const errors = [];
 const baseJob = { id: "fixture-job", email: "fixture-ui@example.com", status: "completed", canChangeMfa: true };
 const props = { job: baseJob, token: "fixture-console-token", mfaChangeAvailable: true,
+  smsProvider: { id: "custom", name: "fixture-provider", config: {}, ready: false },
   onMfaStarted: (id) => started.push(id), onError: (error) => errors.push(error), accountProxyUrl: "" };
 const render = (extra = {}) => act(() => root.render(React.createElement("table", null, React.createElement("tbody", null, React.createElement(JobRow, { ...props, ...extra })))));
 try {

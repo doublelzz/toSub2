@@ -11,10 +11,6 @@ import { fileURLToPath } from "node:url";
 import { createCredentialStore } from "../src/credential-store.mjs";
 
 // These HTTP tests use synthetic accounts, isolated output, and a local protocol fixture.
-if (!["win32", "darwin"].includes(process.platform)) {
-  console.log("MFA console persistence smoke skipped: system credential storage unavailable");
-  process.exit(0);
-}
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "tosub2-mfa-http-"));
 const id = crypto.randomUUID();

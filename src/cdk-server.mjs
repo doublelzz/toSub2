@@ -140,6 +140,7 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
       const workspaceRoot = id === store.adminId ? root : path.join(root, "cdk", id);
       const workspace = await createWorkspace({
         root: workspaceRoot, cdkId: id, namespace, legacyEmails: id === store.adminId ? initialLegacyEmails : new Set(),
+        credentialVault: { seal: (value, scope) => vault.seal(value, `credentials:${id}:${scope}`), open: (value, scope) => vault.open(value, `credentials:${id}:${scope}`) },
         smsPool: smsPool.forOwner(id),
         smsProviderAllowed: (providerId) => store.smsProviderAllowed(id, providerId),
         rebindVault: { seal: (value, scope) => vault.seal(value, `rebind:${id}:${scope}`), open: (value, scope) => vault.open(value, `rebind:${id}:${scope}`) },
