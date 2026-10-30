@@ -17,7 +17,7 @@ import { createOfferRunner } from "./offer-runner.mjs";
 import { matchesTaskQuery, normalizeTaskQuery, summarizeTasks } from "./task-query.mjs";
 import { ACCOUNT_SESSION_FILENAME, loadAccountInsights, publicAccountInsights } from "./account-insights.mjs";
 import { withSub2ApiExpiry, validateSub2ApiData, summarizeSub2ApiTokens, mergeSub2ApiCredentials } from "./sub2api-export.mjs";
-import { createSub2ApiLinker } from "./sub2api-linking.mjs";
+import { createSub2ApiLinker, publicSub2ApiAccount } from "./sub2api-linking.mjs";
 import { phoneVerificationStatus, recordSmsOrder, publicSmsSummary } from "./sms-orders.mjs";
 import { readPhoneEvidence, writePhoneEvidence } from "./phone-verification-evidence.mjs";
 import {
@@ -30,6 +30,8 @@ import { DEFAULT_TLS_PROFILE, DirectTlsProfileProbe, proxySupportsSessionRotatio
 
 const MAX_ACTIVE_JOBS = 20;
 const MAX_BATCH_JOBS = 500;
+const MAX_TASK_QUERY_IDS = 10_000;
+const MAX_SUB2API_ANOMALY_ITEMS = 10_000;
 const MAX_PROXY_RISK_RETRIES = 10;
 const MAX_PROXY_CONNECTION_FAILURES = 20;
 const PROXY_CONNECTION_RETRY_BASE_MS = Math.max(1, Number(process.env.PROXY_CONNECTION_RETRY_BASE_MS || 1_000));
@@ -117,6 +119,7 @@ const sub2ApiRequestControllers = new Set();
 const sub2ApiRequestPromises = new Set();
 const sub2ApiAutoRepairPromises = new Set();
 const sub2ApiLocalBindings = new Map();
+const sub2ApiLocalSnapshots = new Map();
 const sub2ApiUploadPreviews = new Map();
 const sub2ApiPushPromises = new Set();
 const sub2ApiUploadPreviewTtlMs = Number.isFinite(options.sub2ApiUploadPreviewTtlMs)
@@ -129,13 +132,7 @@ const sub2ApiLinker = createSub2ApiLinker({
     return requestSub2Api(config, endpoint, requestOptions);
   },
   ownerId: options.cdkId,
-  async getBindings(config, email) {
-    for (const backend of new Set([sub2ApiConnectionIdentity(config), monitorBackendIdentity(config)])) {
-      const rows = await (options.getRemoteBindings ? options.getRemoteBindings(backend, email) : sub2ApiLocalBindings.get(`${backend}:${email}`) || []);
-      if (rows?.length) return [...new Map(rows.map((row) => [String(row.remoteId ?? row.remote_id ?? row.id), row])).values()];
-    }
-    return [];
-  },
+  getBindings: getSub2ApiRemoteBindings,
   bindRemote: bindSub2ApiRemote,
 });
 const directTlsProfileProbe = new DirectTlsProfileProbe({
@@ -148,6 +145,7 @@ const sub2ApiMonitorState = {
   nextCheckAt: null,
   lastError: null,
   lastResult: null,
+  anomalies: null,
 };
 
 await fs.mkdir(OUTPUT_ROOT, { recursive: true, mode: 0o700 });
@@ -278,7 +276,8 @@ async function handleApi(req, res, requestUrl) {
   if (req.method === "POST" && requestUrl.pathname === "/api/jobs/query") {
     const body = await readJson(req);
     const requestedPage = Math.max(1, Number.parseInt(body.page || "1", 10) || 1);
-    await sendJobsPage(res, requestedPage, Object.hasOwn(body, "emails") ? normalizeEmailFilter(body.emails) : null, body);
+    await sendJobsPage(res, requestedPage, Object.hasOwn(body, "emails") ? normalizeEmailFilter(body.emails) : null, body,
+      Object.hasOwn(body, "ids") ? normalizeTaskIds(body.ids) : null);
     return;
   }
 
@@ -525,6 +524,14 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
+  if (req.method === "POST" && requestUrl.pathname === "/api/sub2api/links-cache") {
+    const body = await readJson(req);
+    const config = normalizeSub2ApiConfig(body.config);
+    const selected = resolveSelectedJobs(body.ids);
+    sendJson(res, 200, { configured: true, items: await cachedSub2ApiLinks(config, selected) });
+    return;
+  }
+
   if (req.method === "POST" && requestUrl.pathname === "/api/sub2api/links") {
     const body = await readJson(req);
     const config = normalizeSub2ApiConfig(body.config);
@@ -536,7 +543,18 @@ async function handleApi(req, res, requestUrl) {
       }
       return { id: job.id, email: job.email, account };
     }));
-    sendJson(res, 200, await sub2ApiLinker.inspect(config, records));
+    const previous = new Map((await cachedSub2ApiLinks(config, selected)).map((item) => [item.id, item]));
+    const response = await sub2ApiLinker.inspect(config, records);
+    const checkedAt = response.checkedAt;
+    response.items = await Promise.all(response.items.map(async (item) => {
+      const saved = previous.get(item.id);
+      const snapshot = item.status === "error" && saved?.status === "linked"
+        ? { ...saved, refreshError: item.message, refreshErrorAt: checkedAt }
+        : { ...item, checkedAt, metadataComplete: true };
+      await saveSub2ApiLinkSnapshot(config, item.email, snapshot);
+      return { ...snapshot, cached: true };
+    }));
+    sendJson(res, 200, response);
     return;
   }
 
@@ -604,6 +622,16 @@ async function handleApi(req, res, requestUrl) {
       const pushed = await sub2ApiLinker.push(config, records, { targets: preview.targets });
       const result = { success: pushed.created + pushed.updated, failed: pushed.failed, unknown: pushed.unknown,
         results: pushed.results.map((row, index) => ({ ...row, ...payload.sources[index] })) };
+      await Promise.all(result.results.filter((row) => row.success === true && row.accounts?.length).map(async (row) => {
+        row.checkedAt = new Date().toISOString();
+        try {
+          await saveSub2ApiLinkSnapshot(config, row.email, { status: "linked", message: "已关联", accounts: row.accounts,
+            checkedAt: row.checkedAt, metadataComplete: true });
+        } catch {
+          row.snapshotSaved = false;
+          row.message += "；关联详情未能保存，请手动更新关联结果";
+        }
+      }));
 
       sendJson(res, 200, {
         ...publicExportReport(payload),
@@ -624,6 +652,11 @@ async function handleApi(req, res, requestUrl) {
 
   if (req.method === "GET" && requestUrl.pathname === "/api/sub2api/monitor") {
     sendJson(res, 200, publicSub2ApiMonitorState());
+    return;
+  }
+
+  if (req.method === "GET" && requestUrl.pathname === "/api/sub2api/monitor/anomalies") {
+    sendJson(res, 200, await currentSub2ApiAnomalyReport());
     return;
   }
 
@@ -779,13 +812,14 @@ async function handleApi(req, res, requestUrl) {
   sendJson(res, 405, { error: "Method not allowed" });
 }
 
-async function sendJobsPage(res, requestedPage, emailFilter = null, filters = {}) {
+async function sendJobsPage(res, requestedPage, emailFilter = null, filters = {}, taskIds = null) {
   const query = normalizeTaskQuery(filters);
   await syncCompletedOutputs();
   await refreshSmsPoolStates();
   const allJobs = listUniqueJobs();
   const emailSet = emailFilter?.length ? new Set(emailFilter) : null;
-  const visibleJobs = allJobs.filter((job) => (!emailSet || emailSet.has(job.email.toLowerCase())) && matchesTaskQuery(job, query));
+  const idSet = taskIds === null ? null : new Set(taskIds);
+  const visibleJobs = allJobs.filter((job) => (idSet === null || idSet.has(job.id)) && (!emailSet || emailSet.has(job.email.toLowerCase())) && matchesTaskQuery(job, query));
   const total = visibleJobs.length;
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const page = Math.min(requestedPage, totalPages);
@@ -795,7 +829,7 @@ async function sendJobsPage(res, requestedPage, emailFilter = null, filters = {}
     jobs: visibleJobs.slice(start, start + PAGE_SIZE).map(publicJob),
     selection: visibleJobs.map(publicSelectionJob),
     pagination: { page, pageSize: PAGE_SIZE, total, totalPages, totalAll: allJobs.length },
-    filter: { active: Boolean(emailSet || query.search || query.status !== "all" || query.phoneBinding !== "all" || query.start !== null), requested: emailFilter?.length || 0, matched: total },
+    filter: { active: Boolean(idSet !== null || emailSet || query.search || query.status !== "all" || query.phoneBinding !== "all" || query.start !== null), requested: taskIds?.length ?? emailFilter?.length ?? 0, matched: total },
     stats: {
       ...summarizeTasks(allJobs, query),
       active: allJobs.filter(occupiesActiveSlot).length,
@@ -803,6 +837,13 @@ async function sendJobsPage(res, requestedPage, emailFilter = null, filters = {}
       completed: allJobs.filter((job) => job.status === "completed").length,
     },
   });
+}
+
+function normalizeTaskIds(value) {
+  if (!Array.isArray(value)) throw httpError(400, "任务筛选必须是任务 ID 数组");
+  if (value.length > MAX_TASK_QUERY_IDS) throw httpError(422, `一次最多筛选 ${MAX_TASK_QUERY_IDS} 个任务`);
+  if (value.some((id) => typeof id !== "string" || !id.trim() || id.length > 200)) throw httpError(400, "任务筛选 ID 格式不正确");
+  return [...new Set(value.map((id) => id.trim()))];
 }
 
 function normalizeEmailFilter(value) {
@@ -3852,6 +3893,7 @@ async function loadSub2ApiMonitorConfiguration() {
     sub2ApiMonitorState.lastResult = saved.state?.lastResult && typeof saved.state.lastResult === "object"
       ? saved.state.lastResult
       : null;
+    sub2ApiMonitorState.anomalies = sanitizeSub2ApiAnomalyReport(saved.state?.anomalies);
   } catch (error) {
     if (error?.code !== "ENOENT") {
       console.warn(`[warn] Sub2API 号池监控配置无法读取：${String(error?.message || error).slice(0, 180)}`);
@@ -3884,10 +3926,72 @@ async function persistSub2ApiMonitorConfiguration() {
       lastCheckAt: sub2ApiMonitorState.lastCheckAt,
       lastError: sub2ApiMonitorState.lastError,
       lastResult: sub2ApiMonitorState.lastResult,
+      anomalies: sub2ApiMonitorState.anomalies,
     },
     updatedAt: new Date().toISOString(),
   };
   await options.writeMonitor(payload);
+}
+
+function sanitizeSub2ApiAnomalyReport(value) {
+  if (!value || typeof value !== "object" || typeof value.bindingId !== "string" || !value.bindingId
+    || !Number.isFinite(Date.parse(value.checkedAt))) return null;
+  const count = (number) => Number.isSafeInteger(number) && number >= 0 ? number : 0;
+  const items = (Array.isArray(value.items) ? value.items : []).slice(0, MAX_SUB2API_ANOMALY_ITEMS).map((item) => {
+    const remoteId = Number(item?.remoteId);
+    const email = typeof item?.email === "string" && isEmail(item.email.trim()) ? item.email.trim().toLowerCase() : null;
+    const groups = (Array.isArray(item?.groups) ? item.groups : []).slice(0, 100).flatMap((group) => {
+      const id = Number(group?.id);
+      return Number.isSafeInteger(id) && id > 0 ? [{ id, name: String(group.name || `分组 ${id}`).replace(/[\r\n\t]/g, " ").slice(0, 160) }] : [];
+    });
+    return { remoteId: Number.isSafeInteger(remoteId) && remoteId > 0 ? remoteId : null, email, groups };
+  });
+  return {
+    bindingId: value.bindingId.slice(0, 200), checkedAt: new Date(value.checkedAt).toISOString(),
+    groupIds: [...new Set((Array.isArray(value.groupIds) ? value.groupIds : []).map(Number).filter((id) => Number.isSafeInteger(id) && id > 0))],
+    scanned: count(value.scanned), inScope: count(value.inScope), outsideScope: count(value.outsideScope),
+    truncated: value.truncated === true || (value.items?.length || 0) > MAX_SUB2API_ANOMALY_ITEMS,
+    omitted: count(value.omitted) + Math.max(0, (value.items?.length || 0) - MAX_SUB2API_ANOMALY_ITEMS), items,
+  };
+}
+
+async function classifySub2ApiAnomalies(config, source) {
+  const report = sanitizeSub2ApiAnomalyReport(source);
+  if (!report) throw httpError(409, "异常记录结果不可读取，请重新执行巡检");
+  const bindingsByEmail = new Map();
+  const items = await Promise.all(report.items.map(async (item) => {
+    if (!item.email) return { ...item, jobId: null, status: "missing_email", message: `远端${item.remoteId ? ` #${item.remoteId}` : "记录"} 缺少邮箱，无法筛选` };
+    if (!bindingsByEmail.has(item.email)) bindingsByEmail.set(item.email, getSub2ApiRemoteBindings(config, item.email));
+    const bindings = await bindingsByEmail.get(item.email);
+    const bound = item.remoteId && (bindings.some((row) => Number(row.remoteId ?? row.remote_id ?? row.id) === item.remoteId)
+      || !options.getRemoteBindings && options.remoteBound?.(monitorBackendIdentity(config), item.remoteId));
+    if (!bound) return { ...item, jobId: null, status: "unlinked", message: `${item.email} 未关联` };
+    const job = findJobByEmail(item.email);
+    if (!job) return { ...item, jobId: null, status: "missing_task", message: `${item.email} 已关联，但本地无任务` };
+    return { ...item, jobId: job.id, status: "linked", message: `${item.email} 已关联，可筛选操作` };
+  }));
+  return { ...report, available: true, items,
+    filterable: items.filter((item) => item.status === "linked").length,
+    unlinked: items.filter((item) => item.status === "unlinked").length,
+    missingLocal: items.filter((item) => item.status === "missing_task").length,
+    missingEmail: items.filter((item) => item.status === "missing_email").length };
+}
+
+async function currentSub2ApiAnomalyReport() {
+  const config = sub2ApiMonitorConfig;
+  const stored = sub2ApiMonitorState.anomalies;
+  if (!config || !stored || stored.bindingId !== monitorBackendIdentity(config)) return {
+    available: false, checkedAt: null, groupIds: config?.groupIds || [], scanned: 0, inScope: 0, filterable: 0,
+    unlinked: 0, missingLocal: 0, missingEmail: 0, outsideScope: 0, truncated: false, omitted: 0, items: [],
+    message: stored ? "Sub2API 配置已变化，请按当前配置重新巡检" : "尚无异常记录结果，请先执行巡检",
+  };
+  const report = await classifySub2ApiAnomalies(config, stored);
+  if (!sub2ApiMonitorConfig || stored.bindingId !== monitorBackendIdentity(sub2ApiMonitorConfig)) return {
+    available: false, checkedAt: null, groupIds: sub2ApiMonitorConfig?.groupIds || [], scanned: 0, inScope: 0, filterable: 0,
+    unlinked: 0, missingLocal: 0, missingEmail: 0, outsideScope: 0, truncated: false, omitted: 0, items: [],
+    message: "Sub2API 配置已变化，请按当前配置重新巡检",
+  };
+  return report;
 }
 
 function publicSub2ApiMonitorState() {
@@ -3904,6 +4008,7 @@ function publicSub2ApiMonitorState() {
     nextCheckAt: sub2ApiMonitorState.nextCheckAt,
     lastError: sub2ApiMonitorState.lastError,
     lastResult: sub2ApiMonitorState.lastResult,
+    anomaliesAvailable: Boolean(sub2ApiMonitorConfig && sub2ApiMonitorState.anomalies?.bindingId === monitorBackendIdentity(sub2ApiMonitorConfig)),
   };
 }
 
@@ -3949,6 +4054,10 @@ async function runSub2ApiMonitor(trigger = "scheduled") {
       cooldown: 0,
       outsideGroups: 0,
       missingEmail: 0,
+      inScope: 0,
+      filterable: 0,
+      unlinked: 0,
+      missingLocal: 0,
     };
     try {
       await syncCompletedOutputs(true);
@@ -3957,12 +4066,24 @@ async function runSub2ApiMonitor(trigger = "scheduled") {
       const remoteAccounts = await listSub2ApiErrorAccounts(config);
       assertMonitorContext(config, monitorBackendIdentity(config));
       summary.checked = remoteAccounts.length;
+      const anomalySource = [];
+      let anomalyInScope = 0, anomalyOutsideScope = 0, anomalyOmitted = 0;
       const grouped = new Map();
       for (const account of remoteAccounts) {
+        const inGroups = isSub2ApiAccountInMonitoredGroups(account, config.groupIds);
+        if (inGroups) {
+          anomalyInScope += 1;
+          if (account.extra?.tosub2_cdk_id && account.extra.tosub2_cdk_id !== options.cdkId) anomalyOutsideScope += 1;
+          else if (anomalySource.length < MAX_SUB2API_ANOMALY_ITEMS) anomalySource.push({
+            remoteId: Number(account.id), email: sub2ApiAccountEmail(account), groups: publicSub2ApiAccount(account).groups,
+          });
+          else anomalyOmitted += 1;
+        }
         const remoteId = Number(account.id);
         if (!Number.isSafeInteger(remoteId) || remoteId <= 0) { summary.missingTask += 1; continue; }
         if (account.extra?.tosub2_cdk_id === options.cdkId && account.extra?.tosub2_config_id === monitorBackendIdentity(config) && findJobByEmail(sub2ApiAccountEmail(account))) options.bindRemote(monitorBackendIdentity(config), account.id, sub2ApiAccountEmail(account));
         if (!options.remoteBound(monitorBackendIdentity(config), account.id)) { summary.outsideGroups += 1; continue; }
+        if (account.extra?.tosub2_cdk_id && account.extra.tosub2_cdk_id !== options.cdkId) { summary.outsideGroups += 1; continue; }
         if (!isSub2ApiAccountInMonitoredGroups(account, config.groupIds)) {
           summary.outsideGroups += 1;
           continue;
@@ -4014,7 +4135,19 @@ async function runSub2ApiMonitor(trigger = "scheduled") {
         });
       }
 
-      sub2ApiMonitorState.lastCheckAt = new Date().toISOString();
+      const checkedAt = new Date().toISOString();
+      const anomalies = await classifySub2ApiAnomalies(config, {
+        bindingId: monitorBackendIdentity(config), checkedAt, groupIds: config.groupIds,
+        scanned: remoteAccounts.length, inScope: anomalyInScope, outsideScope: anomalyOutsideScope,
+        truncated: anomalyOmitted > 0, omitted: anomalyOmitted, items: anomalySource,
+      });
+      assertMonitorContext(config, anomalies.bindingId);
+      sub2ApiMonitorState.anomalies = sanitizeSub2ApiAnomalyReport(anomalies);
+      summary.inScope = anomalies.inScope;
+      summary.filterable = anomalies.filterable;
+      summary.unlinked = anomalies.unlinked;
+      summary.missingLocal = anomalies.missingLocal;
+      sub2ApiMonitorState.lastCheckAt = checkedAt;
       sub2ApiMonitorState.lastResult = summary;
       await persistSub2ApiMonitorConfiguration();
       return summary;
@@ -4165,6 +4298,54 @@ function sub2ApiConnectionIdentity(config) {
   const value = JSON.stringify({ cdkId: options.cdkId, baseUrl: normalized.baseUrl, adminApiKey: normalized.adminApiKey });
   const fingerprint = typeof options.fingerprint === "function" ? options.fingerprint(value) : crypto.createHash("sha256").update(value).digest("hex");
   return `sub2api-connection-v1:${fingerprint}`;
+}
+
+async function getSub2ApiRemoteBindings(config, email) {
+  for (const backend of new Set([sub2ApiConnectionIdentity(config), monitorBackendIdentity(config)])) {
+    const rows = await (options.getRemoteBindings ? options.getRemoteBindings(backend, email) : sub2ApiLocalBindings.get(`${backend}:${email}`) || []);
+    if (rows?.length) return [...new Map(rows.map((row) => [String(row.remoteId ?? row.remote_id ?? row.id), row])).values()];
+  }
+  return [];
+}
+
+function sub2ApiSnapshotBindingIds(rows) {
+  return [...new Set(rows.map((row) => Number(row.remoteId ?? row.remote_id ?? row.id)).filter((id) => Number.isSafeInteger(id) && id > 0))].sort((left, right) => left - right);
+}
+
+async function saveSub2ApiLinkSnapshot(config, email, snapshot) {
+  const normalizedEmail = email.trim().toLowerCase();
+  const backend = sub2ApiConnectionIdentity(config);
+  const safe = { status: snapshot.status, message: snapshot.message, accounts: snapshot.accounts || [],
+    email: normalizedEmail, checkedAt: snapshot.checkedAt ?? null, metadataComplete: snapshot.metadataComplete !== false,
+    bindingIds: sub2ApiSnapshotBindingIds(await getSub2ApiRemoteBindings(config, normalizedEmail)),
+    ...(snapshot.refreshError ? { refreshError: snapshot.refreshError, refreshErrorAt: snapshot.refreshErrorAt || null } : {}) };
+  if (options.saveSub2ApiLinkSnapshot) await options.saveSub2ApiLinkSnapshot(backend, normalizedEmail, safe);
+  sub2ApiLocalSnapshots.set(`${backend}:${normalizedEmail}`, safe);
+  return safe;
+}
+
+async function cachedSub2ApiLinks(config, selected) {
+  const backend = sub2ApiConnectionIdentity(config);
+  const emails = selected.map((job) => job.email.toLowerCase());
+  const snapshots = options.getSub2ApiLinkSnapshots ? await options.getSub2ApiLinkSnapshots(backend, emails)
+    : emails.map((email) => sub2ApiLocalSnapshots.get(`${backend}:${email}`)).filter(Boolean);
+  const byEmail = new Map(snapshots.map((snapshot) => [snapshot.email, snapshot]));
+  return Promise.all(selected.map(async (job) => {
+    const email = job.email.toLowerCase();
+    const ids = sub2ApiSnapshotBindingIds(await getSub2ApiRemoteBindings(config, email));
+    const snapshot = byEmail.get(email);
+    const snapshotIds = Array.isArray(snapshot?.bindingIds) ? [...snapshot.bindingIds].sort((left, right) => left - right)
+      : snapshot?.status === "linked" ? (snapshot.accounts || []).map((account) => Number(account.id)).sort((left, right) => left - right) : null;
+    if (snapshot && snapshotIds && JSON.stringify(ids) === JSON.stringify(snapshotIds)
+      && (snapshot.status !== "linked" || ids.length === 1 && snapshot.accounts?.length === 1 && Number(snapshot.accounts[0].id) === ids[0])) {
+      return { ...snapshot, id: job.id, email, cached: true };
+    }
+    if (ids.length > 1) return { id: job.id, email, status: "conflict", message: "本地已有多个远端关联，请明确目标后更新关联", accounts: [], checkedAt: null, cached: true };
+    if (ids.length === 1) return { id: job.id, email, status: "linked", message: "已保存关联关系，分组与状态详情尚未保存，可手动更新一次",
+      accounts: [{ id: ids[0], status: "unknown", groups: [], schedulable: null, proxyId: null, concurrency: null, loadFactor: null, priority: null }],
+      checkedAt: null, cached: true, metadataComplete: false };
+    return { id: job.id, email, status: "unlinked", message: "尚未关联，推送前预检将核对远端账号", accounts: [], checkedAt: null, cached: true };
+  }));
 }
 
 async function bindSub2ApiRemote(config, remoteId, email) {
@@ -6103,6 +6284,7 @@ return {
     if (!account || account.platform !== "openai" || account.type !== "oauth" || sub2ApiAccountEmail(account) !== local.email.toLowerCase()) throw httpError(409, "远端账号与当前邮箱或授权类型不匹配");
     if (account.extra?.tosub2_cdk_id && account.extra.tosub2_cdk_id !== options.cdkId) throw httpError(409, "远端账号已属于其他 CDK，无法关联");
     await bindSub2ApiRemote(config, id, local.email);
+    await saveSub2ApiLinkSnapshot(config, local.email, { status: "linked", message: "已关联", accounts: [publicSub2ApiAccount(account)], checkedAt: new Date().toISOString(), metadataComplete: true });
   },
   inventory() { return [...new Set([...listUniqueJobs().map((job) => job.email.toLowerCase()), ...mfaWorkspace.list().accounts.map((account) => account.email.toLowerCase())])]; },
   publicJobs: () => listUniqueJobs().map(publicJob),

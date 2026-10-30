@@ -163,6 +163,8 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
         writeMonitor: async (value) => store.saveSetting(id, "monitor", value),
         remoteBound: (backend, remoteId) => store.remoteBound(id, backend, remoteId),
         getRemoteBindings: (backend, email) => store.getRemoteBindings(id, backend, email),
+        getSub2ApiLinkSnapshots: (backend, emails) => store.getSub2ApiLinkSnapshots(id, backend, emails),
+        saveSub2ApiLinkSnapshot: (backend, email, snapshot) => store.saveSub2ApiLinkSnapshot(id, backend, email, snapshot),
         replaceRemoteBinding: (backend, remoteId, email) => store.replaceRemoteBinding(id, backend, remoteId, email),
         bindRemote: (backend, remoteId, email) => store.bindRemote(id, backend, remoteId, email),
         fingerprint: vault.fingerprint,

@@ -12,6 +12,41 @@ const normalizeSmsPermissions = (value) => {
   return CDK_SMS_PROVIDER_IDS.filter((id) => id === "custom" || value.includes(id));
 };
 
+const sub2ApiLinkStatuses = new Set(["linked", "unlinked", "conflict", "missing", "error"]);
+const sub2ApiRemoteStatuses = new Set(["active", "error", "disabled", "expired", "unknown"]);
+const snapshotEmail = (value) => typeof value === "string" ? value.trim().toLowerCase() : "";
+const snapshotInteger = (value) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+const snapshotDate = (value) => typeof value === "string" && Number.isFinite(Date.parse(value)) ? new Date(value).toISOString() : null;
+const snapshotMessage = (value) => (typeof value === "string" ? value : "")
+  .replace(/Bearer\s+\S+/gi, "Bearer [redacted]")
+  .replace(/((?:access_token|refresh_token|id_token|api[_ -]?key|authorization)["']?\s*[:=]\s*["']?)[^"',}\s]+/gi, "$1[redacted]")
+  .replace(/\badmin-[A-Za-z0-9_-]{16,}\b/g, "[redacted]")
+  .replace(/\beyJ[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+){1,2}\b/g, "[redacted]")
+  .replace(/[\r\n\t]+/g, " ").trim().slice(0, 500);
+function safeSub2ApiLinkSnapshot(email, value = {}) {
+  const accounts = (Array.isArray(value.accounts) ? value.accounts : []).slice(0, 20).flatMap((account) => {
+    const remoteId = snapshotInteger(account?.id);
+    if (!remoteId) return [];
+    const groups = (Array.isArray(account.groups) ? account.groups : []).slice(0, 100).flatMap((group) => {
+      const id = snapshotInteger(group?.id);
+      return id ? [{ id, name: snapshotMessage(group.name).slice(0, 160) || `分组 ${id}` }] : [];
+    });
+    return [{ id: remoteId, platform: account.platform === "openai" ? "openai" : null,
+      type: ["oauth", "apikey", "setup-token"].includes(account.type) ? account.type : null,
+      status: sub2ApiRemoteStatuses.has(account.status) ? account.status : "unknown",
+      schedulable: typeof account.schedulable === "boolean" ? account.schedulable : null,
+      proxyId: snapshotInteger(account.proxyId) || null, concurrency: snapshotInteger(account.concurrency),
+      loadFactor: snapshotInteger(account.loadFactor), priority: snapshotInteger(account.priority), groups }];
+  });
+  return { email, status: sub2ApiLinkStatuses.has(value.status) ? value.status : "error",
+    message: snapshotMessage(value.message), checkedAt: snapshotDate(value.checkedAt), accounts,
+    metadataComplete: value.metadataComplete === true,
+    bindingIds: [...new Set((Array.isArray(value.bindingIds) ? value.bindingIds : []).map(snapshotInteger).filter((id) => id > 0))].slice(0, 20),
+    ...(typeof value.stale === "boolean" ? { stale: value.stale } : {}),
+    ...(value.refreshError ? { refreshError: snapshotMessage(value.refreshError) } : {}),
+    ...(snapshotDate(value.refreshErrorAt) ? { refreshErrorAt: snapshotDate(value.refreshErrorAt) } : {}) };
+}
+
 export async function createCdkStore(root, vault) {
   const directory = path.join(root, ".cdk");
   const databasePath = path.join(directory, "cdk.sqlite");
@@ -40,6 +75,7 @@ export async function createCdkStore(root, vault) {
     CREATE TABLE IF NOT EXISTS verification_attempts (id INTEGER PRIMARY KEY,ip TEXT NOT NULL,created_at INTEGER NOT NULL,failed INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS ip_bans (id TEXT PRIMARY KEY,ip TEXT NOT NULL,source TEXT NOT NULL,reason TEXT NOT NULL,actor TEXT NOT NULL,created_at INTEGER NOT NULL,expires_at INTEGER,revoked_at INTEGER);
     CREATE TABLE IF NOT EXISTS sub2api_bindings (cdk_id TEXT NOT NULL REFERENCES cdks(id),backend TEXT NOT NULL,remote_id TEXT NOT NULL,email TEXT NOT NULL,PRIMARY KEY(cdk_id,backend,remote_id));
+    CREATE TABLE IF NOT EXISTS sub2api_link_snapshots (cdk_id TEXT NOT NULL REFERENCES cdks(id),backend TEXT NOT NULL,email TEXT NOT NULL,payload TEXT NOT NULL,updated_at INTEGER NOT NULL,PRIMARY KEY(cdk_id,backend,email));
     CREATE TABLE IF NOT EXISTS sms_pool_operations (id TEXT NOT NULL,cdk_id TEXT NOT NULL REFERENCES cdks(id),job_id TEXT NOT NULL,email TEXT NOT NULL,run_id TEXT NOT NULL,status TEXT NOT NULL,fee INTEGER NOT NULL CHECK(fee>=0),payload TEXT NOT NULL,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,PRIMARY KEY(cdk_id,id));
     CREATE UNIQUE INDEX IF NOT EXISTS sms_pool_active_job ON sms_pool_operations(cdk_id,job_id) WHERE status NOT IN ('verified','released');
     CREATE INDEX IF NOT EXISTS sms_pool_owner_time ON sms_pool_operations(cdk_id,created_at DESC);
@@ -762,6 +798,27 @@ export async function createCdkStore(root, vault) {
         db.prepare("DELETE FROM sub2api_bindings WHERE cdk_id=? AND backend=? AND email=?").run(id, backend, normalizedEmail);
         store.bindRemote(id, backend, remoteId, normalizedEmail);
       });
+    },
+    getSub2ApiLinkSnapshots(id, backend, emails) {
+      if (!Array.isArray(emails) || !emails.length) return [];
+      const requested = [...new Set(emails.map(snapshotEmail).filter(Boolean))];
+      if (requested.length > 500) throw cdkError(422, "每次最多读取 500 个关联结果");
+      if (!requested.length) return [];
+      const rows = db.prepare(`SELECT email,payload,updated_at FROM sub2api_link_snapshots WHERE cdk_id=? AND backend=? AND email IN (${requested.map(() => "?").join(",")})`).all(id, backend, ...requested);
+      const snapshots = new Map(rows.map((row) => [row.email, {
+        ...safeSub2ApiLinkSnapshot(row.email, vault.open(row.payload, `sub2api-link:${id}:${backend}:${row.email}`)),
+        updatedAt: new Date(row.updated_at).toISOString(),
+      }]));
+      return requested.flatMap((email) => snapshots.has(email) ? [snapshots.get(email)] : []);
+    },
+    saveSub2ApiLinkSnapshot(id, backend, email, value) {
+      const normalizedEmail = snapshotEmail(email);
+      if (!normalizedEmail || normalizedEmail.length > 320 || typeof backend !== "string" || !backend || backend.length > 512) throw cdkError(422, "关联结果范围不正确");
+      const snapshot = safeSub2ApiLinkSnapshot(normalizedEmail, value);
+      const updatedAt = Date.now();
+      db.prepare("INSERT INTO sub2api_link_snapshots VALUES(?,?,?,?,?) ON CONFLICT(cdk_id,backend,email) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at")
+        .run(id, backend, normalizedEmail, vault.seal(snapshot, `sub2api-link:${id}:${backend}:${normalizedEmail}`), updatedAt);
+      return { ...snapshot, updatedAt: new Date(updatedAt).toISOString() };
     },
     remoteBound(id, backend, remoteId) { return Boolean(db.prepare("SELECT 1 FROM sub2api_bindings WHERE cdk_id=? AND backend=? AND remote_id=?").get(id, backend, String(remoteId))); },
     cleanup() { const now = Date.now(); const rules = store.rules(); db.prepare("DELETE FROM sessions WHERE expires_at<? OR last_seen<?").run(now, now - 2 * 60 * 60000); db.prepare("DELETE FROM verification_attempts WHERE created_at<?").run(now - Math.max(24 * 60, rules.failureWindowMinutes) * 60000); db.prepare("DELETE FROM security_events WHERE last_at<?").run(now - rules.retentionDays * 86400000); },

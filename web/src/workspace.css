@@ -101,11 +101,26 @@ tr:last-child td { border-bottom: 0; }
 .authorization-table th:nth-child(7) { width: 12%; }
 .sub2api-link-controls, .sub2api-link-controls label { display: inline-flex; align-items: center; gap: 7px; }
 .sub2api-link-controls { flex-wrap: wrap; gap: 8px 12px; }
+.sub2api-anomaly-tools { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 14px 0; color: var(--muted); font-size: 12px; }
+.sub2api-anomaly-filter { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; margin: 12px 0; border: 1px solid var(--line); background: var(--green-soft); color: var(--green-strong); border-radius: 7px; font-size: 12px; }
+.sub2api-anomaly-report { margin: 12px 0 18px; padding: 12px 0; border-block: 1px solid var(--line); font-size: 12px; }
+.sub2api-anomaly-report > div { display: flex; flex-wrap: wrap; gap: 8px 18px; align-items: baseline; }
+.sub2api-anomaly-report small, .sub2api-anomaly-report p { color: var(--muted); font-size: 12px; }
+.sub2api-anomaly-report p { margin: 8px 0; }
+.sub2api-anomaly-report details { margin-top: 10px; }
+.sub2api-anomaly-report summary { color: var(--amber); cursor: pointer; }
+.sub2api-anomaly-report ul { margin: 8px 0 0; padding: 0; max-height: 240px; overflow: auto; list-style: none; }
+.sub2api-anomaly-report li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 12px; padding: 7px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.sub2api-anomaly-report li:last-child { border-bottom: 0; }
+.sub2api-anomaly-report li > span, .sub2api-anomaly-error { color: var(--amber); }
+.sub2api-anomaly-error { margin: 10px 0; font-size: 12px; }
 .sub2api-link-controls label { min-height: 32px; color: var(--muted); font-size: 12px; cursor: pointer; }
 .sub2api-link-summary { display: grid; gap: 4px; min-width: 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
 .sub2api-link-summary strong { color: var(--ink); font-weight: 500; }
 .sub2api-link-summary > div { display: grid; gap: 2px; }
 .sub2api-link-summary small { font-size: 12px; overflow-wrap: anywhere; }
+.sub2api-link-saved-at { color: var(--muted); font-weight: 400; }
+.sub2api-link-refresh-error { color: var(--amber); }
 .sub2api-group-tags { display: inline-flex; align-items: flex-start; flex-wrap: wrap; gap: 5px; min-width: 0; max-width: 100%; }
 .sub2api-group-tag { display: inline-flex; align-items: center; min-width: 0; max-width: 100%; min-height: 24px; padding: 2px 9px; border: 1px solid var(--group-tag-border); border-radius: 999px; background: var(--group-tag-bg); color: var(--group-tag-ink); font-size: 12px; font-weight: 600; line-height: 1.5; overflow-wrap: anywhere; white-space: normal; }
 .sub2api-group-tag--blue { --group-tag-bg: #dbeafe; --group-tag-ink: #1d4ed8; --group-tag-border: #93c5fd; }
@@ -365,6 +380,8 @@ input::placeholder, textarea::placeholder { color: var(--muted); opacity: 1; }
 @media (min-width: 1600px) { .workspace { padding-left: 40px; padding-right: 40px; } .authorization-table th:nth-child(3) { width: 27%; } }
 @media (pointer: coarse) { .sub2api-link-controls label, .sub2api-link-controls button { min-height: 44px; } }
 @media (max-width: 640px) {
+  .sub2api-anomaly-tools, .sub2api-anomaly-filter { align-items: flex-start; flex-wrap: wrap; }
+  .sub2api-anomaly-tools .secondary-button { min-height: 40px; }
   .sub2api-link-detail-grid { grid-template-columns: minmax(0, 1fr); }
   .sub2api-link-detail-groups { grid-column: auto; }
   .modal-backdrop.sub2api-push-backdrop { padding: 12px; }

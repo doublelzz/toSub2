@@ -47,6 +47,8 @@ function unwrap(payload) {
 }
 
 function publicAccount(account) {
+  const optionalInteger = (value) => value === null || value === undefined || value === "" ? null
+    : Number.isSafeInteger(Number(value)) ? Number(value) : null;
   const names = new Map();
   for (const group of Array.isArray(account.groups) ? account.groups : []) {
     const id = positiveId(group?.id); if (id) names.set(id, text(group.name) || `分组 ${id}`);
@@ -60,11 +62,12 @@ function publicAccount(account) {
   const activeIds = Array.isArray(account.group_ids) ? new Set(account.group_ids.map(positiveId).filter(Boolean)) : null;
   return { id: Number(account.id), platform: text(account.platform) || null, type: text(account.type) || null,
     status: text(account.status) || "unknown", schedulable: typeof account.schedulable === "boolean" ? account.schedulable : null,
-    proxyId: positiveId(account.proxy_id), concurrency: Number.isSafeInteger(Number(account.concurrency)) ? Number(account.concurrency) : null,
-    loadFactor: Number.isSafeInteger(Number(account.load_factor)) ? Number(account.load_factor) : null,
-    priority: Number.isSafeInteger(Number(account.priority)) ? Number(account.priority) : null,
+    proxyId: positiveId(account.proxy_id), concurrency: optionalInteger(account.concurrency),
+    loadFactor: optionalInteger(account.load_factor), priority: optionalInteger(account.priority),
     groups: [...names].filter(([id]) => !activeIds || activeIds.has(id)).map(([id, name]) => ({ id, name })) };
 }
+
+export { publicAccount as publicSub2ApiAccount };
 
 function targetFingerprint(account) {
   return crypto.createHash("sha256").update(JSON.stringify({

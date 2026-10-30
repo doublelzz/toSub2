@@ -34,6 +34,9 @@ const rows = ["one", "two", "three", "four"].map((id) => ({ id, email: id + "@fi
 let largePage = false;
 const pendingLinks = []; const pendingPreviews = []; const pendingUploads = [];
 const linkRequests = []; const previews = []; const uploads = [];
+const cacheRequests = []; const cachedItems = new Map();
+const pendingCache = []; let holdCacheRead = false;
+const cacheKey = (value) => JSON.stringify([value.baseUrl.replace(/\/+$/, ""), value.adminApiKey]);
 const { App, Sub2ApiPushPreview } = await load("../web/src/main.jsx", ["App", "Sub2ApiPushPreview"], {
   ...filters, ...smsOptions, ...ui,
   MfaWorkspace: () => null, EmailRebindWorkspace: () => null, OfferWorkspace: () => null, SmsPoolWorkspace: () => null,
@@ -48,8 +51,21 @@ const { App, Sub2ApiPushPreview } = await load("../web/src/main.jsx", ["App", "S
       return Response.json({ jobs: largePage ? rows : rows.slice((page - 1) * 2, page * 2), selection: rows, stats: {}, pagination: { page, total: rows.length, totalPages: 2, pageSize: 2 } });
     }
     if (url === "/api/sub2api/links") {
-      linkRequests.push(JSON.parse(options.body));
-      return new Promise((resolve) => pendingLinks.push((data, status = 200) => resolve(Response.json(data, { status }))));
+      const body = JSON.parse(options.body); linkRequests.push(body);
+      return new Promise((resolve) => pendingLinks.push((data, status = 200) => {
+        if (status === 200) {
+          const previous = cachedItems.get(cacheKey(body.config)) || new Map();
+          for (const item of data.items || []) if (item.status === "linked" && (!previous.has(item.id) || Date.parse(item.checkedAt || "") >= Date.parse(previous.get(item.id)?.checkedAt || ""))) previous.set(item.id, { ...item, cached: true });
+          cachedItems.set(cacheKey(body.config), previous);
+        }
+        resolve(Response.json(data, { status }));
+      }));
+    }
+    if (url === "/api/sub2api/links-cache") {
+      const body = JSON.parse(options.body); cacheRequests.push(body);
+      const previous = cachedItems.get(cacheKey(body.config)) || new Map();
+      const response = { configured: true, items: body.ids.map((id) => previous.get(id)).filter(Boolean) };
+      return holdCacheRead ? new Promise((resolve) => pendingCache.push(() => resolve(Response.json(response)))) : Response.json(response);
     }
     if (url === "/api/sub2api/upload-preview") {
       previews.push(JSON.parse(options.body));
@@ -57,8 +73,15 @@ const { App, Sub2ApiPushPreview } = await load("../web/src/main.jsx", ["App", "S
     }
     if (url === "/api/sub2api/monitor") return Response.json({ enabled: false, configured: true });
     if (url === "/api/sub2api/upload") {
-      uploads.push(JSON.parse(options.body));
-      return new Promise((resolve) => pendingUploads.push((data, status = 200) => resolve(Response.json(data, { status }))));
+      const body = JSON.parse(options.body); uploads.push(body);
+      return new Promise((resolve) => pendingUploads.push((data, status = 200) => {
+        if (status === 200) {
+          const previous = cachedItems.get(cacheKey(body.config)) || new Map();
+          for (const row of data.result?.results || []) if (row.success && row.accounts?.length) previous.set(row.jobId || row.id, { id: row.jobId || row.id, status: "linked", accounts: row.accounts, checkedAt: row.checkedAt, metadataComplete: true, cached: true });
+          cachedItems.set(cacheKey(body.config), previous);
+        }
+        resolve(Response.json(data, { status }));
+      }));
     }
     throw new Error("Unexpected request " + url);
   },
@@ -68,7 +91,7 @@ const byText = (label, scope = container) => [...scope.querySelectorAll("button"
 const clickText = (label, scope) => act(async () => { const button = byText(label, scope); assert.ok(button, "Missing button " + label); button.click(); });
 const resolveNext = (queue, data, status) => act(async () => { assert.ok(queue.length); queue.shift()(data, status); });
 const queryButton = () => container.querySelector(".sub2api-link-controls button");
-const linked = (id, name) => ({ id, status: "linked", accounts: [{ id: 71, platform: "openai", type: "oauth", status: "active", schedulable: true, proxyId: 3, concurrency: 12, loadFactor: 80, priority: 2, groups: [{ id: 7, name }] }] });
+const linked = (id, name) => ({ id, status: "linked", checkedAt: "2026-10-30T00:00:00.000Z", metadataComplete: true, accounts: [{ id: 71, platform: "openai", type: "oauth", status: "active", schedulable: true, proxyId: 3, concurrency: 12, loadFactor: 80, priority: 2, groups: [{ id: 7, name }] }] });
 const preview = (changes = {}) => ({
   previewToken: "synthetic-preview-token", expiresAt: new Date(Date.now() + 300000).toISOString(),
   selected: 2, created: 1, updated: 1, blocked: 1, skipped: 0, canPush: true,
@@ -94,6 +117,7 @@ try {
   assert.equal(queryButton(), null, "hidden association column has no query action");
   await click('[aria-label="显示 Sub2API 关联"]');
   assert.equal(queryButton().disabled, true, "zero selection disables manual query");
+  assert.equal(cacheRequests.length, 1, "showing the column loads saved local metadata once without contacting the remote service");
   assert.equal(linkRequests.length, 0, "showing the column must not query");
   assert.match(container.querySelector(".sub2api-link-column").textContent, /未查询，勾选账号后查询/);
   await click('[aria-label="选择 one@fixture.invalid"]');
@@ -122,6 +146,9 @@ try {
   await click('[aria-label="关闭面板"]');
   await act(async () => new Promise((resolve) => window.setTimeout(resolve, 1000)));
   assert.equal(linkRequests.length, 1, "ordinary polling must not query");
+  const cacheReadsAfterPolling = cacheRequests.length;
+  await act(async () => new Promise((resolve) => window.setTimeout(resolve, 1000)));
+  assert.equal(cacheRequests.length, cacheReadsAfterPolling, "routine polling does not reload local metadata repeatedly");
   await click('[aria-label="显示 Sub2API 关联"]');
   await click('[aria-label="显示 Sub2API 关联"]');
   assert.equal(linkRequests.length, 1, "toggle only controls visibility");
@@ -129,8 +156,16 @@ try {
 
   await act(async () => queryButton().click());
   await resolveNext(pendingLinks, { error: "fixture failure synthetic-links-key" }, 502);
-  assert.match(container.querySelector(".sub2api-link-column").textContent, /查询失败/);
+  assert.match(container.querySelector(".sub2api-link-column").textContent, /已关联.*Plus <script>/);
+  assert.match(container.querySelector(".sub2api-link-column").textContent, /刷新失败，保留上次结果/);
+  assert.match(container.querySelector(".sub2api-link-column").textContent, /结果更新于/);
   assert.doesNotMatch(container.textContent, /synthetic-links-key/);
+  await act(async () => queryButton().click());
+  await resolveNext(pendingLinks, { items: [{ id: "one", status: "missing", accounts: [], message: "远端账号已删除", checkedAt: "2026-10-30T00:02:00.000Z" }] });
+  assert.match(container.querySelector(".sub2api-link-column").textContent, /远端已删除/);
+  assert.equal(container.querySelector(".sub2api-link-column .sub2api-group-tags"), null, "a confirmed missing account clears old linked metadata instead of retaining it as a refresh error");
+  await act(async () => queryButton().click());
+  await resolveNext(pendingLinks, { items: [linked("one", "Restored group")] });
 
   await clickText("上传到 Sub2API", container.querySelector(".selection-toolbar"));
   assert.equal(previews.length, 1); assert.equal(uploads.length, 0);
@@ -164,9 +199,10 @@ try {
   assert.equal(container.querySelector('[aria-label="关闭推送预检"]').disabled, true);
   assert.equal(byText("取消", container.querySelector(".sub2api-push-dialog")).disabled, true);
   const queriesBeforePush = linkRequests.length;
-  await resolveNext(pendingUploads, { created: 0, updated: 1, linked: 1, uploaded: 1, result: { results: [] }, rows: [] });
+  await resolveNext(pendingUploads, { created: 0, updated: 1, linked: 1, uploaded: 1, result: { results: [{ id: "one", jobId: "one", success: true, accounts: [{ ...linked("one", "Pushed group").accounts[0], id: 72 }], checkedAt: "2026-10-30T00:05:00.000Z" }] }, rows: [] });
   assert.match(container.querySelector(".global-success").textContent, /已更新 1 条，已关联 1 条/);
   assert.equal(linkRequests.length, queriesBeforePush, "successful push does not query remote associations");
+  assert.match(container.querySelector(".sub2api-link-column").textContent, /已关联.*远端 #72.*Pushed group/);
 
   await click('[aria-label="选择 one@fixture.invalid"]');
   await act(async () => queryButton().click());
@@ -195,6 +231,30 @@ try {
   assert.equal(confirms, 0);
   await act(async () => document.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
   assert.equal(closes, 1);
+
+  saved.set("chatgpt-onboarding.sub2api-upload-settings-v1", JSON.stringify(config));
+  const remoteQueriesBeforeReload = linkRequests.length;
+  await act(async () => root.render(React.createElement(App, { key: "restored-saved-association", auth })));
+  assert.equal(linkRequests.length, remoteQueriesBeforeReload, "reloading a workspace restores saved associations without a remote request");
+  assert.match(container.querySelector(".sub2api-link-column").textContent, /已关联.*远端 #72.*Pushed group.*结果更新于/);
+  assert.equal(container.querySelector(".sub2api-link-column time").dateTime, "2026-10-30T00:05:00.000Z", "restored metadata retains its actual check time after a successful push");
+  assert.equal(saved.has("tosub2.sub2api-links-cache"), false, "association snapshots are not written to browser storage");
+
+  cachedItems.set(cacheKey(config), new Map([["one", { id: "one", status: "linked", accounts: [{ id: 490, groups: [], status: "unknown" }], metadataComplete: false, checkedAt: null, cached: true }]]));
+  await act(async () => root.render(React.createElement(App, { key: "legacy-saved-association", auth })));
+  assert.match(container.querySelector(".sub2api-link-column").textContent, /已关联.*远端 #490.*分组待更新.*详情待更新/);
+  assert.equal(linkRequests.length, remoteQueriesBeforeReload, "legacy associations never trigger an automatic remote metadata backfill");
+
+  holdCacheRead = true;
+  await act(async () => root.render(React.createElement(App, { key: "cache-response-race", auth })));
+  await click('[aria-label="选择 one@fixture.invalid"]');
+  await act(async () => queryButton().click());
+  await resolveNext(pendingLinks, { items: [linked("one", "Fresh manual result")] });
+  assert.ok(pendingCache.length);
+  await act(async () => pendingCache.shift()());
+  assert.match(container.querySelector(".sub2api-link-column").textContent, /已关联.*Fresh manual result/);
+  assert.doesNotMatch(container.querySelector(".sub2api-link-column").textContent, /远端 #490/, "a late local-cache response cannot replace newer manual lookup metadata");
+  holdCacheRead = false;
 
   saved.set("chatgpt-onboarding.sub2api-upload-settings-v1", JSON.stringify({}));
   await act(async () => root.render(React.createElement(App, { key: "unconfigured", auth })));
