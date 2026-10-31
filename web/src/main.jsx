@@ -20,6 +20,7 @@ import {
   LogIn,
   Mail,
   MailCheck,
+  Megaphone,
   Plus,
   RefreshCw,
   RotateCcw,
@@ -41,6 +42,8 @@ import SmsPoolWorkspace, { SmsPoolChoice, SmsPoolChargeDialog } from "./SmsPoolW
 import CdkGate from "./CdkGate.jsx";
 import CdkWorkspace from "./CdkWorkspace.jsx";
 import CurrentCdk from "./CurrentCdk.jsx";
+import AnnouncementEntry from "./AnnouncementEntry.jsx";
+import { AnnouncementManager } from "./Announcement.jsx";
 import { cdkFetch, flushWorkspaceSettings, readWorkspaceValue, writeWorkspaceValue } from "./cdk-api.mjs";
 import SmsPriceSelector from "./SmsPriceSelector.jsx";
 import { filterSmsOptionsByGrade, findSmsNumberOption, preferredSmsNumberOption } from "./sms-number-options.mjs";
@@ -83,7 +86,17 @@ function PhoneBindingOption({ enabled, onChange, disabled }) {
 
 function App({ auth }) {
   const [adminView, setAdminView] = useState(auth.account.role === "admin" && auth.account.id === auth.workspace.id);
-  const [activeWorkspace, setActiveWorkspace] = useState(auth.account.role === "admin" && auth.account.id === auth.workspace.id ? "cdk-management" : "authorization");
+  const [activeWorkspace, updateActiveWorkspace] = useState(auth.account.role === "admin" && auth.account.id === auth.workspace.id ? "cdk-management" : "authorization");
+  const announcementEditor = useRef({ dirty: false, busy: false });
+  const reportAnnouncementState = useMemo(() => (value) => { announcementEditor.current = value; }, []);
+  function canLeaveAnnouncement() {
+    if (activeWorkspace !== "announcement") return true;
+    if (announcementEditor.current.busy) return false;
+    return !announcementEditor.current.dirty || window.confirm("公告有未保存的修改，离开后将丢失。确定离开？");
+  }
+  function setActiveWorkspace(next) {
+    if (next === activeWorkspace || canLeaveAnnouncement()) updateActiveWorkspace(next);
+  }
   const [mfaFocusAccountId, setMfaFocusAccountId] = useState(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [remoteBindingOpen, setRemoteBindingOpen] = useState(false);
@@ -1133,7 +1146,7 @@ function App({ auth }) {
   }
 
   return (
-    <main className={`app-shell density-${density}`}>
+    <main className={`app-shell density-${density}${activeWorkspace === "announcement" ? " announcement-editing" : ""}`}>
       <aside className="app-sidebar">
         <div className="brand-block"><div className="brand-mark"><ShieldCheck size={21} /></div><h1>账号工作台</h1></div>
         <nav className="workspace-tabs" aria-label="工作区">
@@ -1146,6 +1159,7 @@ function App({ auth }) {
             <button type="button" className={activeWorkspace === "sms-pool" ? "active" : ""} aria-pressed={activeWorkspace === "sms-pool"} onClick={() => setActiveWorkspace("sms-pool")}><Globe2 size={17} />接码池</button>
             <button type="button" className={activeWorkspace === "cdk-management" ? "active" : ""} aria-pressed={activeWorkspace === "cdk-management"} onClick={() => setActiveWorkspace("cdk-management")}><KeyRound size={17} />CDK 管理</button>
             <button type="button" className={activeWorkspace === "cdk-security" ? "active" : ""} aria-pressed={activeWorkspace === "cdk-security"} onClick={() => setActiveWorkspace("cdk-security")}><ShieldCheck size={17} />安全中心</button>
+            <button type="button" className={activeWorkspace === "announcement" ? "active" : ""} aria-pressed={activeWorkspace === "announcement"} onClick={() => setActiveWorkspace("announcement")}><Megaphone size={17} />公告管理</button>
           </>}
           <button type="button" className="sidebar-settings" onClick={() => setSettingsOpen(true)}><Settings2 size={17} />{auth.account.role === "admin" ? "系统配置" : "配置"}</button>
         </nav>
@@ -1153,22 +1167,25 @@ function App({ auth }) {
       </aside>
       <div className="workspace-content">
       <header className="topbar">
-        <div className="workspace-path"><span>工作区</span><ChevronRight size={14} /><strong>{({ authorization: "账号授权", mfa: "MFA 修改", rebind: "邮箱换绑", offers: "优惠检测", "sms-pool": "接码池", "cdk-mine": "我的 CDK", "cdk-management": "CDK 管理", "cdk-security": "安全中心" })[activeWorkspace]}</strong></div>
+        <div className="workspace-path"><span>工作区</span><ChevronRight size={14} /><strong>{({ authorization: "账号授权", mfa: "MFA 修改", rebind: "邮箱换绑", offers: "优惠检测", "sms-pool": "接码池", "cdk-mine": "我的 CDK", "cdk-management": "CDK 管理", "cdk-security": "安全中心", announcement: "公告管理" })[activeWorkspace]}</strong></div>
         <div className="topbar-actions cdk-session-actions">
+          {auth.announcement?.enabled && <AnnouncementEntry announcement={auth.announcement} />}
           <CurrentCdk auth={auth} onOpen={() => setActiveWorkspace("cdk-mine")} />
           {auth.account.role === "admin" && <button className="secondary-button" onClick={async () => {
+            if (!canLeaveAnnouncement()) return;
             try {
-              if (adminView) { setAdminView(false); setActiveWorkspace("authorization"); }
+              if (adminView) { setAdminView(false); updateActiveWorkspace("authorization"); }
               else if (auth.workspace.id !== auth.account.id) await auth.switchWorkspace(auth.account.id);
-              else { setAdminView(true); setActiveWorkspace("cdk-management"); }
+              else { setAdminView(true); updateActiveWorkspace("cdk-management"); }
             } catch (failure) { setError(failure.message); }
           }}>{adminView ? "切换用户视角" : "返回管理视角"}</button>}
           <ThemeControl /><button type="button" className="secondary-button" onClick={() => setSettingsOpen(true)}><Settings2 size={16} />{auth.account.role === "admin" ? "系统配置" : "配置"}</button>
-          <button type="button" className="secondary-button" onClick={() => void auth.logout().catch((failure) => setError(failure.message))}>退出</button>
+          <button type="button" className="secondary-button" onClick={() => { if (canLeaveAnnouncement()) void auth.logout().catch((failure) => setError(failure.message)); }}>退出</button>
         </div>
       </header>
       {auth.workspace.id !== auth.account.id && <p className="cdk-scope-note">管理员正在查看 {auth.workspace.note || auth.workspace.label} 的工作区。此处操作和新增导入属于该 CDK。</p>}
       {activeWorkspace.startsWith("cdk-") && <CdkWorkspace auth={auth} section={activeWorkspace.slice(4)} onNavigate={(section) => setActiveWorkspace(`cdk-${section}`)} />}
+      {activeWorkspace === "announcement" && adminView && auth.account.role === "admin" && <AnnouncementManager token={token} onChanged={auth.reload} onStateChange={reportAnnouncementState} />}
       {activeWorkspace === "sms-pool" && auth.account.role === "admin" && <SmsPoolWorkspace token={token} />}
       {activeWorkspace === "offers" && <OfferWorkspace token={token} balance={auth.workspace.balance} />}
       {activeWorkspace === "rebind" && <EmailRebindWorkspace token={token} onOpenAuthorization={() => { setPhoneTab("disabled"); setFilters(DEFAULT_FILTERS); setPage(1); setSelectedJobIds(new Set()); setExpandedJobId(null); setEmailFilter([]); setActiveWorkspace("authorization"); }} />}

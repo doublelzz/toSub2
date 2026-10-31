@@ -24,6 +24,7 @@
     "check:offers": "node --check src/offer-workspace.mjs && node --check src/offer-runner.mjs && node test/offer-workspace.mjs && node test/offer-proxy-retry.mjs && node test/offer-console.mjs && node test/offer-ui.mjs",
     "check:sms": "node --check src/hero-sms.mjs && node test/hero-sms.mjs && node test/sms-providers.mjs && node test/sms-provider-console-smoke.mjs && node test/sms-price-selector.mjs",
     "check:ui": "node test/task-query.mjs && node test/task-query-console.mjs && node test/workspace-settings-ui.mjs && node test/dialog-focus-stack.mjs && node test/import-charge-confirmation.mjs",
+    "check:announcement": "node test/announcement-html.mjs && node test/announcement-console.mjs && node test/announcement-ui.mjs",
     "check:phone-binding": "node test/phone-binding-console.mjs",
     "check:sms-orders": "node test/sms-orders.mjs && node test/sms-order-cancellation.mjs",
     "check:cdk": "node test/cdk-store.mjs && node test/cdk-console.mjs && node test/cdk-sub2api-context.mjs && npm run check:cdk-sms",
@@ -52,6 +53,7 @@
   "homepage": "https://github.com/poxiao33/toSub2#readme",
   "dependencies": {
     "@vitejs/plugin-react": "^5.1.1",
+    "dompurify": "^3.4.17",
     "jsdom": "26.1.0",
     "lucide-react": "^0.468.0",
     "react": "^19.0.0",

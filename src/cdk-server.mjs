@@ -3,12 +3,15 @@ import fs from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { JSDOM } from "jsdom";
 import { createCdkStore } from "./cdk-store.mjs";
 import { createCdkVault } from "./cdk-vault.mjs";
 import { acquireCdkLock } from "./cdk-lock.mjs";
 import { cdkError, clientIp, normalizeClientIp, readRequestJson, requireSameOrigin } from "./cdk-security.mjs";
 import { assertOfferAccess } from "./offer-workspace.mjs";
 import { createSmsPool } from "./sms-pool.mjs";
+import { createAnnouncementSanitizer } from "./announcement-html.mjs";
+import { createAnnouncementStore } from "./announcement-store.mjs";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cookieName = "tosub2_session";
@@ -111,8 +114,11 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
   cleanupFailedStart = async () => {
     shuttingDown = true; clearInterval(queueTimer); clearInterval(cleanupTimer);
     if (server?.listening) await new Promise((resolve) => { server.close(resolve); server.closeIdleConnections?.(); });
-    await Promise.allSettled([...creating.values()]); await Promise.allSettled([...workspaces.values()].map((workspace) => workspace.shutdown())); await smsPool.close(); store.close();
+    await Promise.allSettled([...creating.values()]); await Promise.allSettled([...workspaces.values()].map((workspace) => workspace.shutdown())); await smsPool.close(); announcementDom?.window.close(); store.close();
   };
+  let announcementDom;
+  announcementDom = new JSDOM("");
+  const announcements = createAnnouncementStore({ store, sanitize: createAnnouncementSanitizer(announcementDom.window), document: announcementDom.window.document });
   const initialLegacyEmails = await legacyEmails(root);
   let globalSlots = 20;
   const availableSlots = () => globalSlots;
@@ -249,7 +255,7 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
     const features = { ...original.features, smsProviders,
       allowedSmsProviders, cdk: true, admin: session.actor.role === "admin" };
     if (!allowedSmsProviders.includes("pool")) delete features.smsPool;
-    return { authenticated: true, token: session.csrf, account: store.get(session.actor.id), workspace: store.get(session.workspace.id), settings: visibleWorkspaceSettings(session.workspace.id), features };
+    return { authenticated: true, token: session.csrf, account: store.get(session.actor.id), workspace: store.get(session.workspace.id), settings: visibleWorkspaceSettings(session.workspace.id), features, announcement: announcements.publicAnnouncement() };
   }
 
   function sessionCookie(req, value, expired = false) {
@@ -325,6 +331,12 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
     }
     if (url.pathname.startsWith("/api/admin/")) {
       if (session.actor.role !== "admin") throw cdkError(403, "需要管理员权限");
+      if (url.pathname === "/api/admin/announcement") {
+        if (req.method === "GET") send(res, 200, { announcement: announcements.read() });
+        else if (req.method === "PUT") send(res, 200, { announcement: announcements.save(await readRequestJson(req), actor) });
+        else throw cdkError(405, "请求方法不支持");
+        return;
+      }
       if (url.pathname === "/api/admin/sms-pool" && req.method === "GET") { send(res, 200, smsPool.adminSnapshot()); return; }
       if (url.pathname === "/api/admin/sms-pool/analytics" && req.method === "GET") { send(res, 200, smsPool.analytics(Object.fromEntries(url.searchParams))); return; }
       if (url.pathname === "/api/admin/sms-pool/inventory" && req.method === "GET") { send(res, 200, smsPool.inventoryPage(Object.fromEntries(url.searchParams))); return; }
@@ -499,7 +511,7 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
     await Promise.allSettled([...workspaces.values()].map((workspace) => workspace.shutdown()));
     await smsPool.close();
     let timer; await Promise.race([closed, new Promise((resolve) => { timer = setTimeout(() => { server.closeAllConnections?.(); resolve(); }, 3000); })]); clearTimeout(timer);
-    store.close(); await processLock.close();
+    announcementDom.window.close(); store.close(); await processLock.close();
   })();
   if (listen) {
     const terminate = () => void close().catch(() => { process.exitCode = 1; }); process.once("SIGINT", terminate); process.once("SIGTERM", terminate);
