@@ -693,6 +693,7 @@ async function handleApi(req, res, requestUrl) {
         lubanApiBase: process.env.LUBAN_SMS_API_BASE,
         smsBowerApiBase: process.env.SMSBOWER_API_BASE,
         heroSmsApiBase: process.env.HERO_SMS_API_BASE,
+        daxiguaSmsApiBase: process.env.DAXIGUA_SMS_API_BASE,
       });
       if (!smsClient.listNumberOptions) throw httpError(400, "该接码平台不支持价格查询");
       const options = await smsClient.listNumberOptions();
@@ -2785,7 +2786,8 @@ async function recoverSmsPoolJobs() {
 
 function poolProviderClient(providerId, config) {
   return createSmsProvider(providerId, config, { lubanApiBase: process.env.LUBAN_SMS_API_BASE,
-    smsBowerApiBase: process.env.SMSBOWER_API_BASE, heroSmsApiBase: process.env.HERO_SMS_API_BASE });
+    smsBowerApiBase: process.env.SMSBOWER_API_BASE, heroSmsApiBase: process.env.HERO_SMS_API_BASE,
+    daxiguaSmsApiBase: process.env.DAXIGUA_SMS_API_BASE });
 }
 
 async function acquirePoolSmsNumber(job, config) {
@@ -2935,6 +2937,7 @@ async function acquireSmsNumber(job, providerId, config) {
       lubanApiBase: process.env.LUBAN_SMS_API_BASE,
       smsBowerApiBase: process.env.SMSBOWER_API_BASE,
       heroSmsApiBase: process.env.HERO_SMS_API_BASE,
+      daxiguaSmsApiBase: process.env.DAXIGUA_SMS_API_BASE,
       acquireCustomSmsEntry,
     });
   } catch (error) {
@@ -3162,6 +3165,7 @@ function scheduleSmsNumberRetry(job, reason = "手机号不可用", options = {}
           lubanApiBase: process.env.LUBAN_SMS_API_BASE,
           smsBowerApiBase: process.env.SMSBOWER_API_BASE,
           heroSmsApiBase: process.env.HERO_SMS_API_BASE,
+          daxiguaSmsApiBase: process.env.DAXIGUA_SMS_API_BASE,
           acquireCustomSmsEntry,
         });
       } catch (error) {

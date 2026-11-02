@@ -6,7 +6,7 @@ import { cdkError, normalizeClientIp, positiveInteger, randomSecret, secretHash 
 import { poolCostOrder, summarizePoolCosts, poolCostFilters, matchesPoolCost, poolCostAnalytics } from "./sms-pool-costs.mjs";
 
 const DEFAULT_RULES = { ratePerMinute: 30, warnFailures: 5, banFailures: 10, failureWindowMinutes: 10, banMinutes: 30, escalationCount: 3, escalationHours: 24, retentionDays: 30 };
-export const CDK_SMS_PROVIDER_IDS = ["custom", "luban", "smsbower", "herosms", "pool"];
+export const CDK_SMS_PROVIDER_IDS = ["custom", "luban", "smsbower", "herosms", "daxigua", "pool"];
 const normalizeSmsPermissions = (value) => {
   if (!Array.isArray(value) || value.some((id) => typeof id !== "string" || !CDK_SMS_PROVIDER_IDS.includes(id))) throw cdkError(422, "接码方式权限格式不正确");
   return CDK_SMS_PROVIDER_IDS.filter((id) => id === "custom" || value.includes(id));

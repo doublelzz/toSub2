@@ -41,7 +41,7 @@ const monitor = () => ({ enabled: true, configured: true, bindingId: "fixture-co
 const { App, formatMonitorResult } = await load("../web/src/main.jsx", ["App", "formatMonitorResult"], {
   ...filters, ...smsOptions, ...ui,
   MfaWorkspace: () => null, EmailRebindWorkspace: () => null, OfferWorkspace: () => null, SmsPoolWorkspace: () => null,
-  SmsPoolChoice: () => null, SmsPoolChargeDialog: () => null, CdkWorkspace: () => null, CurrentCdk: () => null, SmsPriceSelector: () => null,
+  SmsPoolChoice: () => null, SmsPoolChargeDialog: () => null, CdkWorkspace: () => null, CurrentCdk: () => null, SmsPriceSelector: () => null, SmsServiceSelector: () => null,
   readWorkspaceValue: (key) => saved.get(key) || null, writeWorkspaceValue: (key, value) => saved.set(key, value), flushWorkspaceSettings: async () => {},
   cdkFetch: async (url, options = {}) => {
     requests.push({ url, method: options.method || "GET" });

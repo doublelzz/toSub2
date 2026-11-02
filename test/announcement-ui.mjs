@@ -240,7 +240,7 @@ try {
     ...filters, ...smsOptions, ...ui,
     AnnouncementManager: components.AnnouncementManager, AnnouncementEntry: empty,
     MfaWorkspace: empty, EmailRebindWorkspace: empty, OfferWorkspace: empty, SmsPoolWorkspace: empty,
-    SmsPoolChoice: empty, SmsPoolChargeDialog: empty, CdkWorkspace: empty, SmsPriceSelector: empty,
+    SmsPoolChoice: empty, SmsPoolChargeDialog: empty, CdkWorkspace: empty, SmsPriceSelector: empty, SmsServiceSelector: empty,
     CurrentCdk: ({ onOpen }) => React.createElement("button", { type: "button", onClick: onOpen }, "查看当前 CDK"),
     readWorkspaceValue: () => null, writeWorkspaceValue() {}, flushWorkspaceSettings: async () => {},
     cdkFetch: async (url) => {

@@ -6,7 +6,7 @@ import { createSmsBuffer } from "./sms-buffer.mjs";
 import { summarizePoolCosts, poolCostAnalytics, matchesCurrentEntry } from "./sms-pool-costs.mjs";
 
 const DEFAULT_RULES = { enabled: false, fee: 2, noStockThreshold: 3, cooldownMinutes: 10, maxAttempts: 10, requestConcurrency: 3 };
-const PROVIDERS = new Set(["smsbower", "herosms"]);
+const PROVIDERS = new Set(["smsbower", "herosms", "daxigua"]);
 const CLOSED = new Set(["verified", "released"]);
 const text = (value) => typeof value === "string" ? value.trim() : "";
 const clone = (value) => structuredClone(value);
@@ -20,11 +20,11 @@ const validId = (value) => /^[a-zA-Z0-9_-]{1,120}$/.test(value);
 
 export function classifyPoolError(error) {
   const code = String(error?.code || "").toUpperCase();
-  if (/^(NO_NUMBERS|NO_NUMBER|NO_STOCK)$/.test(code)) return "no_stock";
+  if (/^(NO_NUMBERS|NO_NUMBER|NO_STOCK|ORDER_FAILED|ORDER_CANCELLED|SERVICE_UNAVAILABLE)$/.test(code)) return "no_stock";
   if (/^(BAD_KEY|NO_KEY|UNAUTHORIZED|INVALID_API_KEY|BANNED)/.test(code)) return "auth_invalid";
-  if (/^(NO_BALANCE|PAYMENT_REQUIRED|INSUFFICIENT_BALANCE)/.test(code)) return "balance_insufficient";
+  if (/^(NO_BALANCE|PAYMENT_REQUIRED|INSUFFICIENT_BALANCE|INSUFFICIENT_USES)/.test(code)) return "balance_insufficient";
   if (/429|RATE_LIMIT|TOO_MANY/.test(code) || /HTTP\s+429/i.test(error?.message || "")) return "rate_limited";
-  if (/^(BAD_ACTION|BAD_SERVICE|WRONG_SERVICE|WRONG_COUNTRY|WRONG_MAX_PRICE|UNPROCESSABLE_ENTITY|BAD_COUNTRY|BAD_PRICE|INVALID_PRICE)/.test(code)) return "config_invalid";
+  if (/^(BAD_ACTION|BAD_SERVICE|WRONG_SERVICE|WRONG_COUNTRY|WRONG_MAX_PRICE|UNPROCESSABLE_ENTITY|BAD_COUNTRY|BAD_PRICE|INVALID_PRICE|INVALID_SERVICE)/.test(code)) return "config_invalid";
   // A purchase may have reached the provider even when its reply never reached us.
   return "order_unknown";
 }
@@ -146,9 +146,10 @@ export function createSmsPool({ store, createProvider = createSmsProvider, provi
     admin(actor); const value = config(); const old = body.id ? value.credentials.find((row) => row.id === body.id) : null;
     if (body.id && !old) throw cdkError(404, "接码凭据不存在");
     const providerId = text(body.providerId || old?.providerId).toLowerCase();
-    if (!PROVIDERS.has(providerId)) throw cdkError(422, "接码池目前支持 SMSBower 和 Hero SMS");
+    if (!PROVIDERS.has(providerId)) throw cdkError(422, "接码池目前支持 SMSBower、Hero SMS 和大西瓜接码");
     const apiKey = text(body.apiKey) || old?.apiKey || "";
-    if (!/^[a-zA-Z0-9._-]{8,256}$/.test(apiKey)) throw cdkError(422, "请输入有效的接码 API Key");
+    const validApiKey = providerId === "daxigua" ? /^[\x21-\x7e]{8,512}$/.test(apiKey) : /^[a-zA-Z0-9._-]{8,256}$/.test(apiKey);
+    if (!validApiKey) throw cdkError(422, "请输入有效的接码 API Key");
     const name = text(body.name || old?.name).slice(0, 80); if (!name) throw cdkError(422, "请填写凭据名称");
     if (Object.hasOwn(body, "enabled") && typeof body.enabled !== "boolean") throw cdkError(422, "启用状态格式不正确");
     if (old && old.providerId !== providerId && value.entries.some((entry) => entry.credentialId === old.id)) throw cdkError(409, "已有池条目的凭据不能更换服务商");
@@ -175,10 +176,19 @@ export function createSmsPool({ store, createProvider = createSmsProvider, provi
     const merged = { ...old, ...body }; const credential = value.credentials.find((row) => row.id === merged.credentialId);
     if (!credential) throw cdkError(422, "请选择已配置的接码凭据");
     const categoryId = text(merged.categoryId || "other"); category(categoryId);
-    const country = String(merged.country ?? ""); const maxPrice = String(merged.maxPrice ?? ""); const providerIds = String(merged.providerIds || "");
-    if (!/^\d{1,5}$/.test(country) || !/^\d+(?:\.\d{1,6})?$/.test(maxPrice) || Number(maxPrice) <= 0 || Number(maxPrice) > 10000) throw cdkError(422, "请选择有效国家和价格上限");
+    const usageProvider = credential.providerId === "daxigua";
+    const country = String(merged.country ?? "");
+    const maxPrice = String(usageProvider ? merged.uses ?? merged.maxPrice ?? "" : merged.maxPrice ?? "");
+    const providerIds = String(usageProvider ? merged.serviceId ?? merged.providerIds ?? "" : merged.providerIds || "");
+    const service = text(usageProvider ? merged.project || merged.service : merged.service || "dr");
+    if (usageProvider) {
+      if (!/^[a-zA-Z0-9_-]{1,16}$/.test(country) || !/^\d{1,9}$/.test(maxPrice) || Number(maxPrice) < 1
+        || !/^\d{1,20}$/.test(providerIds) || !/^[a-zA-Z0-9_-]{1,80}$/.test(service)) throw cdkError(422, "请选择有效的大西瓜接码服务");
+    } else if (!/^\d{1,5}$/.test(country) || !/^\d+(?:\.\d{1,6})?$/.test(maxPrice) || Number(maxPrice) <= 0 || Number(maxPrice) > 10000) {
+      throw cdkError(422, "请选择有效国家和价格上限");
+    }
     if (credential.providerId === "smsbower" && !/^\d{1,12}(?:,\d{1,12}){0,99}$/.test(providerIds)) throw cdkError(422, "请选择 SMSBower 供应商档位");
-    const service = text(merged.service || "dr"); if (!/^[a-z0-9_]{1,32}$/.test(service)) throw cdkError(422, "服务代码格式不正确");
+    if (!usageProvider && !/^[a-z0-9_]{1,32}$/.test(service)) throw cdkError(422, "服务代码格式不正确");
     const grade = merged.grade ?? "unknown"; const gradeFilter = merged.gradeFilter ?? "all";
     if (!["gold", "unknown"].includes(grade) || !["all", "gold", "unknown"].includes(gradeFilter)) throw cdkError(422, "供应商档位筛选不正确");
     if (Object.hasOwn(body, "enabled") && typeof body.enabled !== "boolean") throw cdkError(422, "启用状态格式不正确");
@@ -186,7 +196,8 @@ export function createSmsPool({ store, createProvider = createSmsProvider, provi
     const routingChanged = old && ["credentialId", "country", "maxPrice", "providerIds", "service"].some((key) => old[key] !== ({ credentialId: credential.id, country, maxPrice, providerIds, service })[key]);
     const resetHealth = !old || routingChanged || body.resetCooldown === true;
     const entry = { id: old?.id || crypto.randomUUID(), categoryId, credentialId: credential.id, country, countryLabel: text(merged.countryLabel).slice(0, 160), maxPrice, providerIds, service,
-      quotedPrice: moneyAmount(merged.quotedPrice), currency: moneyCurrency(merged.currency),
+      ...(usageProvider ? { serviceId: providerIds, project: service, uses: maxPrice } : {}),
+      quotedPrice: usageProvider ? null : moneyAmount(merged.quotedPrice), currency: usageProvider ? null : moneyCurrency(merged.currency),
       grade, gradeFilter,
       priority: integer(merged.priority ?? 100, "优先级", 0, 10000), enabled: merged.enabled ?? true,
       state: resetHealth ? "active" : old.state, noStockCount: resetHealth ? 0 : old.noStockCount, cooldownUntil: resetHealth ? 0 : old.cooldownUntil,
@@ -250,7 +261,8 @@ export function createSmsPool({ store, createProvider = createSmsProvider, provi
     return { apiKey: choice.credential.apiKey, service: choice.entry.service, country: choice.entry.country, countryLabel: choice.entry.countryLabel,
       categoryId: current.categoryId || "other", categoryName: current.categoryName || "其他", categoryFeeVersion: current.categoryFeeVersion || 1,
       maxPrice: choice.entry.maxPrice, quotedPrice: choice.entry.quotedPrice, currency: choice.entry.currency,
-      providerIds: choice.entry.providerIds, maxRotationAttempts: String(maxAttempts), rotationIntervalSeconds: "1" };
+      providerIds: choice.entry.providerIds, project: choice.entry.project, serviceId: choice.entry.serviceId, uses: choice.entry.uses,
+      maxRotationAttempts: String(maxAttempts), rotationIntervalSeconds: "1" };
   }
   function recordSuccess(choice, attemptId) {
     mutate((value) => { const entry = value.entries.find((row) => row.id === choice.entry.id); if (sameEntry(entry, choice.entry)) { entry.noStockCount = 0; entry.cooldownUntil = 0; entry.bufferRetryAt = 0; entry.lastError = ""; if (entry.halfOpen === attemptId) entry.halfOpen = null; } });
@@ -322,6 +334,7 @@ export function createSmsPool({ store, createProvider = createSmsProvider, provi
           if (order.cost?.amount != null && Number(order.cost.amount) > Number(providerConfig.maxPrice)) throw new Error("order price exceeded configured ceiling");
         } catch (error) {
           if (["SMS_PROVIDER_FORBIDDEN", "SMS_POOL_CLOSED", "SMS_POOL_CATEGORY_UNAVAILABLE"].includes(error.code)) throw error;
+          if (!order && error?.order?.requestId) order = error.order;
           const kind = providerRequested ? classifyPoolError(error) : "config_invalid"; recordFailure(choice, kind, attemptId);
           current = store.updateSmsOperation(ownerId, operationId, (value) => { value.state = kind === "order_unknown" ? "unknown" : "reserved"; value.reason = kind;
             if (order?.requestId) value.allocation = { ...categorySnapshot, allocationId: attemptId, entryId: choice.entry.id, credentialId: choice.credential.id, providerId, config: providerConfig, order: clone(order), createdAt: now(), configVersion: choice.configVersion, abandoned: false, submitted: false };

@@ -10,7 +10,7 @@ const root = await fs.mkdtemp(path.join(os.tmpdir(), "tosub2-category-console-")
 const protocolScript = path.join(root, "phone-fixture.mjs");
 await fs.writeFile(protocolScript, `import readline from 'node:readline/promises';
 const rl=readline.createInterface({input:process.stdin,output:process.stdout});
-try { await rl.question('Phone number, E.164 format (p=quit): '); await new Promise(resolve=>setTimeout(resolve,50)); await rl.question('Phone number, E.164 format (p=quit): '); await rl.question('Phone OTP (r=resend, p=change phone, q=quit): '); } finally {rl.close();}
+try { await rl.question('Phone number, E.164 format (p=quit): '); await new Promise(resolve=>setTimeout(resolve,500)); await rl.question('Phone number, E.164 format (p=quit): '); await rl.question('Phone OTP (r=resend, p=change phone, q=quit): '); } finally {rl.close();}
 `);
 const categories = [{ id: "us", name: "美区", enabled: true, fee: 5, feeVersion: 2 }, { id: "other", name: "其他", enabled: true, fee: 2, feeVersion: 1 }];
 const rows = new Map(); let purchases = 0; let workspace;

@@ -61,7 +61,7 @@ const { CdkGate } = await load("../web/src/CdkGate.jsx", ["CdkGate"], { ...ui, I
 const empty = () => null;
 const { App, resolveSmsProvider } = await load("../web/src/main.jsx", ["App", "resolveSmsProvider"], {
   ...filters, ...smsOptions, ...ui, cdkFetch, SmsPoolChargeDialog,
-  MfaWorkspace: empty, EmailRebindWorkspace: empty, OfferWorkspace: empty, SmsPoolWorkspace: empty, SmsPoolChoice, CdkWorkspace: empty, CurrentCdk: empty, SmsPriceSelector: empty,
+  MfaWorkspace: empty, EmailRebindWorkspace: empty, OfferWorkspace: empty, SmsPoolWorkspace: empty, SmsPoolChoice, CdkWorkspace: empty, CurrentCdk: empty, SmsPriceSelector: empty, SmsServiceSelector: empty,
   readWorkspaceValue: (key) => key === "chatgpt-onboarding.sms-provider-settings-v1" ? JSON.stringify({ selectedProviderId: "pool", configs: { pool: { categoryId: selectedCategoryId, apiKey: "stale-secret-must-not-submit" } } }) : null,
   writeWorkspaceValue() {}, flushWorkspaceSettings: async () => {},
 }, "const appRoot =");

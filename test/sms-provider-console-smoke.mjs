@@ -15,7 +15,7 @@ const smsActions = [];
 let smsChecks = 0;
 let autoRotateNumberCalls = 0;
 let customInboxChecks = 0;
-const smsServer = http.createServer((req, res) => {
+const smsServer = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", "http://127.0.0.1");
   if (url.pathname === "/custom-inbox") {
     customInboxChecks += 1;
@@ -27,6 +27,37 @@ const smsServer = http.createServer((req, res) => {
         ];
     res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
     res.end(JSON.stringify({ messages }));
+    return;
+  }
+  if (url.pathname.startsWith("/daxigua/api/v1/")) {
+    assert.equal(req.headers.authorization, "Bearer test-daxigua-key");
+    const route = url.pathname.slice("/daxigua/api/v1/".length);
+    smsActions.push({ provider: "daxigua", action: `${req.method} ${route}` });
+    if (req.method === "GET" && route === "services") {
+      res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ success: true, data: { services: [{ id: 2, name: "Chat GPT", country: "kh", project: "chatgpt", uses: 1 }] } }));
+      return;
+    }
+    if (req.method === "POST" && route === "orders") {
+      assert.match(String(req.headers["idempotency-key"] || ""), /^tosub2-/);
+      let body = ""; for await (const chunk of req) body += chunk;
+      assert.deepEqual(JSON.parse(body), { country: "kh", project: "chatgpt" });
+      res.writeHead(202, { "content-type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ success: true, data: daxiguaOrder("assigned") }));
+      return;
+    }
+    if (req.method === "GET" && route === "orders/987") {
+      res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ success: true, data: daxiguaOrder("received", { sms_content: "Your ChatGPT verification code is 654321" }) }));
+      return;
+    }
+    if (req.method === "POST" && route === "orders/987/cancel") {
+      res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ success: true, data: daxiguaOrder("cancelled") }));
+      return;
+    }
+    res.writeHead(404, { "content-type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify({ success: false, error: { code: "order_not_found", message: "fixture missing" } }));
     return;
   }
   const isOffers = url.pathname === "/api/v1/activations/offers/sms";
@@ -101,6 +132,7 @@ const child = spawn(process.execPath, [path.join(projectRoot, "src", "console-se
     TOSUB2_TLS_PROFILE: "chrome142",
     SMSBOWER_API_BASE: `http://127.0.0.1:${smsServer.address().port}/handler_api.php`,
     HERO_SMS_API_BASE: `http://127.0.0.1:${smsServer.address().port}/hero/handler_api.php`,
+    DAXIGUA_SMS_API_BASE: `http://127.0.0.1:${smsServer.address().port}/daxigua/api/v1/`,
     SMS_POLL_INTERVAL_MS: "20",
     SMS_POLL_TIMEOUT_MS: "3000",
   },
@@ -117,7 +149,7 @@ const childExit = new Promise((resolve) => child.once("exit", resolve));
 
 try {
   const bootstrap = await waitForJson(`${baseUrl}/api/bootstrap`);
-  assert.deepEqual(bootstrap.features.smsProviders.map((provider) => provider.id), ["luban", "smsbower", "herosms", "custom", "pool"]);
+  assert.deepEqual(bootstrap.features.smsProviders.map((provider) => provider.id), ["luban", "smsbower", "herosms", "daxigua", "custom", "pool"]);
   const headers = { "content-type": "application/json", "x-console-token": bootstrap.token };
   const optionsResponse = await fetch(`${baseUrl}/api/sms-providers/smsbower/options`, {
     method: "POST",
@@ -387,6 +419,35 @@ try {
   assert.equal(heroMetadata.includes("test-hero-key"), false);
   assert.equal(logs.includes("test-hero-key"), false);
 
+  const daxiguaOptionsResponse = await fetch(`${baseUrl}/api/sms-providers/daxigua/options`, {
+    method: "POST", headers, body: JSON.stringify({ config: { apiKey: "test-daxigua-key" } }),
+  });
+  const daxiguaOptionsText = await daxiguaOptionsResponse.text();
+  assert.equal(daxiguaOptionsResponse.status, 200, daxiguaOptionsText);
+  const daxiguaOptions = JSON.parse(daxiguaOptionsText);
+  assert.deepEqual(daxiguaOptions.options, [{ serviceId: "2", country: "kh", project: "chatgpt", uses: 1, title: "Chat GPT", label: "Chat GPT / kh", price: 1, count: 1, currency: "次" }]);
+  const daxiguaResponse = await fetch(`${baseUrl}/api/jobs`, {
+    method: "POST", headers, body: JSON.stringify({ email: "daxigua-sms@example.com" }),
+  });
+  assert.equal(daxiguaResponse.status, 201);
+  const daxigua = await daxiguaResponse.json();
+  await waitForJob(headers, daxigua.job.id, (job) => job.status === "phone");
+  const daxiguaNumberResponse = await fetch(`${baseUrl}/api/jobs/${daxigua.job.id}/sms-number`, {
+    method: "POST", headers,
+    body: JSON.stringify({ providerId: "daxigua", config: { apiKey: "test-daxigua-key", serviceId: "2", country: "kh", project: "chatgpt", uses: "1", countryLabel: "Chat GPT / kh / 1 次" } }),
+  });
+  assert.equal(daxiguaNumberResponse.status, 200, await daxiguaNumberResponse.text());
+  const daxiguaCompleted = await waitForJob(headers, daxigua.job.id, (job) => job.status === "completed");
+  assert.equal(daxiguaCompleted.smsProviderId, "daxigua");
+  assert.equal(daxiguaCompleted.smsProviderName, "大西瓜接码");
+  assert.equal(daxiguaCompleted.smsStatus, "completed");
+  assert.ok(smsActions.some((item) => item.provider === "daxigua" && item.action === "POST orders"));
+  assert.ok(smsActions.some((item) => item.provider === "daxigua" && item.action === "GET orders/987"));
+  assert.ok(!smsActions.some((item) => item.provider === "daxigua" && item.action.endsWith("/complete")));
+  const daxiguaMetadata = await storedFiles(outputRoot).readFile(path.join(outputRoot, daxigua.job.id, "job-meta.json"), "utf8");
+  assert.equal(daxiguaMetadata.includes("test-daxigua-key"), false);
+  assert.equal(logs.includes("test-daxigua-key"), false);
+
   const cancelResponse = await fetch(`${baseUrl}/api/jobs`, {
     method: "POST", headers, body: JSON.stringify({ email: "hero-cancel@example.com" }),
   });
@@ -469,4 +530,9 @@ function findAvailablePort() {
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function daxiguaOrder(status, patch = {}) {
+  return { id: 987, country: "kh", project: "chatgpt", status, status_display: status, phone_number: "+85512345678", sms_content: "", failure_reason: "", uses: 1,
+    terminal: ["received", "failed", "cancelled", "review"].includes(status), created_at: "2026-10-30T00:00:00+00:00", ...patch };
 }

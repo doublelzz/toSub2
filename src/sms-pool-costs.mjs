@@ -1,6 +1,6 @@
 import { moneyAmount, moneyCurrency } from "./sms-orders.mjs";
 
-const names = { smsbower: "SMSBower", herosms: "Hero SMS", luban: "LubanSMS", custom: "自定义接码" };
+const names = { smsbower: "SMSBower", herosms: "Hero SMS", daxigua: "大西瓜接码", luban: "LubanSMS", custom: "自定义接码" };
 const amount = (value) => moneyAmount(value);
 const money = (value, currency) => { const parsed = amount(value); return parsed === null ? null : { amount: parsed, currency: moneyCurrency(currency) }; };
 const categoryId = (order) => order.categoryId || "legacy";

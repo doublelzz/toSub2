@@ -5,7 +5,7 @@ import { cdkFetch, requestId } from "./cdk-api.mjs";
 
 const kinds = { issue: "初始发放", topup: "管理员追加", import: "导入账号", "sms-pool": "接码池成功扣次", "merge-in": "融合转入", "merge-out": "融合转出" };
 const statusNames = { active: "正常", disabled: "已禁用", merged: "已融合" };
-const smsProviderNames = { custom: "自定义接码", luban: "鲁班接码", smsbower: "SMSBower", herosms: "Hero SMS", pool: "接码池" };
+const smsProviderNames = { custom: "自定义接码", luban: "鲁班接码", smsbower: "SMSBower", herosms: "Hero SMS", daxigua: "大西瓜接码", pool: "接码池" };
 const cdkSmsProviders = (cdk = {}) => cdk.role === "admin" ? Object.keys(smsProviderNames) : ["custom", ...Object.keys(smsProviderNames).filter((id) => id !== "custom" && cdk.allowedSmsProviders?.includes(id))];
 const ruleNames = { ratePerMinute: "每 IP 每分钟验证上限", warnFailures: "达到告警的失败次数", banFailures: "达到封禁的失败次数", failureWindowMinutes: "失败统计窗口（分钟）", banMinutes: "首次封禁（分钟）", escalationCount: "升级封禁所需触发次数", escalationHours: "重复触发统计及升级时长（小时）", retentionDays: "日志保留（天）" };
 

@@ -1,6 +1,7 @@
 import { createLubanSmsClient } from "./luban-sms.mjs";
 import { createSmsBowerClient } from "./smsbower.mjs";
 import { createHeroSmsClient } from "./hero-sms.mjs";
+import { createDaXiGuaSmsClient } from "./daxigua-sms.mjs";
 import { createCustomSmsClient } from "./custom-sms.mjs";
 
 export const SMS_PROVIDER_DEFINITIONS = [
@@ -43,6 +44,22 @@ export const SMS_PROVIDER_DEFINITIONS = [
       { key: "country", label: "国家与价格", type: "price-select", summaryKey: "countryLabel" },
       { key: "maxPrice", label: "最高价格", type: "hidden" },
       { key: "countryLabel", label: "国家名称", type: "hidden", required: false },
+      { key: "maxRotationAttempts", label: "最大取号次数（含首次）", type: "number", defaultValue: "3", min: 1, max: 20, step: 1, required: false },
+      { key: "rotationIntervalSeconds", label: "自动换号间隔（秒）", type: "number", defaultValue: "5", min: 0, max: 600, step: 1, required: false },
+    ],
+  },
+  {
+    id: "daxigua",
+    name: "大西瓜接码",
+    description: "查询账户当前上架服务，按次数创建订单并自动等待号码分配",
+    optionsEndpoint: "/api/sms-providers/daxigua/options",
+    fields: [
+      { key: "apiKey", label: "API Key", type: "password", placeholder: "输入大西瓜接码 API Key" },
+      { key: "serviceId", label: "接码服务", type: "service-select", summaryKey: "countryLabel" },
+      { key: "country", label: "国家代码", type: "hidden" },
+      { key: "project", label: "项目代码", type: "hidden" },
+      { key: "uses", label: "每单次数", type: "hidden" },
+      { key: "countryLabel", label: "服务名称", type: "hidden", required: false },
       { key: "maxRotationAttempts", label: "最大取号次数（含首次）", type: "number", defaultValue: "3", min: 1, max: 20, step: 1, required: false },
       { key: "rotationIntervalSeconds", label: "自动换号间隔（秒）", type: "number", defaultValue: "5", min: 0, max: 600, step: 1, required: false },
     ],
@@ -158,6 +175,40 @@ export function createSmsProvider(providerIdValue, configValue = {}, options = {
     };
   }
 
+  if (providerId === "daxigua") {
+    const apiKey = validateBearerApiKey(config.apiKey, "大西瓜接码");
+    const country = String(config.country || "").trim();
+    const project = String(config.project || config.service || "").trim();
+    if (country && !/^[a-zA-Z0-9_-]{1,16}$/.test(country)) throw new Error("请重新查询大西瓜接码服务");
+    if (project && !/^[a-zA-Z0-9_-]{1,80}$/.test(project)) throw new Error("请重新查询大西瓜接码服务");
+    const client = createDaXiGuaSmsClient({
+      apiKey,
+      apiBase: options.daxiguaSmsApiBase,
+      fetchImpl: options.fetchImpl,
+      now: options.now,
+      sleep: options.sleep,
+      timeoutMs: options.timeoutMs,
+      assignmentTimeoutMs: options.assignmentTimeoutMs,
+      pollIntervalMs: options.pollIntervalMs,
+    });
+    return {
+      id: "daxigua",
+      name: "大西瓜接码",
+      apiKey,
+      serviceLabel: config.countryLabel || (country && project ? `${project} / ${country}` : "未选择服务"),
+      getNumber: () => {
+        if (!country || !project) throw new Error("请先查询并选择大西瓜接码服务");
+        return client.getNumber(country, project);
+      },
+      listNumberOptions: () => client.getServiceOptions(),
+      getSms: (requestId) => client.getSms(requestId),
+      inspect: (requestId) => client.inspect(requestId),
+      cancelStrict: (requestId) => client.cancelStrict(requestId),
+      cancelReceipt: (requestId) => client.cancelStrict(requestId),
+      release: (requestId) => client.release(requestId),
+    };
+  }
+
   if (providerId === "custom") {
     const client = createCustomSmsClient({
       entries: config.entries,
@@ -181,5 +232,11 @@ export function createSmsProvider(providerIdValue, configValue = {}, options = {
 function validateApiKey(value, providerName) {
   const apiKey = String(value || "").trim();
   if (!/^[a-zA-Z0-9._-]{8,256}$/.test(apiKey)) throw new Error(`请输入有效的 ${providerName} API Key`);
+  return apiKey;
+}
+
+function validateBearerApiKey(value, providerName) {
+  const apiKey = String(value || "").trim();
+  if (!/^[\x21-\x7e]{8,512}$/.test(apiKey)) throw new Error(`请输入有效的 ${providerName} API Key`);
   return apiKey;
 }

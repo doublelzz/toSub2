@@ -46,6 +46,7 @@ import AnnouncementEntry from "./AnnouncementEntry.jsx";
 import { AnnouncementManager } from "./Announcement.jsx";
 import { cdkFetch, flushWorkspaceSettings, readWorkspaceValue, writeWorkspaceValue } from "./cdk-api.mjs";
 import SmsPriceSelector from "./SmsPriceSelector.jsx";
+import SmsServiceSelector from "./SmsServiceSelector.jsx";
 import { filterSmsOptionsByGrade, findSmsNumberOption, preferredSmsNumberOption } from "./sms-number-options.mjs";
 import { Drawer, MoreActions, TaskFilters, TaskOverview, ThemeControl, useCalendarDay, useDialogFocus } from "./WorkspaceUi.jsx";
 import { AUTH_STATUSES, DEFAULT_FILTERS, hasFilters, queryFilters } from "./task-filters.mjs";
@@ -58,7 +59,7 @@ const MAIL_REQUEST_SETTINGS_KEY = "chatgpt-onboarding.mail-request-settings-v1";
 const SUB2API_UPLOAD_SETTINGS_KEY = "chatgpt-onboarding.sub2api-upload-settings-v1";
 const SUB2API_LINKS_VISIBLE_KEY = "tosub2.sub2api-links-visible";
 const ACCOUNT_PROXY_STORAGE_KEY = "chatgpt-onboarding.account-proxy-v1";
-const SMS_PROVIDER_ORDER = ["luban", "smsbower", "herosms", "custom", "pool"];
+const SMS_PROVIDER_ORDER = ["luban", "smsbower", "herosms", "daxigua", "custom", "pool"];
 const SMS_PROVIDER_EXTERNAL_LINKS = {
   luban: {
     href: "https://lubansms.com/",
@@ -70,6 +71,10 @@ const SMS_PROVIDER_EXTERNAL_LINKS = {
   },
   herosms: {
     href: "https://hero-sms.com/cn/api",
+    label: "查看 API 与密钥",
+  },
+  daxigua: {
+    href: "https://tibosb.site/api/docs/",
     label: "查看 API 与密钥",
   },
 };
@@ -723,6 +728,17 @@ function App({ auth }) {
       if (requestedAccess !== smsProviderAccess.current) return;
       const options = Array.isArray(data.options) ? data.options : [];
       setSmsNumberOptionsState({ providerId: resolved.id, apiKey: resolved.config.apiKey, service: resolved.config.service, options });
+      if (resolved.id === "daxigua") {
+        const current = options.find((option) => String(option.serviceId) === String(resolved.config.serviceId || ""))
+          || options.find((option) => option.country === resolved.config.country && option.project === resolved.config.project)
+          || options[0];
+        if (!current) throw new Error("当前没有可用的大西瓜接码服务");
+        updateSmsProviderConfig(resolved.id, {
+          serviceId: String(current.serviceId), country: current.country, project: current.project,
+          uses: String(current.uses), countryLabel: formatSmsServiceName(current),
+        });
+        return;
+      }
       const eligible = resolved.id === "smsbower" ? filterSmsOptionsByGrade(options, resolved.config.gradeFilter) : options;
       const current = resolved.config.maxPrice
         ? findSmsNumberOption(eligible, resolved.config) || preferredSmsNumberOption(eligible, resolved.id)
@@ -1457,6 +1473,12 @@ function App({ auth }) {
                       onGradeChange={changeSmsGrade}
                       onRefresh={() => loadSmsNumberOptions()} countryName={formatSmsCountryName} onSelect={(selected) => updateSmsProviderConfig(draftSmsProvider.id, {
                         country: selected.country, maxPrice: String(selected.price), quotedPrice: String(selected.price), providerIds: selected.providerIds || "", countryLabel: formatSmsCountryName(selected),
+                      })} />
+                  ) : field.type === "service-select" ? (
+                    <SmsServiceSelector key={`${draftSmsProvider.id}-${field.key}`} provider={draftSmsProvider} options={smsNumberOptions} loading={smsOptionsLoading}
+                      onRefresh={() => loadSmsNumberOptions()} onSelect={(selected) => updateSmsProviderConfig(draftSmsProvider.id, {
+                        serviceId: String(selected.serviceId), country: selected.country, project: selected.project,
+                        uses: String(selected.uses), countryLabel: formatSmsServiceName(selected),
                       })} />
                   ) : (
                     <label key={field.key} className={`settings-field ${field.type === "textarea" ? "wide-settings-field" : ""}`}>
@@ -2993,6 +3015,10 @@ function formatSmsCountryName(option) {
     } catch {}
   }
   return option.title || `国家 ${option.country}`;
+}
+
+function formatSmsServiceName(option) {
+  return `${option.title || option.project} / ${option.country} / ${option.uses} 次`;
 }
 
 function writeLocalJson(key, value) {

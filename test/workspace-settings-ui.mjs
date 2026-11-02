@@ -33,7 +33,7 @@ const { App } = await loadComponents("../web/src/main.jsx", ["App"], {
   OfferWorkspace: page("offers"),
   SmsPoolWorkspace: page("sms-pool"), SmsPoolChoice: () => null, SmsPoolChargeDialog: () => null,
   CdkWorkspace: ({ section }) => React.createElement("section", { "data-fixture-page": `cdk-${section}` }),
-  CurrentCdk: () => null, SmsPriceSelector: () => null,
+  CurrentCdk: () => null, SmsPriceSelector: () => null, SmsServiceSelector: () => null,
   readWorkspaceValue: () => null, writeWorkspaceValue: () => {}, flushWorkspaceSettings: async () => {},
   cdkFetch: async (url, options = {}) => {
     requests.push({ url, method: options.method || "GET" });

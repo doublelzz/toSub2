@@ -6,6 +6,7 @@ import { JSDOM } from "jsdom";
 import { transformWithEsbuild } from "vite";
 import * as filters from "../web/src/task-filters.mjs";
 import * as smsOptions from "../web/src/sms-number-options.mjs";
+import { publicSmsProviderDefinitions } from "../src/sms-providers.mjs";
 
 async function load(file, names, bindings = {}, end) {
   let source = await fs.readFile(new URL(file, import.meta.url), "utf8");
@@ -50,7 +51,7 @@ try {
   await act(async () => root.render(React.createElement(CdkWorkspace, { auth: adminAuth, section: "management", onNavigate() {} })));
   await click("详情");
   assert.equal(checkbox("允许自定义接码").checked, true); assert.equal(checkbox("允许自定义接码").disabled, true);
-  for (const label of ["允许鲁班接码", "允许SMSBower", "允许Hero SMS", "允许接码池"]) assert.equal(checkbox(label).checked, false, "old and new ordinary CDKs default to custom only");
+  for (const label of ["允许鲁班接码", "允许SMSBower", "允许Hero SMS", "允许大西瓜接码", "允许接码池"]) assert.equal(checkbox(label).checked, false, "old and new ordinary CDKs default to custom only");
   await check("允许SMSBower"); await click("保存接码权限");
   assert.deepEqual(calls.findLast((call) => call.method === "PATCH").body, { allowedSmsProviders: ["custom", "smsbower"] });
   assert.equal(checkbox("允许SMSBower").checked, true); assert.match(container.textContent, /接码方式权限已保存/);
@@ -67,25 +68,32 @@ try {
     { id: "luban", name: "鲁班接码", fields: [{ key: "apiKey", label: "API Key" }] },
     { id: "smsbower", name: "SMSBower", fields: [{ key: "apiKey", label: "API Key" }] },
     { id: "herosms", name: "Hero SMS", fields: [{ key: "apiKey", label: "API Key" }] },
+    publicSmsProviderDefinitions().find((provider) => provider.id === "daxigua"),
     { id: "custom", name: "自定义接码", fields: [{ key: "entries", label: "号码与接码 API", type: "textarea" }] },
     { id: "pool", name: "接码池", fields: [] },
   ];
-  let featureProviders = [definitions[3]];
+  let featureProviders = [definitions[4]];
   let permissionChanges = 0;
   window.addEventListener("cdk-sms-permissions-changed", () => { permissionChanges++; });
   const savedSettings = [];
+  const serviceOptions = [
+    { serviceId: "2", title: "Chat GPT", country: "kh", project: "chatgpt", uses: 1 },
+    { serviceId: "3", title: "OpenAI alternate", country: "us", project: "openai", uses: 2 },
+  ];
+  const { SmsServiceSelector } = await load("../web/src/SmsServiceSelector.jsx", ["SmsServiceSelector"]);
   let stored = { selectedProviderId: "herosms", configs: { custom: { entries: "+12025550123----https://fixture.example.invalid/code" }, herosms: { apiKey: "hidden-fixture-key" } } };
   const auth = () => ({ authenticated: true, token: "fixture-user-token", account: ordinary, workspace: ordinary, features: { smsProviders: featureProviders, allowedSmsProviders: featureProviders.map((row) => row.id), bulkActions: true }, logout: async () => {} });
   const { App, withSmsProviderDefaults } = await load("../web/src/main.jsx", ["App", "withSmsProviderDefaults"], {
     ...filters, ...smsOptions, ...ui,
     MfaWorkspace: () => null, EmailRebindWorkspace: () => null, OfferWorkspace: () => null, SmsPoolWorkspace: () => null, SmsPoolChoice: () => null, SmsPoolChargeDialog: () => null,
-    CdkWorkspace: () => null, CurrentCdk: () => null, SmsPriceSelector: () => null,
+    CdkWorkspace: () => null, CurrentCdk: () => null, SmsPriceSelector: () => null, SmsServiceSelector,
     readWorkspaceValue: (key) => key === "chatgpt-onboarding.sms-provider-settings-v1" ? JSON.stringify(stored) : null,
     writeWorkspaceValue: (key, value) => { if (key === "chatgpt-onboarding.sms-provider-settings-v1") savedSettings.push(JSON.parse(value)); }, flushWorkspaceSettings: async () => {},
     cdkFetch: async (url) => {
       if (url === "/api/bootstrap") return Response.json(auth());
       if (url.startsWith("/api/jobs?")) return Response.json({ jobs: [], selection: [], stats: {}, features: { smsProviders: featureProviders, allowedSmsProviders: featureProviders.map((row) => row.id) } });
       if (url === "/api/mail-request-config") return Response.json({ ok: true });
+      if (url === "/api/sms-providers/daxigua/options") return Response.json({ options: serviceOptions });
       throw Error(`Unexpected ordinary request ${url}`);
     },
   }, "const appRoot =");
@@ -96,23 +104,23 @@ try {
   assert.equal(container.querySelector(".sms-provider-toolbar .provider-name").textContent, "自定义接码");
   await click("配置", container.querySelector(".sms-provider-toolbar"));
   assert.deepEqual([...container.querySelectorAll('.provider-tabs [role="tab"]')].map((row) => row.textContent), ["自定义接码"]);
-  assert.doesNotMatch(container.querySelector('[role="dialog"]').textContent, /鲁班|SMSBower|Hero SMS|接码池/);
+  assert.doesNotMatch(container.querySelector('[role="dialog"]').textContent, /鲁班|SMSBower|Hero SMS|大西瓜|接码池/);
   assert.equal(savedSettings.at(-1).selectedProviderId, "custom"); assert.equal(savedSettings.at(-1).configs.herosms, undefined, "hidden cached provider credentials are never retained as active settings");
-  featureProviders = [definitions[1], definitions[3]];
+  featureProviders = [definitions[1], definitions[4]];
   await act(async () => root.render(React.createElement(App, { key: "ordinary", auth: auth() })));
   assert.deepEqual([...container.querySelectorAll('.provider-tabs [role="tab"]')].map((row) => row.textContent), ["SMSBower", "自定义接码"]);
   await act(async () => container.querySelector('.provider-tabs [role="tab"]').click());
   assert.equal(container.querySelector('.provider-tabs [aria-selected="true"]').textContent, "SMSBower");
-  featureProviders = [definitions[3], definitions[1]];
+  featureProviders = [definitions[4], definitions[1]];
   await act(async () => root.render(React.createElement(App, { key: "ordinary", auth: auth() })));
   assert.equal(container.querySelector('.provider-tabs [aria-selected="true"]').textContent, "SMSBower", "provider order changes do not reset the open tab");
-  featureProviders = [definitions[3]];
+  featureProviders = [definitions[4]];
   await act(async () => root.render(React.createElement(App, { key: "ordinary", auth: auth() })));
   assert.deepEqual([...container.querySelectorAll('.provider-tabs [role="tab"]')].map((row) => row.textContent), ["自定义接码"]);
   assert.equal(container.querySelector('.provider-tabs [aria-selected="true"]').textContent, "自定义接码", "revocation immediately repairs an open configuration draft");
-  assert.doesNotMatch(container.querySelector('[role="dialog"]').textContent, /SMSBower|Hero SMS|鲁班|接码池/);
+  assert.doesNotMatch(container.querySelector('[role="dialog"]').textContent, /SMSBower|Hero SMS|大西瓜|鲁班|接码池/);
   const afterRevocation = permissionChanges;
-  featureProviders = [definitions[3], definitions[4]];
+  featureProviders = [definitions[4], definitions[5]];
   await act(async () => new Promise((resolve) => window.setTimeout(resolve, 1000)));
   assert.deepEqual([...container.querySelectorAll('.provider-tabs [role="tab"]')].map((row) => row.textContent), ["自定义接码", "接码池"], "the existing jobs poll applies newly granted providers without reloading the app");
   assert.equal(permissionChanges, afterRevocation + 1);
@@ -120,6 +128,16 @@ try {
   await act(async () => new Promise((resolve) => window.setTimeout(resolve, 1000)));
   assert.equal(permissionChanges, afterRevocation + 1, "identical permission snapshots do not dispatch repeated refresh events");
   assert.equal(savedSettings.length, persistedAfterGrant, "identical poll snapshots do not rewrite or reset settings drafts");
+  featureProviders = [definitions[3], definitions[4]];
+  stored = { selectedProviderId: "daxigua", configs: { daxigua: { apiKey: "synthetic-daxigua-ui-key" } } };
+  await act(async () => root.render(React.createElement(App, { key: "daxigua-query", auth: auth() })));
+  await click("配置", container.querySelector(".workspace-tabs"));
+  await click("配置", container.querySelector(".sms-provider-toolbar"));
+  await click("查询服务");
+  assert.equal(container.querySelectorAll(".sms-country-row").length, 2, "initial query remains visible after automatically selecting a project");
+  await act(async () => container.querySelectorAll(".sms-country-row")[1].click());
+  assert.equal(container.querySelectorAll(".sms-country-row").length, 2, "changing project keeps the complete service list available");
+  assert.equal(container.querySelectorAll(".sms-country-row")[1].getAttribute("aria-pressed"), "true");
   console.log("CDK SMS permissions UI passed (custom-only defaults, administrator grant/revoke and issue-time choice, filtered platform tabs, cached credential removal and live draft fallback)");
 } finally {
   await act(async () => root.unmount()); dom.window.close(); globalThis.FormData = previousFormData; globalThis.matchMedia = previousMatchMedia;

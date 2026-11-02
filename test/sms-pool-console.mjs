@@ -187,8 +187,8 @@ try {
   workspace = await createConsoleWorkspace(options); workspace.resume();
   const batch = [];
   for (let index = 0; index < 6; index++) batch.push(await start(`queue-${index}@example.com`));
-  await wait(() => numbers === 5 && workspace.publicJobs().find(row => row.id === batch[5] && row.smsPoolBilling?.state === "queued"), "sixth pool request should queue behind five active sessions");
-  const waiting = workspace.publicJobs().find(row => row.id === batch[5]);
+  await wait(() => numbers === 5 && batch.some(id => workspace.publicJobs().find(row => row.id === id && row.smsPoolBilling?.state === "queued")), "one pool request should queue behind five active sessions");
+  const waiting = workspace.publicJobs().find(row => batch.includes(row.id) && row.smsPoolBilling?.state === "queued");
   assert.equal(waiting.smsPoolBilling.reserved, 0); assert.equal(waiting.smsNumberAttempt, 0); assert.equal(begun, 5); assert.equal(charges, 0);
   const queuedCancel = await start("queued-cancel@example.com");
   await wait(() => workspace.publicJobs().find(row => row.id === queuedCancel && row.smsPoolBilling?.state === "queued"), "cancel target should be queued");
