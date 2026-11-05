@@ -15,6 +15,10 @@
 .cdk-entry-form label { display: grid; gap: 8px; font-size: 13px; margin: 25px 0 20px; }
 .cdk-entry-form input { min-width: 0; width: 100%; padding: 11px; color: var(--ink); background: var(--surface); border: 1px solid var(--line); border-radius: 8px; font: inherit; }
 .cdk-entry-form .primary-button { width: 100%; }
+.cdk-remember { margin: -8px 0 18px; }
+.cdk-entry-form .cdk-remember label { display: flex; align-items: center; gap: 8px; min-height: 32px; margin: 0; cursor: pointer; }
+.cdk-entry-form .cdk-remember input { flex: 0 0 16px; width: 16px; height: 16px; margin: 0; padding: 0; accent-color: var(--green); }
+.cdk-remember p { margin: 0 0 0 24px; color: var(--muted); font-size: 12px; line-height: 1.7; }
 .cdk-entry-foot { margin-top: 24px; padding-top: 21px; border-top: 1px solid var(--line); }
 .cdk-error { padding: 13px 15px; margin: 12px 0 18px; color: var(--danger) !important; background: var(--danger-soft); border: 1px solid var(--line); border-radius: 8px; font-size: 13px; line-height: 1.8; }
 .cdk-save-error { position: sticky; top: 0; z-index: 40; background: var(--danger-soft); color: var(--danger); padding: 11px 20px; font-size: 13px; display: flex; justify-content: space-between; gap: 15px; }
@@ -178,6 +182,7 @@
   .cdk-equation strong { font-size: 23px; }
 }
 @media (pointer: coarse) {
+  .cdk-entry-form .cdk-remember label { min-height: 44px; }
   .cdk-row-actions button, .cdk-link, .cdk-tabs button, .cdk-filters select, .cdk-field input, .cdk-field select { min-height: 44px; }
   .cdk-field input, .cdk-field select, .cdk-entry-form input, .cdk-filters input { font-size: 16px; }
   .cdk-current-panel .secondary-button { min-height: 44px; }

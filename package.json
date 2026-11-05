@@ -29,7 +29,7 @@
     "check:announcement": "node test/announcement-html.mjs && node test/announcement-console.mjs && node test/announcement-ui.mjs",
     "check:phone-binding": "node test/phone-binding-console.mjs",
     "check:sms-orders": "node test/sms-orders.mjs && node test/sms-order-cancellation.mjs",
-    "check:cdk": "node test/cdk-store.mjs && node test/cdk-console.mjs && node test/cdk-sub2api-context.mjs && npm run check:cdk-sms",
+    "check:cdk": "node test/cdk-store.mjs && node test/cdk-console.mjs && node test/cdk-sub2api-context.mjs && node test/cdk-login-ui.mjs && npm run check:cdk-sms",
     "check:cdk-sms": "node test/cdk-sms-permissions.mjs && node test/cdk-sms-routes.mjs && node test/cdk-sms-client-settings.mjs && node test/cdk-sms-permissions-ui.mjs",
     "check:sms-pool": "npm run check:sms-demand && npm run check:sms-categories && node test/sms-pool.mjs && node test/daxigua-sms-pool.mjs && node test/sms-pool-api.mjs && node test/sms-pool-console.mjs && node test/phone-verification-evidence.mjs && node test/sms-pool-ui.mjs && node test/cdk-billing-ui.mjs && node test/sms-pool-actions-ui.mjs && node test/sms-pool-e2e.mjs && node test/cdk-quota-events.mjs && node test/sms-pool-production-ui.mjs && node test/sms-order-lifecycle.mjs && node test/sms-buffer.mjs && node test/sms-buffer-e2e.mjs && node test/sms-pool-buffer-ui.mjs && npm run check:sms-pool-costs",
     "check:sms-pool-costs": "node test/sms-pool-costs.mjs && node test/sms-pool-cost-ui.mjs && npm run check:sms-pool-analytics",
