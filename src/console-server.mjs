@@ -16,6 +16,7 @@ import { createOfferWorkspace } from "./offer-workspace.mjs";
 import { createOfferRunner } from "./offer-runner.mjs";
 import { matchesTaskQuery, normalizeTaskQuery, summarizeTasks } from "./task-query.mjs";
 import { ACCOUNT_SESSION_FILENAME, loadAccountInsights, publicAccountInsights } from "./account-insights.mjs";
+import { exportAccountAccessTokens } from "./account-token-export.mjs";
 import { withSub2ApiExpiry, validateSub2ApiData, summarizeSub2ApiTokens, mergeSub2ApiCredentials } from "./sub2api-export.mjs";
 import { createSub2ApiLinker, publicSub2ApiAccount } from "./sub2api-linking.mjs";
 import { phoneVerificationStatus, recordSmsOrder, publicSmsSummary } from "./sms-orders.mjs";
@@ -273,6 +274,7 @@ async function handleApi(req, res, requestUrl) {
         ...(smsPool && smsProviderAllowed("pool") ? { smsPool: await smsPool.summary() } : {}),
         queue: true,
         sourceExport: true,
+        atExport: true,
         cancelAll: true,
         sub2apiUpload: true,
         sub2apiMonitor: true,
@@ -396,6 +398,13 @@ async function handleApi(req, res, requestUrl) {
   if (req.method === "POST" && requestUrl.pathname === "/api/jobs/export-source") {
     const body = await readJson(req);
     await exportSourceAccounts(res, body.ids);
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/jobs/export-at") {
+    const body = await readJson(req);
+    const selected = resolveSelectedJobs(body.ids);
+    sendJson(res, 200, await exportAccountAccessTokens(selected));
     return;
   }
 

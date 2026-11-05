@@ -386,6 +386,16 @@ input::placeholder, textarea::placeholder { color: var(--muted); opacity: 1; }
 .mfa-export-feedback { margin-top: 10px; color: var(--muted); font-size: 13px; line-height: 1.6; }
 .mfa-export-feedback.is-error { color: var(--danger); }
 .mfa-export-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 10px; margin-top: 20px; }
+.account-export-token-status { margin: -8px 0 16px; color: var(--muted); font-size: 13px; line-height: 1.6; }
+.account-export-format { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 18px; color: var(--ink); font-size: 13px; }
+.account-export-format select { min-width: 180px; min-height: 36px; padding: 7px 10px; color: var(--ink); background: var(--surface); border: 1px solid var(--line); border-radius: 7px; }
+.account-export-content-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+.account-export-content-heading .mfa-export-label { margin: 0; }
+.account-export-content-heading button { min-height: 30px; }
+.account-export-empty { margin: 0 0 16px; padding: 12px; color: var(--muted); background: var(--surface-subtle); border: 1px solid var(--line); border-radius: 7px; font-size: 13px; line-height: 1.6; }
+.account-export-skipped { margin-top: 16px; color: var(--muted); font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
+.account-export-skipped summary { color: var(--ink); cursor: pointer; }
+.account-export-skipped ul { max-height: 140px; margin: 10px 0 0; padding-left: 20px; overflow-y: auto; }
 .mfa-history table { min-width: 0; table-layout: fixed; }
 .mfa-history { margin-top: 0; }
 .mfa-history th:nth-child(1) { width: 26%; }

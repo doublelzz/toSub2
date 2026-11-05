@@ -135,6 +135,17 @@ function App({ auth }) {
   const [selectedJobIds, setSelectedJobIds] = useState(() => new Set());
   const [jobSelectionIndex, setJobSelectionIndex] = useState([]);
   const [batchAction, setBatchAction] = useState("");
+  const [accountExportPreview, setAccountExportPreview] = useState(null);
+  const accountExportRequest = useRef(null);
+  const accountExportScope = JSON.stringify([auth.workspace.id, auth.token, activeWorkspace]);
+  const accountExportContext = useRef(accountExportScope);
+  accountExportContext.current = accountExportScope;
+  useEffect(() => {
+    setAccountExportPreview(null);
+    accountExportRequest.current?.abort(); accountExportRequest.current = null;
+    setBatchAction((current) => ["source", "at"].includes(current) ? "" : current);
+    return () => { accountExportRequest.current?.abort(); accountExportRequest.current = null; };
+  }, [accountExportScope]);
   const [page, setPage] = useState(1);
   const [pagination, setPagination] = useState({ page: 1, pageSize: 20, total: 0, totalPages: 1 });
   const [stats, setStats] = useState({ active: 0, queued: 0, completed: 0 });
@@ -1109,22 +1120,42 @@ function App({ auth }) {
     }
   }
 
-  async function exportSelectedSource() {
+  function closeAccountExport() {
+    accountExportRequest.current?.abort(); accountExportRequest.current = null;
+    setAccountExportPreview(null);
+  }
+
+  async function exportSelectedAccounts(kind) {
     if (!selectedJobIds.size || batchAction) return;
-    setBatchAction("source");
+    const ids = [...selectedJobIds]; const scope = accountExportScope;
+    const returnFocus = document.activeElement?.closest(".more-actions")?.querySelector("summary") || document.activeElement;
+    const controller = new AbortController();
+    accountExportRequest.current?.abort(); accountExportRequest.current = controller;
+    setAccountExportPreview(null); setBatchAction(kind);
+    const current = () => accountExportRequest.current === controller && accountExportContext.current === scope && !controller.signal.aborted;
     try {
-      const response = await cdkFetch("/api/jobs/export-source", {
+      const response = await cdkFetch(`/api/jobs/export-${kind}`, {
         method: "POST",
         headers: { "content-type": "application/json", "x-console-token": token },
-        body: JSON.stringify({ ids: [...selectedJobIds] }),
+        body: JSON.stringify({ ids }), signal: controller.signal,
       });
-      if (!response.ok) throw new Error((await response.json()).error || "原始信息导出失败");
-      await saveDownloadResponse(response, `chatgpt-account-source-${selectedJobIds.size}-accounts-${localTimestamp()}.txt`);
+      if (!response.ok) throw new Error((await response.json()).error || `${kind === "at" ? "AT 信息" : "原始信息"}导出失败`);
+      let result;
+      if (kind === "at") {
+        result = await response.json();
+        result = { ...result, filename: `chatgpt-account-at-${result.exported || 0}-accounts-${localTimestamp()}.txt` };
+      } else {
+        const content = (await (await response.blob()).text()).replace(/^\uFEFF/, "");
+        result = { content, requested: ids.length, exported: content.split(/\r?\n/).filter((line) => line.trim()).length,
+          filename: downloadFilename(response.headers.get("content-disposition")) || `chatgpt-account-source-${ids.length}-accounts-${localTimestamp()}.txt` };
+      }
+      if (!current()) return;
+      setAccountExportPreview({ ...result, kind, scope, returnFocus });
       setError("");
     } catch (requestError) {
-      setError(requestError.message);
+      if (current()) setError(requestError.message);
     } finally {
-      setBatchAction("");
+      if (current()) { accountExportRequest.current = null; setBatchAction(""); }
     }
   }
 
@@ -1312,11 +1343,15 @@ function App({ auth }) {
               )}
               <MoreActions label="更多">
               {features.sourceExport && (
-                <button type="button" className="secondary-button bulk-button" onClick={exportSelectedSource} disabled={!selectedJobIds.size || Boolean(batchAction)}>
+                <button type="button" className="secondary-button bulk-button" onClick={() => exportSelectedAccounts("source")} disabled={!selectedJobIds.size || Boolean(batchAction)}>
                   {batchAction === "source" ? <LoaderCircle className="spin" size={16} /> : <FileText size={16} />}
                   导出原始信息
                 </button>
               )}
+              {(features.atExport ?? features.sourceExport) && <button type="button" className="secondary-button bulk-button" onClick={() => exportSelectedAccounts("at")} disabled={!selectedJobIds.size || Boolean(batchAction)}>
+                {batchAction === "at" ? <LoaderCircle className="spin" size={16} /> : <KeyRound size={16} />}
+                导出 AT 信息
+              </button>}
               <button type="button" className="regenerate-button bulk-button" onClick={reauthorizeSelected} disabled={!canReauthorizeSelected || Boolean(batchAction)}>
                 {batchAction === "reauthorize" ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}
                 批量重新授权
@@ -1784,6 +1819,7 @@ function App({ auth }) {
         </div>
       )}
       {activeWorkspace === "authorization" && <>
+      {accountExportPreview?.scope === accountExportScope && <AccountExportDialog data={accountExportPreview} onClose={closeAccountExport} />}
       {batchOpen && (
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
           if (event.target === event.currentTarget && !batchBusy) setBatchOpen(false);
@@ -2622,6 +2658,54 @@ function downloadSummary(response) {
   try { summary = JSON.parse(response.headers.get("x-export-summary")); } catch { /* No summary from an older server. */ }
   return summary ? `已导出 ${summary.exported} 条，失败 ${summary.failed} 条，跳过 ${summary.skipped} 条。导入 Sub2API 后请设置目标分组。`
     : "文件已下载。导入 Sub2API 后请设置目标分组。";
+}
+
+function AccountExportDialog({ data, onClose }) {
+  const dialogRef = useRef(null); const contentRef = useRef(null); const alive = useRef(true);
+  const [copyState, setCopyState] = useState(""); const [format, setFormat] = useState("email-at");
+  const isAt = data.kind === "at";
+  const entries = Array.isArray(data.entries) ? data.entries : [];
+  const skipped = Array.isArray(data.skipped) ? data.skipped : [];
+  const content = isAt ? entries.map((entry) => format === "at" ? entry.accessToken : `${entry.email}----${entry.accessToken}`).join("\n") : data.content || "";
+  const expired = entries.filter((entry) => entry.expired === true).length;
+  const unknown = entries.filter((entry) => entry.expired == null).length;
+  const sessionCount = entries.filter((entry) => entry.source === "session").length;
+  const oauthCount = entries.filter((entry) => entry.source === "oauth").length;
+  useDialogFocus(true, onClose, dialogRef, data.returnFocus);
+  useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
+
+  function selectContent() { contentRef.current?.focus(); contentRef.current?.select(); }
+  async function copyContent() {
+    if (!content || copyState === "copying") return;
+    setCopyState("copying");
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error("Clipboard unavailable");
+      await navigator.clipboard.writeText(content);
+      if (alive.current) setCopyState("copied");
+    } catch {
+      if (alive.current) { setCopyState("failed"); selectContent(); }
+    }
+  }
+  function downloadContent() {
+    if (!content) return;
+    const objectUrl = URL.createObjectURL(new Blob(["\uFEFF", content], { type: "text/plain;charset=utf-8" }));
+    const link = document.createElement("a"); link.href = objectUrl; link.download = data.filename;
+    document.body.append(link); link.click(); link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1_000);
+  }
+  return <div className="modal-backdrop mfa-export-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+    <section ref={dialogRef} className="mfa-export-dialog account-export-dialog" role="dialog" aria-modal="true" aria-labelledby="account-export-title" aria-describedby="account-export-description">
+      <header className="drawer-heading"><h2 id="account-export-title">导出{isAt ? " AT 信息" : "原始信息"}</h2><button type="button" className="icon-button" aria-label="关闭账号导出预览" onClick={onClose}><X size={19} /></button></header>
+      <p id="account-export-description" className="mfa-export-description">已选 {data.requested} 个账号 · 已导出 {isAt ? entries.length : data.exported} 条{isAt && ` · 跳过 ${skipped.length} 条`}<br />{isAt ? "来自已保存的账号信息，不自动刷新 AT；过期 AT 仍按原值导出。" : "每行保留账号原始信息，可直接选中复制。"}</p>
+      {isAt && <><p className="account-export-token-status" role="status">ChatGPT 会话 {sessionCount} 条 · OAuth 授权 {oauthCount} 条<br />已过期 {expired} 条 · 期限未知 {unknown} 条</p><label className="account-export-format" htmlFor="account-export-format">导出格式<select id="account-export-format" aria-label="AT 导出格式" value={format} disabled={copyState === "copying"} onChange={(event) => { setFormat(event.target.value); setCopyState(""); }}><option value="email-at">邮箱----AT</option><option value="at">仅 AT（每行一个）</option></select></label></>}
+      {isAt && !entries.length && <p className="account-export-empty" role="status">所选账号没有可导出的已保存 AT，可导出条数为 0。</p>}
+      <div className="account-export-content-heading"><label className="mfa-export-label" htmlFor="account-export-content">导出内容</label><button type="button" className="text-action" disabled={!content} onClick={selectContent}>全选内容</button></div>
+      <textarea ref={contentRef} id="account-export-content" aria-label="账号导出预览内容" value={content} readOnly spellCheck="false" autoComplete="off" />
+      <div className={`mfa-export-feedback${copyState === "failed" ? " is-error" : ""}`} role={copyState === "failed" ? "alert" : "status"}>{copyState === "copied" ? "已复制全部内容。" : copyState === "failed" ? "无法访问剪贴板，内容已选中，请手动复制。" : "可复制全部内容，也可选中部分内容复制。"}</div>
+      {isAt && skipped.length > 0 && <details className="account-export-skipped"><summary>查看跳过账号（{skipped.length}）</summary><ul>{skipped.map((entry, index) => <li key={`${entry.email}-${index}`}><strong>{entry.email}</strong>：{entry.reason || "未找到可导出的 AT"}</li>)}</ul></details>}
+      <footer className="mfa-export-actions"><button type="button" className="secondary-button" disabled={!content} onClick={downloadContent}><Download size={16} />下载 TXT</button><button type="button" className="primary-button" disabled={!content || copyState === "copying"} onClick={copyContent}>{copyState === "copying" ? <LoaderCircle size={16} className="spin" /> : copyState === "copied" ? <Check size={16} /> : <Copy size={16} />}{copyState === "copying" ? "正在复制" : copyState === "copied" ? "已复制" : "复制全部"}</button></footer>
+    </section>
+  </div>;
 }
 
 function ExportReport({ report, onClose }) {
