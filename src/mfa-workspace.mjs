@@ -64,10 +64,11 @@ const STAGE_MESSAGES = {
 
 function sanitizeProtocolLog(value, credentials = {}) {
   let text = String(value).replace(/\x1b\[[0-9;]*m/g, "");
-  for (const secret of [credentials.password, credentials.totpSecret].filter(Boolean).sort((a, b) => b.length - a.length)) {
+  for (const secret of [credentials.password, credentials.totpSecret, credentials.proxyUrl].filter(Boolean).sort((a, b) => b.length - a.length)) {
     text = text.split(secret).join("<redacted>");
   }
   return text
+    .replace(/\b(https?|socks5h?):\/\/[^\s/]*@/gi, "$1://<redacted>@")
     .replace(/([?&](?:code|token|state|csrf|nonce|otp|code_challenge)=)[^&\s]+/gi, "$1<redacted>")
     .replace(/(["']?\b(?:access_token|accessToken|refresh_token|id_token|password|totp_secret|totpSecret|2fa_key|secret|session_id|cookie|cookies|authorization|code|otp|csrf|token)["']?\s*[=:]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\r\n]+)/gi, "$1<redacted>")
     .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, "<redacted>")
@@ -150,7 +151,7 @@ function credentialsOnly(value = {}) {
   };
 }
 
-export async function createMfaWorkspace({ root, protocolScript, credentialStore, deferCredentialRecovery = false, isAccountBusy = () => false, onSuccess = async () => {}, resolveAuthorization = async () => null, onLogout = async () => {}, onSyncAuthorization = async () => { throw requestError(409, "账号授权同步暂不可用"); } }) {
+export async function createMfaWorkspace({ root, protocolScript, credentialStore, proxyPool = null, deferCredentialRecovery = false, isAccountBusy = () => false, onSuccess = async () => {}, resolveAuthorization = async () => null, onLogout = async () => {}, onSyncAuthorization = async () => { throw requestError(409, "账号授权同步暂不可用"); } }) {
   const directory = path.join(path.resolve(root), "mfa");
   const metadataPath = path.join(directory, "accounts.json");
   const accounts = new Map();
@@ -256,7 +257,7 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
 
   async function runProtocol(account, entry, args, credentials) {
     await appendLog(account, `[process] 开始${entry.operation === "logout_all" ? "登出所有设备" : "修改 2FA"}，账号：${account.email}`);
-    await appendLog(account, `[proxy] ${credentials.proxyUrl || "直连"}`);
+    await appendLog(account, `[proxy] ${credentials.proxyUrl ? "已分配代理，本次流程保持同一代理" : "直连"}`);
     return new Promise((resolve) => {
       const reuseOnly = args.includes("--mfa-session") || entry.operation === "logout_all";
       const child = spawn(process.execPath, [protocolScript, ...args, "--verbose"], {
@@ -610,14 +611,16 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
     const requestedConcurrency = options.concurrency === undefined ? 3 : Number(options.concurrency);
     if (!Number.isInteger(requestedConcurrency) || requestedConcurrency < 1 || requestedConcurrency > 30) throw requestError(400, "并发数必须为 1 至 30 的整数");
     if ([...accounts.values()].some(processing) || activeTasks.size) throw requestError(409, "请等待当前批次结束后再启动下一批");
-    let proxyUrl;
-    if (options.proxyUrl !== undefined) {
+    let selection = proxyPool?.normalizeSelection(options) || null;
+    if (!proxyPool && (options.useProxyPool === true || Object.hasOwn(options, "proxyPool"))) throw requestError(400, "代理池暂不可用");
+    if (!proxyPool && options.proxyUrl !== undefined) {
       if (typeof options.proxyUrl !== "string") throw requestError(400, "代理地址格式错误");
-      proxyUrl = options.proxyUrl.trim();
+      const proxyUrl = options.proxyUrl.trim();
       if (proxyUrl) {
         try { if (!["http:", "https:", "socks5:", "socks5h:"].includes(new URL(proxyUrl).protocol)) throw new Error(); }
         catch { throw requestError(400, "代理地址必须使用 http、https、socks5 或 socks5h"); }
       }
+      selection = { mode: "fixed", proxyUrl };
     }
     const release = reserve(selected.map((account) => account.email));
     try {
@@ -628,8 +631,23 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
           const credentials = await loadCredentials(account, !logout && !account.sessionOnly);
           const checkpoint = await readCheckpoint(account);
           if (logout && checkpoint) throw requestError(409, "账号有待恢复的 MFA 检查点，请先重试完成恢复");
-          if (proxyUrl !== undefined) credentials.proxyUrl = proxyUrl;
-          loaded.push([account.id, credentials]);
+          loaded.push([account.id, credentials, checkpoint, { ...credentials }]);
+        }
+        // Complete credential/checkpoint validation before advancing the shared cursor.
+        // A partially completed MFA operation must resume using its saved exit.
+        const saved = [];
+        try {
+          for (const [, credentials, checkpoint] of loaded) {
+            if (selection && !checkpoint) credentials.proxyUrl = proxyPool ? proxyPool.resolve(selection) : selection.proxyUrl;
+          }
+          for (const [id, credentials, , previousCredentials] of loaded) {
+            if (credentials.proxyUrl !== previousCredentials.proxyUrl) {
+              await credentialStore.save(accounts.get(id).email, credentials); saved.push([id, previousCredentials]);
+            }
+          }
+        } catch {
+          for (const [id, credentials] of saved) await credentialStore.save(accounts.get(id).email, credentials).catch(() => {});
+          throw operationError("credentials");
         }
         concurrency = requestedConcurrency;
         const previous = selected.map((account) => ({ ...account }));
@@ -646,7 +664,11 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
           }
         }
         try { await persist(); }
-        catch (error) { for (const account of previous) Object.assign(accounts.get(account.id), account); throw error; }
+        catch (error) {
+          for (const account of previous) Object.assign(accounts.get(account.id), account);
+          for (const [id, credentials] of saved) await credentialStore.save(accounts.get(id).email, credentials).catch(() => {});
+          throw error;
+        }
         for (const [id, credentials] of loaded) activeCredentials.set(id, credentials);
         for (const account of selected) await appendLog(account, `[queued] 已加入${logout ? "设备登出" : "2FA 修改"}队列，并发数：${concurrency}`);
       });
@@ -676,9 +698,12 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
         if (credentials.totpSecret) credentials.totpSecret = normalizeSecret(credentials.totpSecret);
         const previous = existing ? { ...existing } : null;
         const previousCredentials = credentialsOnly(await credentialStore.load(email));
+        const checkpoint = existing ? await readCheckpoint(existing) : null;
         let previousSession;
         try { previousSession = await fs.readFile(sessionPath(target)); } catch (error) { if (error.code !== "ENOENT") throw operationError("storage"); }
         try {
+          if (checkpoint) credentials.proxyUrl = previousCredentials.proxyUrl;
+          else if (proxyPool) credentials.proxyUrl = proxyPool.resolve({ mode: "workspace" });
           await credentialStore.save(email, credentials);
           await writeMfaSession(sessionPath(target), session, email);
           target.sessionOnly = true;

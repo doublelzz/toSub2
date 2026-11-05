@@ -2,7 +2,8 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Ban, Check, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, CircleAlert, Copy, Download, FileText, History, ListPlus, LoaderCircle, LogOut, RefreshCw, Search, ShieldCheck, Send, X } from "lucide-react";
 import { Drawer, MoreActions, TaskFilters, TaskOverview, useCalendarDay, useDialogFocus } from "./WorkspaceUi.jsx";
 import { DEFAULT_FILTERS, matchesDate } from "./task-filters.mjs";
-import { cdkFetch } from "./cdk-api.mjs";
+import { cdkFetch, prepareProxyNetworkOptions, prepareWorkspaceProxyPool, readWorkspaceProxyPoolText } from "./cdk-api.mjs";
+import { ProxyNetworkOptions } from "./ProxyPoolInput.jsx";
 
 const PAGE_SIZE = 20;
 const ACTIVE_STATUSES = new Set(["queued", "running"]);
@@ -36,7 +37,8 @@ export default function MfaWorkspace({ token, defaultProxyUrl, focusAccountId, o
   const calendarDay = useCalendarDay();
   const [page, setPage] = useState(1);
   const [concurrency, setConcurrency] = useState(3);
-  const [proxyUrl, setProxyUrl] = useState(defaultProxyUrl || "");
+  const [proxyMode, setProxyMode] = useState("workspace");
+  const [proxyUrl, setProxyUrl] = useState(() => defaultProxyUrl ?? readWorkspaceProxyPoolText());
   const [action, setAction] = useState("");
   const [error, setError] = useState("");
   const [pollError, setPollError] = useState("");
@@ -214,8 +216,9 @@ export default function MfaWorkspace({ token, defaultProxyUrl, focusAccountId, o
     if (!targets.length || !validConcurrency) return;
     if (!window.confirm(`${retry ? "重新处理" : "修改"}这 ${targets.length} 个账号的 MFA？成功后请导出新的 MFA 密钥。`)) return;
     void perform(retry ? "retry" : "start", async () => {
+      const proxyOptions = proxyMode === "workspace" ? await prepareWorkspaceProxyPool(defaultProxyUrl ?? readWorkspaceProxyPoolText()) : await prepareProxyNetworkOptions(proxyMode, proxyUrl);
       const data = await (await request("start", {
-        method: "POST", body: JSON.stringify({ ids: targets.map((account) => account.id), concurrency: Number(concurrency), proxyUrl: proxyUrl.trim() }),
+        method: "POST", body: JSON.stringify({ ids: targets.map((account) => account.id), concurrency: Number(concurrency), ...proxyOptions }),
       })).json();
       setNotice(`已安排 ${data.started} 个账号，处理结果会自动更新。`);
       await refresh();
@@ -247,8 +250,9 @@ export default function MfaWorkspace({ token, defaultProxyUrl, focusAccountId, o
     if (!logoutable.length || !validConcurrency) return;
     if (!window.confirm(`使用已有授权，为${selectedIds.size ? "所选" : "当前筛选中"} ${logoutable.length} 个 MFA 修改成功的账号登出所有设备？包括本次会话。授权过期时会提示，不会重新登录。`)) return;
     void perform("logout-all", async () => {
+      const proxyOptions = proxyMode === "workspace" ? await prepareWorkspaceProxyPool(defaultProxyUrl ?? readWorkspaceProxyPoolText()) : await prepareProxyNetworkOptions(proxyMode, proxyUrl);
       const data = await (await request("logout-all", {
-        method: "POST", body: JSON.stringify({ ids: logoutable.map((account) => account.id), concurrency: Number(concurrency), proxyUrl: proxyUrl.trim() }),
+        method: "POST", body: JSON.stringify({ ids: logoutable.map((account) => account.id), concurrency: Number(concurrency), ...proxyOptions }),
       })).json();
       setNotice(`已安排 ${data.started} 个账号使用已有授权登出；授权过期时提示，不会重新登录，结果显示在“设备登出”列。`);
       await refresh();
@@ -309,7 +313,7 @@ export default function MfaWorkspace({ token, defaultProxyUrl, focusAccountId, o
 
       <div className="mfa-controls">
         <label className="mfa-control"><span>并发数</span><input type="number" min="1" max="30" step="1" value={concurrency} onChange={(event) => { concurrencyLoaded.current = true; setConcurrency(event.target.value); }} /></label>
-        <label className="mfa-control mfa-proxy-control"><span>代理地址</span><input type="text" value={proxyUrl} onChange={(event) => setProxyUrl(event.target.value)} autoComplete="off" spellCheck="false" placeholder="留空使用默认网络" /></label>
+        <ProxyNetworkOptions mode={proxyMode} onModeChange={setProxyMode} value={proxyUrl} onChange={setProxyUrl} disabled={Boolean(action)} ariaLabel="MFA 代理方式" />
       </div>
       {!validConcurrency && <div className="global-error" role="alert">并发数需为 1 到 30 的整数。</div>}
 

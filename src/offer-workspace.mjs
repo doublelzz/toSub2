@@ -49,7 +49,7 @@ export function parseOfferImport(raw, parseText) {
 }
 
 export async function createOfferWorkspace({ root, vault, parseText, resolveSource = async () => null, canUse = () => false,
-  isAccountBusy = () => false, runAccount, requestSchedule = () => {}, normalizeProxy = text,
+  isAccountBusy = () => false, runAccount, requestSchedule = () => {}, normalizeProxy = text, proxyPool = null,
   pollMailbox = fetchMailboxOtpCandidates, mailRequest = () => ({}), now = Date.now }) {
   const directory = path.join(root, "offers"); await fs.mkdir(directory, { recursive: true, mode: 0o700 });
   const db = new DatabaseSync(path.join(directory, "offers.sqlite"));
@@ -68,6 +68,17 @@ export async function createOfferWorkspace({ root, vault, parseText, resolveSour
   const item = (batchId, id) => { batch(batchId); const row = db.prepare("SELECT * FROM items WHERE batch_id=? AND id=?").get(batchId, text(id)); if (!row) throw error("检测账号不存在", 404); return row; };
   const secret = (row) => vault.open(row.secret, `item:${row.id}`);
   const saveSecret = (row, value) => db.prepare("UPDATE items SET secret=? WHERE id=?").run(vault.seal(value, `item:${row.id}`), row.id);
+  const proxySelection = (body) => {
+    if (proxyPool) return proxyPool.normalizeSelection(body);
+    if (Object.hasOwn(body, "proxyPool") || body.useProxyPool === true) throw error("代理池暂不可用");
+    if (!Object.hasOwn(body, "proxyUrl")) return null;
+    if (typeof body.proxyUrl !== "string") throw error("请提供有效的代理地址，或留空直连");
+    return { mode: "fixed", proxyUrl: normalizeProxy(body.proxyUrl) || "" };
+  };
+  const proxyConfigured = (selection) => selection?.mode === "workspace" ? Boolean(proxyPool.current().length)
+    : selection?.mode === "pool" ? Boolean(selection.proxies.length) : Boolean(selection?.proxyUrl);
+  const proxyRequest = (payload) => payload.proxySelection?.mode === "workspace" ? { useProxyPool: true }
+    : payload.proxySelection?.mode === "pool" ? { proxyPool: payload.proxySelection.proxies } : { proxyUrl: payload.proxyUrl || "" };
   function update(row, status, fields = {}) {
     const current = db.prepare("SELECT * FROM items WHERE id=?").get(row.id);
     const history = [...JSON.parse(current.history), { at: stamp(), status, code: fields.error_code || "", ...(Object.hasOwn(OFFER_STAGES, fields.error_stage) ? { stage: fields.error_stage } : {}) }].slice(-30);
@@ -117,13 +128,14 @@ export async function createOfferWorkspace({ root, vault, parseText, resolveSour
     if (db.prepare("SELECT COUNT(*) AS n FROM batches").get().n >= 200) throw error("检测批次已达 200 批上限");
     const concurrency = Number(body.concurrency ?? 3); const maxRetries = Number(body.maxRetries ?? 1);
     if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 20 || !Number.isInteger(maxRetries) || maxRetries < 0 || maxRetries > 3) throw error("并发必须为 1 至 20，额外重试必须为 0 至 3 的整数");
-    const proxyUrl = normalizeProxy(body.proxyUrl || "");
+    const selection = proxySelection(body) || { mode: "fixed", proxyUrl: "" };
+    const proxyUrl = selection.mode === "fixed" ? selection.proxyUrl : "";
     const parsed = parseOfferImport(body.text, parseText); const id = crypto.randomUUID();
     db.exec("BEGIN IMMEDIATE");
     try {
-      db.prepare("INSERT INTO batches VALUES(?,?,?,?,?,?,?)").run(id, text(body.name).slice(0, 80) || `优惠检测 ${stamp().slice(0, 16).replace("T", " ")}`, stamp(), "running", JSON.stringify({ concurrency, maxRetries, proxyConfigured: Boolean(proxyUrl) }), requestKey, view.digest);
+      db.prepare("INSERT INTO batches VALUES(?,?,?,?,?,?,?)").run(id, text(body.name).slice(0, 80) || `优惠检测 ${stamp().slice(0, 16).replace("T", " ")}`, stamp(), "running", JSON.stringify({ concurrency, maxRetries, proxyConfigured: proxyConfigured(selection) }), requestKey, view.digest);
       parsed.entries.forEach((entry, position) => {
-        const itemId = crypto.randomUUID(); const payload = { ...entry, proxyUrl };
+        const itemId = crypto.randomUUID(); const payload = { ...entry, ...(selection.mode === "fixed" ? { proxyUrl } : { proxySelection: selection }) };
         db.prepare("INSERT INTO items(id,batch_id,position,email,status,updated_at,secret,flags) VALUES(?,?,?,?,?,?,?,?)")
           .run(itemId, id, position, entry.email, "queued", stamp(), vault.seal(payload, `item:${itemId}`), JSON.stringify(view.accounts[position]));
       });
@@ -179,7 +191,8 @@ export async function createOfferWorkspace({ root, vault, parseText, resolveSour
     access(); const selection = where(batchId, body.ids ? { ids: body.ids } : body.filters || {});
     const rows = db.prepare(`SELECT * FROM items WHERE ${selection.sql} ORDER BY position`).all(...selection.args);
     const raw = JSON.stringify(rows.map((row) => { const value = secret(row); return { email: row.email, credentials: value.credentials, session: value.session, original: value.original }; }));
-    const view = preview({ text: raw }); return start({ ...JSON.parse(batch(batchId).options), proxyUrl: rows.length ? secret(rows[0]).proxyUrl : "", ...body, text: raw, digest: view.digest });
+    const network = proxySelection(body) ? {} : rows.length ? proxyRequest(secret(rows[0])) : { proxyUrl: "" };
+    const view = preview({ text: raw }); return start({ ...JSON.parse(batch(batchId).options), ...network, ...body, text: raw, digest: view.digest });
   }
   function activeCount() { return [...active.values()].filter((run) => run.slot).length; }
   function isBusy(email) { return [...active.values()].some((run) => run.email === emailOf(email)); }
@@ -212,7 +225,10 @@ export async function createOfferWorkspace({ root, vault, parseText, resolveSour
     const run = { email: row.email, slot: true, controller: new AbortController(), startedAt: now(), requestedAt: null, baseline: new Set(), baselineKnown: false, answer: null };
     active.set(row.id, run); update(row, "running", { error_code: "", prompt_id: "", prompt_kind: "" });
     run.done = (async () => {
-      const payload = secret(row); const source = await resolveSource(row.email);
+      const payload = secret(row);
+      // Allocate before credential/mailbox awaits so parallel launches follow queue order.
+      if (payload.proxySelection) { payload.proxyUrl = proxyPool.resolve(payload.proxySelection); saveSecret(row, payload); }
+      const source = await resolveSource(row.email);
       payload.session ||= source?.session || null;
       for (const key of ["password", "totpSecret", "mailApiUrl", "mailRequestBody"]) payload.credentials[key] ||= source?.credentials?.[key] || "";
       run.payload = payload;
@@ -240,7 +256,9 @@ export async function createOfferWorkspace({ root, vault, parseText, resolveSour
       if (!validRun(row, run)) return;
       const current = item(row.batch_id, row.id); const settings = JSON.parse(batch(row.batch_id).options);
       const code = Object.hasOwn(OFFER_ERRORS, failure.offerCode) ? failure.offerCode : "login_failed";
-      const retrying = failure.retryable === true && current.retries < settings.maxRetries;
+      const canSwitchExit = proxyPool?.canRotate(run.payload?.proxySelection)
+        && ["proxy_connection", "proxy_dns", "forbidden"].includes(code);
+      const retrying = (failure.retryable === true || canSwitchExit) && current.retries < settings.maxRetries;
       update(row, retrying ? "queued" : "failed", { error_code: code, error_stage: failure.offerStage, prompt_kind: "", prompt_id: "", retries: current.retries + (retrying ? 1 : 0), available_at: retrying ? now() + 1000 * (current.retries + 1) : 0 });
     }).finally(() => {
       if (!closing && !canUse()) {
@@ -290,9 +308,8 @@ export async function createOfferWorkspace({ root, vault, parseText, resolveSour
     if (body.ids !== undefined) where(batchId, { ids: body.ids });
     const selected = body.ids ? rows.filter((row) => body.ids.includes(row.id)) : rows;
     if (!selected.length) throw error("没有需要重试的账号");
-    const updateProxy = Object.hasOwn(body, "proxyUrl");
-    if (updateProxy && typeof body.proxyUrl !== "string") throw error("请提供有效的代理地址，或留空直连");
-    const proxyUrl = updateProxy ? normalizeProxy(body.proxyUrl) || "" : null;
+    const selection = proxySelection(body);
+    const updateProxy = Boolean(selection);
     const changes = new Map();
     if (body.credentials && selected.length === 1) {
       const row = selected[0]; const payload = secret(row); const values = body.credentials;
@@ -301,7 +318,17 @@ export async function createOfferWorkspace({ root, vault, parseText, resolveSour
       if (values.mailApiUrl) { if (!validateMailApiUrl(values.mailApiUrl)) throw error("取件 URL 无效"); payload.credentials.mailApiUrl = values.mailApiUrl; }
       changes.set(row.id, payload);
     }
-    if (updateProxy) for (const row of selected) { const payload = changes.get(row.id) || secret(row); payload.proxyUrl = proxyUrl; changes.set(row.id, payload); }
+    for (const row of selected) {
+      const payload = changes.get(row.id) || secret(row);
+      if (updateProxy) {
+        if (selection.mode === "fixed") { payload.proxyUrl = selection.proxyUrl; delete payload.proxySelection; }
+        else payload.proxySelection = selection;
+      } else if (Object.hasOwn(payload, "proxyUrl")) {
+        // An omitted retry override means keep this account's last assigned exit.
+        delete payload.proxySelection;
+      }
+      changes.set(row.id, payload);
+    }
     db.exec("BEGIN IMMEDIATE");
     try {
       for (const row of selected) {
@@ -309,7 +336,7 @@ export async function createOfferWorkspace({ root, vault, parseText, resolveSour
         update(row, "queued", { error_code: "", prompt_kind: "", prompt_id: "", retries: 0, available_at: 0 });
       }
       const settings = JSON.parse(current.options);
-      if (updateProxy && selected.length === db.prepare("SELECT COUNT(*) AS n FROM items WHERE batch_id=?").get(batchId).n) settings.proxyConfigured = Boolean(proxyUrl);
+      if (updateProxy && selected.length === db.prepare("SELECT COUNT(*) AS n FROM items WHERE batch_id=?").get(batchId).n) settings.proxyConfigured = proxyConfigured(selection);
       db.prepare("UPDATE batches SET status='running',options=? WHERE id=?").run(JSON.stringify(settings), current.id);
       db.exec("COMMIT");
     } catch (failure) { db.exec("ROLLBACK"); throw failure; }

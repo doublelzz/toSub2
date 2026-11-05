@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createMfaWorkspace } from "../src/mfa-workspace.mjs";
+import { createProxyPool } from "../src/proxy-pool.mjs";
 
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "tosub2-mfa-workspace-"));
 const oldSecret = "JBSWY3DPEHPK3PXP";
@@ -17,7 +18,7 @@ if (process.argv.includes("--logout-all")) {
   const target = process.argv[process.argv.indexOf("--logout-result") + 1];
   const attempt = process.argv[process.argv.indexOf("--logout-attempt") + 1];
   const log = path.join(path.dirname(target), "mock-runs.jsonl");
-  await fs.appendFile(log, JSON.stringify({email, event:"logout-start", at:Date.now()}) + "\\n");
+  await fs.appendFile(log, JSON.stringify({email, event:"logout-start", at:Date.now(), proxy:process.env.CHATGPT_PROXY_URL || ""}) + "\\n");
   if (email.startsWith("logout-stale")) process.exit(1);
   await new Promise(resolve => setTimeout(resolve, 200));
   if (!process.argv.includes("--mfa-session") || process.env.CHATGPT_TOTP_SECRET || process.env.CHATGPT_LOGIN_PASSWORD) process.exit(9);
@@ -32,7 +33,7 @@ if (process.argv.includes("--logout-all")) {
 }
 const target = process.argv[process.argv.indexOf("--totp-result") + 1];
 const log = path.join(path.dirname(target), "mock-runs.jsonl");
-await fs.appendFile(log, JSON.stringify({email, event:"start", at:Date.now()}) + "\\n");
+await fs.appendFile(log, JSON.stringify({email, event:"start", at:Date.now(), proxy:process.env.CHATGPT_PROXY_URL || ""}) + "\\n");
 if (!process.argv.includes("--rotate-totp") || (!process.argv.includes("--mfa-session") && !process.env.CHATGPT_LOGIN_PASSWORD)) process.exit(8);
 if (process.argv.includes("--mfa-session") && (process.env.CHATGPT_LOGIN_PASSWORD || process.env.CHATGPT_TOTP_SECRET)) process.exit(11);
 const sessionTarget = process.argv[process.argv.indexOf("--mfa-session-output") + 1];
@@ -196,8 +197,8 @@ try {
   assert.match(failedLogs, /进程结束，退出码：1/);
   assert.match(failedLogs, /单行输出过长/);
   assert.ok(failedLogs.length <= 80000);
-  assert.ok(failedLogs.includes('http://synthetic:proxy-password@localhost:12345'));
-  for (const secret of ['private-password', 'raw-cookie', oldSecret, newSecret]) assert.equal(failedLogs.includes(secret), false);
+  assert.match(failedLogs, /已分配代理/);
+  for (const secret of ['private-password', 'raw-cookie', 'proxy-password', oldSecret, newSecret]) assert.equal(failedLogs.includes(secret), false);
   await assert.rejects(instance.logs('../accounts'), { status: 404 });
   const runs = await logRows(directory);
   let active = 0;
@@ -332,6 +333,36 @@ try {
   releaseSave();
   await importPending;
   assert.equal(locked.instance.isBusy("locked@example.com"), false);
+
+  const poolUrls = ["http://fixture:pool-secret-a@a.example.invalid:8080", "socks5h://fixture:pool-secret-b@b.example.invalid:1080", "http://c.example.invalid:8080"];
+  let poolState = {};
+  const proxyPool = createProxyPool({ readPool: () => poolUrls, readState: () => poolState, writeState: (value) => { poolState = value; } });
+  const pooled = await workspace("proxy-pool", { proxyPool });
+  await pooled.instance.importAccounts("pool-one@example.com----fixture-pass\npool-two@example.com----fixture-pass\npool-three@example.com----fixture-pass\nfailed-pool@example.com----fixture-pass");
+  const poolAccounts = pooled.instance.list().accounts;
+  assert.deepEqual(poolState, {}, "importing or listing MFA accounts does not allocate a proxy");
+  await pooled.instance.start({ ids: poolAccounts.map((account) => account.id), concurrency: 3, useProxyPool: true });
+  await settled(pooled.instance);
+  const poolRuns = (await logRows(pooled.directory)).filter((row) => row.event === "start");
+  for (let index = 0; index < poolAccounts.length; index++) {
+    const expected = new URL(poolUrls[index % poolUrls.length]).toString();
+    assert.equal(poolRuns.find((row) => row.email === poolAccounts[index].email).proxy, expected);
+    assert.equal((await pooled.store.load(poolAccounts[index].email)).proxyUrl, expected, "the concrete proxy is saved before protocol execution");
+  }
+  const failedPool = poolAccounts.find((row) => row.email.startsWith("failed"));
+  const stateBeforeResume = structuredClone(poolState);
+  await pooled.instance.shutdown();
+  const pooledRestart = await workspace("proxy-pool", { proxyPool, credentialStore: pooled.store });
+  await pooledRestart.instance.start({ ids: [failedPool.id], useProxyPool: true });
+  await settled(pooledRestart.instance);
+  assert.deepEqual(poolState, stateBeforeResume, "recovering a partially completed MFA checkpoint must not consume another exit");
+  assert.equal((await logRows(pooled.directory)).filter((row) => row.email === failedPool.email && row.event === "start").at(-1).proxy,
+    new URL(poolUrls[0]).toString(), "restart recovery continues with the actual saved proxy");
+  assert.doesNotMatch((await pooledRestart.instance.logs(failedPool.id)).logs, /pool-secret/);
+  const successfulPool = poolAccounts.find((row) => row.email === "pool-one@example.com");
+  await pooledRestart.instance.logoutAll({ ids: [successfulPool.id], useProxyPool: true });
+  await settled(pooledRestart.instance);
+  assert.equal((await logRows(pooled.directory)).filter((row) => row.event === "logout-start").at(-1).proxy, new URL(poolUrls[1]).toString(), "a new logout operation receives the next exit");
 
   const corruptDirectory = path.join(root, "corrupt", "mfa");
   await fs.mkdir(corruptDirectory, { recursive: true });

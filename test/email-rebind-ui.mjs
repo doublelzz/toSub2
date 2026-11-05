@@ -1,3 +1,4 @@
+import * as proxyPoolUi from "./proxy-pool-ui-support.mjs";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import React, { act, useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -9,9 +10,10 @@ const source = await fs.readFile(new URL("../web/src/EmailRebindWorkspace.jsx", 
 const code = source.replace(/^import[^\n]+\n/gm, "").replace("export default function", "function").replace(/export function/g, "function");
 const compiled = await transformWithEsbuild(code, "EmailRebindWorkspace.jsx", { loader: "jsx", jsx: "transform" });
 const usedIcons = Object.fromEntries([...code.matchAll(/<([A-Z]\w*)/g)].map((match) => match[1]).filter((name) => icons[name]).map((name) => [name, icons[name]]));
-const bindings = { React, useCallback, useEffect, useMemo, useRef, useState, ...usedIcons, useDialogFocus: () => {},
-  Drawer: ({ children }) => React.createElement("section", null, children), cdkFetch: () => { throw new Error("Unexpected external request"); } };
-const { MappingDialog, CodeForm, RebindLogs } = new Function(...Object.keys(bindings), `${compiled.code};return {MappingDialog,CodeForm,RebindLogs};`)(...Object.values(bindings));
+let workspaceFetch = () => { throw new Error("Unexpected external request"); };
+const bindings = { ...proxyPoolUi, React, useCallback, useEffect, useMemo, useRef, useState, ...usedIcons, useDialogFocus: () => {},
+  Drawer: ({ children }) => React.createElement("section", null, children), cdkFetch: (...args) => workspaceFetch(...args) };
+const { EmailRebindWorkspace, MappingDialog, CodeForm, RebindLogs } = new Function(...Object.keys(bindings), `${compiled.code};return {EmailRebindWorkspace,MappingDialog,CodeForm,RebindLogs};`)(...Object.values(bindings));
 const dom = new JSDOM('<div id="root"></div>', { url: "http://localhost" });
 globalThis.window = dom.window; globalThis.document = dom.window.document; globalThis.HTMLElement = dom.window.HTMLElement;
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
@@ -98,5 +100,25 @@ try {
   assert.equal(container.querySelector("pre").textContent, fullLog, "refresh cannot duplicate previously loaded logs");
   await act(async () => { root.render(React.createElement(RebindLogs, { id: "different-rebind", request: async () => ({ logs: "another record", offset: 0, nextOffset: 14, hasMore: false }) })); });
   assert.equal(container.querySelector("pre").textContent, "another record", "switching accounts clears the previous journal");
+  const workflowCalls = [];
+  workspaceFetch = async (url, options = {}) => {
+    const body = options.body ? JSON.parse(options.body) : null; workflowCalls.push({ url, body });
+    if (url.endsWith("/state")) return Response.json({ sources: [{ ...selected[0], sources: ["authorization"] }], items: [] });
+    if (url.endsWith("/preview")) return Response.json({ digest: "pool-mapping", rows: [{ oldEmail: selected[0].email, newEmail: "new-first@example.com", mode: "manual" }] });
+    if (url.endsWith("/start")) return Response.json({ started: 1 });
+    throw new Error(`Unexpected proxy-pool workflow route: ${url}`);
+  };
+  await act(async () => root.render(React.createElement(EmailRebindWorkspace, { token: "fixture" })));
+  await act(() => button("换绑邮箱").click());
+  await fill(container.querySelector("textarea"), "new-first@example.com");
+  await act(async () => button("核对映射").click());
+  proxyPoolUi.setWorkspaceProxyPoolDraft("invalid-proxy");
+  await act(async () => button("确认并开始换绑").click());
+  assert.equal(workflowCalls.filter((call) => call.url.endsWith("/start")).length, 0, "invalid shared pool drafts prevent new rebind operations");
+  assert.match(container.textContent, /第 1 行代理格式错误/);
+  proxyPoolUi.setWorkspaceProxyPoolDraft("http://fixture.example.invalid:8080");
+  await act(async () => button("确认并开始换绑").click());
+  assert.equal(workflowCalls.filter((call) => call.url.endsWith("/start")).length, 1);
+  proxyPoolUi.setWorkspaceProxyPoolDraft("");
   console.log("email rebind UI passed (mapping, OTP, charged import, complete paged logs, safe text rendering, copy and record isolation)");
 } finally { await act(() => root.unmount()); dom.window.close(); }

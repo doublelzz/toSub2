@@ -1,3 +1,4 @@
+import * as proxyPoolUi from "./proxy-pool-ui-support.mjs";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import React, { act, useEffect, useId, useMemo, useRef, useState } from "react";
@@ -14,7 +15,7 @@ async function loadComponents(file, names, bindings, end) {
   const compiled = await transformWithEsbuild(code, file, { loader: "jsx", jsx: "transform" });
   const usedIcons = Object.fromEntries([...code.matchAll(/<([A-Z]\w*)/g)]
     .map((match) => match[1]).filter((name) => icons[name]).map((name) => [name, icons[name]]));
-  const scope = { React, useEffect, useId, useMemo, useRef, useState, ...usedIcons, ...bindings };
+  const scope = { ...proxyPoolUi, React, useEffect, useId, useMemo, useRef, useState, ...usedIcons, ...bindings };
   return new Function(...Object.keys(scope), `${compiled.code}; return { ${names.join(",")} };`)(...Object.values(scope));
 }
 
@@ -26,6 +27,7 @@ const auth = {
   logout: async () => {},
 };
 const requests = [];
+const settingsWrites = [];
 const page = (name) => () => React.createElement("section", { "data-fixture-page": name });
 const { App } = await loadComponents("../web/src/main.jsx", ["App"], {
   ...filters, ...smsOptions, ...ui,
@@ -34,7 +36,7 @@ const { App } = await loadComponents("../web/src/main.jsx", ["App"], {
   SmsPoolWorkspace: page("sms-pool"), SmsPoolChoice: () => null, SmsPoolChargeDialog: () => null,
   CdkWorkspace: ({ section }) => React.createElement("section", { "data-fixture-page": `cdk-${section}` }),
   CurrentCdk: () => null, SmsPriceSelector: () => null, SmsServiceSelector: () => null,
-  readWorkspaceValue: () => null, writeWorkspaceValue: () => {}, flushWorkspaceSettings: async () => {},
+  readWorkspaceValue: () => null, writeWorkspaceValue: (key, value) => settingsWrites.push({ key, value }), flushWorkspaceSettings: async () => {},
   cdkFetch: async (url, options = {}) => {
     requests.push({ url, method: options.method || "GET" });
     if (url === "/api/bootstrap") return Response.json(auth);
@@ -82,6 +84,25 @@ try {
       await close();
     }
   }
+  await act(() => button(container.querySelector(".topbar-actions"), "系统配置").click());
+  const proxyToolbar = dialog().querySelector(".account-proxy-toolbar");
+  assert.equal(proxyToolbar.querySelector("textarea"), null, "workspace proxies are hidden by default");
+  await act(() => button(proxyToolbar, "查看 / 编辑").click());
+  const proxyInput = proxyToolbar.querySelector('[aria-label="工作区代理池地址"]');
+  const fillProxy = (value) => act(() => { Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set.call(proxyInput, value); proxyInput.dispatchEvent(new window.Event("input", { bubbles: true })); });
+  const firstProxy = "http://fixture-user:fixture-secret@first.example.invalid:8080";
+  const secondProxy = "socks5h://second.example.invalid:1080";
+  await fillProxy(`${firstProxy}\n\ninvalid`);
+  assert.match(proxyToolbar.textContent, /第 3 行代理格式错误/);
+  assert.equal(proxyInput.getAttribute("aria-invalid"), "true");
+  assert.equal(settingsWrites.filter((write) => write.key === proxyPoolUi.PROXY_POOL_STORAGE_KEY).at(-1).value, "[]", "invalid drafts do not overwrite saved pools");
+  await fillProxy(`${firstProxy}\n\n${secondProxy}\n${firstProxy}`);
+  assert.match(proxyToolbar.textContent, /3 个代理 · 顺序循环/);
+  assert.deepEqual(JSON.parse(settingsWrites.filter((write) => write.key === proxyPoolUi.PROXY_POOL_STORAGE_KEY).at(-1).value), [firstProxy, secondProxy, firstProxy]);
+  await act(() => button(proxyToolbar, "隐藏代理").click());
+  assert.equal(proxyToolbar.querySelector("textarea"), null);
+  assert.doesNotMatch(proxyToolbar.textContent, /fixture-secret/);
+  await close();
   assert.equal(container.querySelector(".global-error"), null);
   assert.equal(requests.some((request) => /sub2api|sms/.test(request.url)), false, "opening configuration must not contact remote account services");
   console.log("workspace settings UI passed (all eight workspaces, three shared configurations, Escape and scroll restoration)");

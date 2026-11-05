@@ -1,3 +1,4 @@
+import * as proxyPoolUi from "./proxy-pool-ui-support.mjs";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import React, { act, useState, useEffect } from "react";
@@ -12,7 +13,7 @@ const calls = [];
 let response = () => Promise.resolve({ accountId: "fixture-mfa-task" });
 const noop = () => null;
 const usedIcons = Object.fromEntries([...rowSource.matchAll(/<([A-Z]\w*)/g)].map((match) => match[1]).filter((name) => icons[name]).map((name) => [name, icons[name]]));
-const bindings = { React, useState, useEffect, ...usedIcons, getInputConfig: noop, QuotaInfo: noop, SubscriptionInfo: noop,
+const bindings = { ...proxyPoolUi, React, useState, useEffect, ...usedIcons, getInputConfig: noop, QuotaInfo: noop, SubscriptionInfo: noop,
   SmsSummary: noop, LoginMethodBadge: noop, JobLogs: noop, StatusBadge: noop,
   MoreActions: ({ children }) => React.createElement("details", null, React.createElement("summary", null, "more"), children),
   formatInsightDate: String, formatDateTime: String, shortId: String, operationLabel: String,

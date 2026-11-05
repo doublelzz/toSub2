@@ -50,6 +50,7 @@ export class TlsFingerprintTransport {
     profile = DEFAULT_TLS_PROFILE,
     verbose = false,
     maxProxySessionAttempts = 10,
+    proxyPoolEnabled = false,
     sameProxyRiskRetries = DEFAULT_SAME_PROXY_RISK_RETRIES,
     sameProxyRiskRetryDelayMs = DEFAULT_SAME_PROXY_RISK_RETRY_DELAY_MS,
     cloudflareSolver = true,
@@ -68,6 +69,7 @@ export class TlsFingerprintTransport {
     this.configuredProfile = null;
     this.closed = false;
     this.remainingProxySessionAttempts = normalizeProxyAttemptLimit(maxProxySessionAttempts);
+    this.proxyPoolEnabled = Boolean(proxyPoolEnabled);
     this.sameProxyRiskRetries = normalizeRetryLimit(sameProxyRiskRetries, DEFAULT_SAME_PROXY_RISK_RETRIES);
     this.sameProxyRiskRetryDelayMs = normalizeRetryLimit(
       sameProxyRiskRetryDelayMs,
@@ -128,17 +130,18 @@ export class TlsFingerprintTransport {
     }
 
     const canRotate = proxySupportsSessionRotation(template);
-    if (canRotate && this.remainingProxySessionAttempts <= 0) {
+    const canReplace = canRotate || this.proxyPoolEnabled;
+    if (canReplace && this.remainingProxySessionAttempts <= 0) {
       throw new Error("PROXY_RISK_CONTROL: 代理会话检测额度已用尽");
     }
     const maxAttempts = 1;
-    if (!canRotate) {
+    if (!canReplace) {
       console.log("[proxy] 未检测到可轮换的会话编号，仅检测当前代理 1 次");
     }
     let lastError = null;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       const proxy = canRotate ? rotateProxySession(template) : template;
-      if (canRotate) {
+      if (canReplace) {
         this.remainingProxySessionAttempts -= 1;
       }
       try {
@@ -152,21 +155,21 @@ export class TlsFingerprintTransport {
             accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
           },
         });
-        if (canRotate) console.log(`[proxy-session-attempt] ${randomUUID()}`);
+        if (canReplace) console.log(`[proxy-session-attempt] ${randomUUID()}`);
         const challenge = response.headers.get("cf-mitigated") || response.headers.get("x-cf-mitigated");
         if (response.status >= 200 && response.status < 400 && !challenge) {
           console.log(`[proxy] 代理检测通过（第 ${attempt} 次，出口会话 ${maskSession(proxy)}）`);
           return proxy;
         }
         lastError = new Error(`HTTP ${response.status}${challenge ? "，返回安全校验页面" : ""}`);
-        if (canRotate) {
+        if (canReplace) {
           console.log(`[proxy] 本次代理检测失败：${lastError.message}，等待更换会话`);
         } else {
           console.log(`[proxy] 代理检测失败：${lastError.message}`);
         }
       } catch (error) {
         lastError = error;
-        if (canRotate) {
+        if (canReplace) {
           console.log(`[proxy] 本次代理连接失败：${redactProxyError(error.message)}，等待更换会话`);
           throw new Error(`PROXY_CONNECTION_RETRY: ${redactProxyError(error.message)}`);
         } else {
@@ -175,7 +178,7 @@ export class TlsFingerprintTransport {
       }
     }
     throw new Error(
-      canRotate
+      canReplace
         ? `PROXY_RISK_CONTROL: 代理本次检测失败：${redactProxyError(lastError?.message || "未知错误")}`
         : `代理检测失败：${redactProxyError(lastError?.message || "未知错误")}`,
     );
@@ -600,12 +603,12 @@ function maskSession(proxyUrl) {
     if (/(^|-)sid-[A-Za-z0-9]+(?=-|$)/.test(username)) {
       return username.replace(/(sid-)[A-Za-z0-9]+/, `$1<redacted:${fingerprint}>`);
     }
-    return `${username || "proxy"}-session-<redacted:${fingerprint}>`;
+    return `proxy-session-<redacted:${fingerprint}>`;
   } catch {
     return "<redacted>";
   }
 }
 
 function redactProxyError(message) {
-  return String(message || "").replace(/(https?|socks5h?):\/\/[^\s/]+:[^\s/@]+@/gi, "$1://<redacted>@").slice(0, 220);
+  return String(message || "").replace(/(https?|socks5h?):\/\/[^\s/]+@/gi, "$1://<redacted>@").slice(0, 220);
 }

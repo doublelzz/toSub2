@@ -27,6 +27,7 @@ import {
 } from "./mail-otp.mjs";
 import { createSmsProvider, publicSmsProviderDefinitions } from "./sms-providers.mjs";
 import { DEFAULT_TLS_PROFILE, DirectTlsProfileProbe, proxySupportsSessionRotation } from "./tls-transport.mjs";
+import { createProxyPool } from "./proxy-pool.mjs";
 
 const MAX_ACTIVE_JOBS = 20;
 const MAX_BATCH_JOBS = 500;
@@ -68,6 +69,35 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const TOOL_ROOT = path.resolve(__dirname, "..");
 const WORKSPACE_ROOT = TOOL_ROOT;
 export async function createConsoleWorkspace(options) {
+const proxyPool = options.proxyPool || createProxyPool();
+const assignedProxy = Symbol("assignedProxy");
+function proxySelection(body) {
+  const selection = proxyPool.normalizeSelection(body);
+  if (selection?.mode === "pool") throw httpError(400, "请在工作区配置中设置账号代理池");
+  return selection;
+}
+function hasProxyUpdate(body) { return proxySelection(body) !== null; }
+function selectJobProxy(body) {
+  if (body[assignedProxy]) return body[assignedProxy];
+  const selection = proxySelection(body);
+  return selection ? { proxyUrl: proxyPool.resolve(selection) || null, proxySource: selection.mode === "workspace" ? "workspace" : "fixed" } : null;
+}
+async function batchProxyOptions(body, selected, eligible = () => true, preserveCheckpoint = () => false) {
+  proxySelection(body); // Validate the whole request before advancing any cursor.
+  const keep = await Promise.all(selected.map((job) => body.useProxyPool === true && preserveCheckpoint(job) ? fileExists(job.checkpointPath) : false));
+  return selected.map((job, index) => eligible(job) && !keep[index] ? { ...body, [assignedProxy]: selectJobProxy(body) } : body);
+}
+async function updateExecutionProxy(job, body, { preserveCheckpoint = false } = {}) {
+  if (!hasProxyUpdate(body)) return;
+  // Continuing an existing session must keep its exit IP.
+  if (preserveCheckpoint && proxySelection(body)?.mode === "workspace" && await fileExists(job.checkpointPath)) return;
+  await reloadMissingJobCredentials(job);
+  const selection = selectJobProxy(body);
+  job.proxyUrl = selection.proxyUrl;
+  job.proxySource = selection.proxySource;
+  job.hasProxyCredential = Boolean(job.proxyUrl);
+  await saveStoredLoginCredentials(job.email, job);
+}
 const smsPool = options.smsPool || null;
 const smsProviderAllowed = (providerId) => typeof options.smsProviderAllowed !== "function" || options.smsProviderAllowed(providerId) === true;
 function assertSmsProviderAllowed(providerId) {
@@ -159,6 +189,7 @@ const mfaCredentialStore = createCredentialStore({
 });
 const mfaCredentialPrefix = `mfa:${crypto.createHash("sha256").update(OUTPUT_ROOT).digest("hex")}:`;
 mfaWorkspace = await createMfaWorkspace({
+  proxyPool,
   root: OUTPUT_ROOT,
   deferCredentialRecovery: true,
   protocolScript: PROTOCOL_SCRIPT,
@@ -192,6 +223,7 @@ mfaWorkspace = await createMfaWorkspace({
   },
 });
 rebindWorkspace = await createEmailRebindWorkspace({
+  proxyPool,
   root: OUTPUT_ROOT, vault: options.rebindVault,
   listSources: rebindSources, resolveSource: resolveRebindSource,
   isAccountBusy: (email) => Boolean(offerWorkspace?.isBusy(email)) || emailJobLocks.has(email.toLowerCase()) || mfaWorkspace.isBusy(email)
@@ -200,6 +232,7 @@ rebindWorkspace = await createEmailRebindWorkspace({
   runStep: createRebindRunner(PROTOCOL_SCRIPT, path.join(OUTPUT_ROOT, "email-rebind", "ipc")),
 });
 offerWorkspace = await createOfferWorkspace({
+  proxyPool,
   root: OUTPUT_ROOT, vault: options.offerVault || options.rebindVault, canUse: options.offerCanUse,
   parseText: (value) => parseBatchEntries(value, mailRequestConfig), normalizeProxy: normalizeProxyUrl,
   resolveSource: async (email) => {
@@ -303,20 +336,22 @@ async function handleApi(req, res, requestUrl) {
     }
     const hasCredentialUpdate = ["password", "mailApiUrl", "mailRequestBody", "totpSecret"].some((key) => Object.hasOwn(body, key));
     const credentials = normalizeLoginCredentials(body);
-    const hasProxyUpdate = Object.hasOwn(body, "proxyUrl");
+    const hasProxyChange = hasProxyUpdate(body);
     const hasPhoneBindingUpdate = Object.hasOwn(body, "phoneBindingEnabled") || Object.hasOwn(body, "phoneBindingMode");
     const phoneOptions = normalizePhoneOptions(body, req.actorId);
     const { phoneBindingEnabled } = phoneOptions;
-    const proxyUrl = hasProxyUpdate ? normalizeProxyUrl(body.proxyUrl) : null;
     const result = await withEmailJobLock(email, async () => {
       const existing = findJobByEmail(email);
+      const selectedProxy = selectJobProxy(body);
+      const proxyUrl = selectedProxy?.proxyUrl ?? null;
+      const proxySource = selectedProxy?.proxySource || "fixed";
       if (existing) {
-        if (hasCredentialUpdate || hasPhoneBindingUpdate) await updateJobCredentials(existing, hasCredentialUpdate ? credentials : { preserveExistingCredentials: true }, { proxyUrl, hasProxyUpdate, ...(hasPhoneBindingUpdate ? phoneOptions : {}) });
+        if (hasCredentialUpdate || hasPhoneBindingUpdate) await updateJobCredentials(existing, hasCredentialUpdate ? credentials : { preserveExistingCredentials: true }, { proxyUrl, proxySource, hasProxyUpdate: hasProxyChange, ...(hasPhoneBindingUpdate ? phoneOptions : {}) });
         if (hasPhoneBindingUpdate) await savePhoneOptions(existing, phoneOptions);
-        else if (hasProxyUpdate) await updateJobProxy(existing, proxyUrl);
-        return { job: existing, created: false, updated: hasCredentialUpdate || hasProxyUpdate || hasPhoneBindingUpdate };
+        else if (hasProxyChange) await updateJobProxy(existing, proxyUrl, proxySource);
+        return { job: existing, created: false, updated: hasCredentialUpdate || hasProxyChange || hasPhoneBindingUpdate };
       }
-      return { job: await startJob(email, credentials, proxyUrl, phoneBindingEnabled, phoneOptions), created: true, updated: false };
+      return { job: await startJob(email, credentials, proxyUrl, phoneBindingEnabled, phoneOptions, { proxySource }), created: true, updated: false };
     });
     sendJson(res, result.created ? 201 : 200, { ...result, job: publicJob(result.job) });
     return;
@@ -325,18 +360,21 @@ async function handleApi(req, res, requestUrl) {
   if (req.method === "POST" && requestUrl.pathname === "/api/jobs/batch") {
     const body = await readJson(req);
     const entries = parseBatchEntries(body.text, mailRequestConfig);
-    const proxyUrl = normalizeProxyUrl(body.proxyUrl);
     const phoneOptions = normalizePhoneOptions(body, req.actorId);
     const { phoneBindingEnabled } = phoneOptions;
-    const settled = await Promise.allSettled(entries.map((entry) => withEmailJobLock(entry.email, async () => {
+    const proxyOptions = await batchProxyOptions(body, entries);
+    const settled = await Promise.allSettled(entries.map((entry, index) => withEmailJobLock(entry.email, async () => {
+      const selectedProxy = selectJobProxy(proxyOptions[index]);
+      const proxyUrl = selectedProxy?.proxyUrl ?? null;
+      const proxySource = selectedProxy?.proxySource || "fixed";
       const existing = findJobByEmail(entry.email);
       if (existing) {
         const hasPolicy = Object.hasOwn(body, "phoneBindingEnabled") || Object.hasOwn(body, "phoneBindingMode");
-        await updateJobCredentials(existing, entry, { proxyUrl, hasProxyUpdate: true, ...(hasPolicy ? phoneOptions : {}) });
+        await updateJobCredentials(existing, entry, { proxyUrl, proxySource, hasProxyUpdate: true, ...(hasPolicy ? phoneOptions : {}) });
         if (hasPolicy) await savePhoneOptions(existing, phoneOptions);
         return { job: existing, updated: true };
       }
-      return { job: await startJob(entry.email, entry, proxyUrl, phoneBindingEnabled, phoneOptions), updated: false };
+      return { job: await startJob(entry.email, entry, proxyUrl, phoneBindingEnabled, phoneOptions, { proxySource }), updated: false };
     })));
     const rejection = settled.find((item) => item.status === "rejected");
     if (rejection) throw rejection.reason;
@@ -377,10 +415,11 @@ async function handleApi(req, res, requestUrl) {
       (job) => !["completed", "failed", "canceled", "reauth_required", "resume_available", "phone_skipped"].includes(job.status),
     );
     if (unsupported) throw httpError(409, `${unsupported.email} 当前仍在进行中，不能重新授权`);
-    await Promise.all(selected.map((job) => withEmailJobLock(job.email, async () => {
+    const proxyOptions = await batchProxyOptions(body, selected, () => true, (job) => job.status !== "completed");
+    await Promise.all(selected.map((job, index) => withEmailJobLock(job.email, async () => {
       captureSmsPoolActor(job, req.actorId);
-      if (job.status === "completed") await regenerateJob(job, body);
-      else await retryJob(job, body);
+      if (job.status === "completed") await regenerateJob(job, proxyOptions[index]);
+      else await retryJob(job, proxyOptions[index]);
     })));
     sendJson(res, 200, { jobs: selected.map(publicJob), started: selected.length });
     return;
@@ -413,10 +452,11 @@ async function handleApi(req, res, requestUrl) {
   if (req.method === "POST" && requestUrl.pathname === "/api/jobs/relogin-batch") {
     const body = await readJson(req);
     const selected = resolveSelectedJobs(body.ids);
-    const started = await Promise.all(selected.map((job) => withEmailJobLock(job.email, async () => {
+    const proxyOptions = await batchProxyOptions(body, selected, canForceRelogin);
+    const started = await Promise.all(selected.map((job, index) => withEmailJobLock(job.email, async () => {
       if (!canForceRelogin(job)) return null;
       captureSmsPoolActor(job, req.actorId);
-      await forceReloginJob(job, body);
+      await forceReloginJob(job, proxyOptions[index]);
       return job;
     })));
     const eligible = started.filter(Boolean);
@@ -432,9 +472,10 @@ async function handleApi(req, res, requestUrl) {
   if (req.method === "POST" && requestUrl.pathname === "/api/jobs/setup-2fa-batch") {
     const body = await readJson(req);
     const selected = resolveSelectedJobs(body.ids);
-    const started = await Promise.all(selected.map((job) => withEmailJobLock(job.email, async () => {
+    const proxyOptions = await batchProxyOptions(body, selected, canSetupTotp, (job) => !job.resultSaved);
+    const started = await Promise.all(selected.map((job, index) => withEmailJobLock(job.email, async () => {
       if (!canSetupTotp(job)) return null;
-      await startTotpSetup(job, body);
+      await startTotpSetup(job, proxyOptions[index]);
       return job;
     })));
     const eligible = started.filter(Boolean);
@@ -450,9 +491,10 @@ async function handleApi(req, res, requestUrl) {
   if (req.method === "POST" && requestUrl.pathname === "/api/jobs/add-password-batch") {
     const body = await readJson(req);
     const selected = resolveSelectedJobs(body.ids);
-    const started = await Promise.all(selected.map((job) => withEmailJobLock(job.email, async () => {
+    const proxyOptions = await batchProxyOptions(body, selected, canAddPassword, (job) => !job.resultSaved);
+    const started = await Promise.all(selected.map((job, index) => withEmailJobLock(job.email, async () => {
       if (!canAddPassword(job)) return null;
-      await startPasswordAdd(job, body);
+      await startPasswordAdd(job, proxyOptions[index]);
       return job;
     })));
     const eligible = started.filter(Boolean);
@@ -1219,9 +1261,9 @@ function canCheckAccountInsights(job) {
   return !isActive(job.status) && !job.child && (Boolean(job.resultSaved) || job.accountSessionAvailable || job.status === "phone_skipped");
 }
 
-async function startJob(email, credentials = {}, proxyUrl = null, phoneBindingEnabled = false, phoneOptions = {}) {
+async function startJob(email, credentials = {}, proxyUrl = null, phoneBindingEnabled = false, phoneOptions = {}, initialState = {}) {
   assertMfaIdle(email);
-  const job = await createJobRecord(email, credentials, proxyUrl, phoneBindingEnabled, phoneOptions);
+  const job = await createJobRecord(email, credentials, proxyUrl, phoneBindingEnabled, phoneOptions, initialState);
   scheduleQueuedJobs();
   return job;
 }
@@ -1271,6 +1313,7 @@ async function createJobRecord(email, credentials = {}, proxyUrl = null, phoneBi
     hasPasswordCredential: Boolean(password),
     hasTotpCredential: Boolean(totpSecret),
     proxyUrl,
+    proxySource: initialState.proxySource || "fixed",
     credentialsLoaded: true,
     hasProxyCredential: Boolean(proxyUrl),
     mailApiUrl,
@@ -1497,6 +1540,7 @@ function launchJob(job, options = {}) {
       TOSUB2_PHONE_JOB_ID: job.id,
       TOSUB2_PHONE_RUN_ID: runId,
       CHATGPT_PROXY_URL: job.proxyUrl || "",
+      CHATGPT_PROXY_POOL_ENABLED: job.proxySource === "workspace" && proxyPool.canRotate({ mode: "workspace" }) ? "1" : "",
       CHATGPT_PROXY_MAX_ATTEMPTS: String(Math.max(0, MAX_PROXY_RISK_RETRIES - (job.proxyRiskRetryCount || 0))),
       TOSUB2_TLS_PROFILE:
         String(process.env.TOSUB2_TLS_PROFILE || "").trim()
@@ -1650,12 +1694,7 @@ async function retryJob(job, options = {}) {
   }
   await assertSavedSmsSetupAllowed(job);
   const retryingSecurityCheck = Boolean(job.securityCheckRequired);
-  if (Object.hasOwn(options, "proxyUrl")) {
-    await reloadMissingJobCredentials(job);
-    job.proxyUrl = normalizeProxyUrl(options.proxyUrl);
-    job.hasProxyCredential = Boolean(job.proxyUrl);
-    const persisted = await saveStoredLoginCredentials(job.email, job);
-  }
+  await updateExecutionProxy(job, options, { preserveCheckpoint: true });
   const resumingCheckpoint = await fileExists(job.checkpointPath);
   stopMailPolling(job);
   if (resumingCheckpoint) stopSmsPolling(job);
@@ -1701,12 +1740,7 @@ async function regenerateJob(job, options = {}) {
   if (job.status !== "completed" || !job.resultSaved) {
     throw httpError(409, "只能为已经完成的任务重新生成授权");
   }
-  if (Object.hasOwn(options, "proxyUrl")) {
-    await reloadMissingJobCredentials(job);
-    job.proxyUrl = normalizeProxyUrl(options.proxyUrl);
-    job.hasProxyCredential = Boolean(job.proxyUrl);
-    await saveStoredLoginCredentials(job.email, job);
-  }
+  await updateExecutionProxy(job, options);
   job.lastError = null;
   job.parserTail = "";
   job.currentPhone = null;
@@ -1732,15 +1766,11 @@ async function forceReloginJob(job, options = {}, context = {}) {
     throw httpError(409, "当前任务正在进行中，不能重新登录");
   }
   await assertSavedSmsSetupAllowed(job);
-  if (job.pendingPasswordRecovery || job.pendingTotpRecovery || Object.hasOwn(options, "proxyUrl")) await reloadMissingJobCredentials(job);
+  if (job.pendingPasswordRecovery || job.pendingTotpRecovery || hasProxyUpdate(options)) await reloadMissingJobCredentials(job);
   if (!canForceRelogin(job)) {
     throw httpError(409, "当前任务正在进行中，不能重新登录");
   }
-  if (Object.hasOwn(options, "proxyUrl")) {
-    job.proxyUrl = normalizeProxyUrl(options.proxyUrl);
-    job.hasProxyCredential = Boolean(job.proxyUrl);
-    await saveStoredLoginCredentials(job.email, job);
-  }
+  await updateExecutionProxy(job, context.autoRepair && job.proxySource === "workspace" && !hasProxyUpdate(options) ? { useProxyPool: true } : options);
   stopMailPolling(job);
   releaseSmsNumber(job, "idle");
   job.queueRunId = null;
@@ -1812,12 +1842,7 @@ async function startTotpSetup(job, options = {}) {
     job.loginCheckpointAvailable = false;
     throw httpError(409, "邮箱登录检查点已丢失，请先重新登录");
   }
-  if (Object.hasOwn(options, "proxyUrl")) {
-    await reloadMissingJobCredentials(job);
-    job.proxyUrl = normalizeProxyUrl(options.proxyUrl);
-    job.hasProxyCredential = Boolean(job.proxyUrl);
-    await saveStoredLoginCredentials(job.email, job);
-  }
+  await updateExecutionProxy(job, options, { preserveCheckpoint: resumeAuthorization });
   stopMailPolling(job);
   releaseSmsNumber(job, "idle");
   job.queueRunId = null;
@@ -1855,12 +1880,7 @@ async function startPasswordAdd(job, options = {}) {
     job.loginCheckpointAvailable = false;
     throw httpError(409, "邮箱登录检查点已丢失，请先重新登录");
   }
-  if (Object.hasOwn(options, "proxyUrl")) {
-    await reloadMissingJobCredentials(job);
-    job.proxyUrl = normalizeProxyUrl(options.proxyUrl);
-    job.hasProxyCredential = Boolean(job.proxyUrl);
-    await saveStoredLoginCredentials(job.email, job);
-  }
+  await updateExecutionProxy(job, options, { preserveCheckpoint: resumeAuthorization });
   stopMailPolling(job);
   releaseSmsNumber(job, "idle");
   job.queueRunId = null;
@@ -2422,7 +2442,7 @@ async function restartAfterProxyRisk(job, options = {}) {
       job.directTlsFallbackAttempted = true;
       const fallbackProfile = await directTlsProfileProbe.resolve();
       appendJobLog(job, `[tls] Cloudflare 求解未完成，正在启用直连 TLS 指纹筛选兜底（${fallbackProfile}）。\n`);
-    } else if (!proxySupportsSessionRotation(job.proxyUrl)) {
+    } else if (!proxySupportsSessionRotation(job.proxyUrl) && !(job.proxySource === "workspace" && proxyPool.canRotate({ mode: "workspace" }))) {
       finishProxyRiskRetries(
         job,
         "当前代理没有可识别的会话编号，无法自动轮换；请更换代理配置后重试",
@@ -2452,6 +2472,16 @@ async function restartAfterProxyRisk(job, options = {}) {
     const restartRunId = job.runId;
     job.child?.kill("SIGTERM");
     job.child = null;
+    if (job.proxySource === "workspace") {
+      if (!proxyPool.current().length) {
+        finishProxyRiskRetries(job, "代理池已清空，请重新配置后重试");
+        return;
+      }
+      const nextProxy = proxyPool.resolve({ mode: "workspace" });
+      job.proxyUrl = nextProxy || null;
+      job.hasProxyCredential = Boolean(nextProxy);
+      await saveStoredLoginCredentials(job.email, job);
+    }
     if (mode === "full") await removePrivateFile(job.checkpointPath);
     job.parserTail = "";
     job.lastError = null;
@@ -4781,6 +4811,7 @@ function recordJobOperation(job, type, at = new Date().toISOString()) {
 
 function sanitizeLog(text) {
   return String(text)
+    .replace(/\b(https?|socks5h?):\/\/[^\s/]*@/gi, "$1://<redacted>@")
     .replace(/([?&](?:code|token|state|csrf|nonce|otp|login_hint|code_challenge)=)[^&\s]+/gi, "$1<redacted>")
     .replace(/(access_token|refresh_token|id_token|password|totp_secret|2fa_key)\s*[=:]\s*[^\s,}]+/gi, "$1=<redacted>");
 }
@@ -4956,7 +4987,7 @@ async function syncCompletedOutputs(force = false) {
         child: null, parserTail: "", resultSaved,
         accountInsights: metadata.account_insights_snapshot || null,
         loginMode: metadata.login_mode === "password" || flags.hasPasswordCredential ? "password" : mailApiUrl ? "email_otp" : metadata.login_mode || "manual",
-        password: "", totpSecret: "", proxyUrl: null,
+        password: "", totpSecret: "", proxyUrl: null, proxySource: metadata.proxy_source === "workspace" ? "workspace" : "fixed",
         credentialsLoaded: false, hasProxyCredential: metadata.proxy_configured === true,
         pendingPasswordRecovery: metadata.pending_password_recovery === true,
         pendingTotpRecovery: metadata.pending_totp_recovery === true,
@@ -5721,6 +5752,7 @@ async function updateJobCredentials(job, credentials, options = {}) {
       })
     : normalizeLoginCredentials(credentials);
   const nextProxyUrl = options.hasProxyUpdate ? normalizeProxyUrl(options.proxyUrl) : job.proxyUrl;
+  const nextProxySource = options.hasProxyUpdate ? options.proxySource || "fixed" : job.proxySource || "fixed";
   const nextPhoneBinding = Object.hasOwn(options, "phoneBindingEnabled") ? options.phoneBindingEnabled : job.phoneBindingEnabled !== false;
   const changed = job.loginMode !== normalized.loginMode
     || job.mailApiUrl !== normalized.mailApiUrl
@@ -5728,6 +5760,7 @@ async function updateJobCredentials(job, credentials, options = {}) {
     || job.password !== normalized.password
     || job.totpSecret !== normalized.totpSecret
     || job.proxyUrl !== nextProxyUrl
+    || (job.proxySource || "fixed") !== nextProxySource
     || (job.phoneBindingEnabled !== false) !== nextPhoneBinding;
   await saveStoredLoginCredentials(job.email, { ...normalized, proxyUrl: nextProxyUrl });
   if (!changed) return;
@@ -5740,6 +5773,7 @@ async function updateJobCredentials(job, credentials, options = {}) {
   job.hasPasswordCredential = Boolean(normalized.password);
   job.hasTotpCredential = Boolean(normalized.totpSecret);
   job.proxyUrl = nextProxyUrl;
+  job.proxySource = nextProxySource;
   job.hasProxyCredential = Boolean(nextProxyUrl);
   job.credentialsLoaded = true;
   job.phoneBindingEnabled = nextPhoneBinding;
@@ -5757,11 +5791,12 @@ async function updateJobCredentials(job, credentials, options = {}) {
   }
 }
 
-async function updateJobProxy(job, proxyUrl) {
+async function updateJobProxy(job, proxyUrl, proxySource = "fixed") {
   assertMfaIdle(job.email);
   await reloadMissingJobCredentials(job);
-  if (job.proxyUrl === proxyUrl) return;
+  if (job.proxyUrl === proxyUrl && (job.proxySource || "fixed") === proxySource) return;
   job.proxyUrl = proxyUrl;
+  job.proxySource = proxySource;
   job.hasProxyCredential = Boolean(proxyUrl);
   await saveStoredLoginCredentials(job.email, job);
   recordJobOperation(job, "proxy_update");
@@ -5856,6 +5891,7 @@ async function saveJobMetadata(job) {
         proxy_risk_retry_count: Number(job.proxyRiskRetryCount || 0),
         proxy_connection_failure_count: Number(job.proxyConnectionFailureCount || 0),
         proxy_configured: Boolean(job.proxyUrl || job.hasProxyCredential),
+        proxy_source: job.proxySource || "fixed",
         sms_provider_id: job.smsProviderId || null,
         sms_provider_name: job.smsProviderName || null,
         sms_service_label: job.smsServiceLabel || null,
@@ -6224,7 +6260,7 @@ function planImport(mode, body) {
       const email = String(body.email || "").trim(); if (!isEmail(email)) throw httpError(422, "邮箱格式不正确");
       normalizeLoginCredentials(body); emails = [email.toLowerCase()];
     } else emails = parseBatchEntries(body.text, mailRequestConfig).map((entry) => entry.email.toLowerCase());
-    normalizeProxyUrl(body.proxyUrl); normalizePhoneOptions(body);
+    proxySelection(body); normalizePhoneOptions(body);
   }
   for (const email of emails) {
     const existing = findJobByEmail(email);

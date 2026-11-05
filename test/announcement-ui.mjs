@@ -1,3 +1,4 @@
+import * as proxyPoolUi from "./proxy-pool-ui-support.mjs";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import React, { act, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
@@ -18,7 +19,7 @@ async function load(file, names, bindings = {}, end) {
   const compiled = await transformWithEsbuild(code, file, { loader: "jsx", jsx: "transform" });
   const usedIcons = Object.fromEntries([...code.matchAll(/<([A-Z]\w*)/g)]
     .map((match) => match[1]).filter((name) => icons[name]).map((name) => [name, icons[name]]));
-  const scope = { React, useCallback, useEffect, useId, useMemo, useRef, useState, createPortal, ...usedIcons, ...bindings };
+  const scope = { ...proxyPoolUi, React, useCallback, useEffect, useId, useMemo, useRef, useState, createPortal, ...usedIcons, ...bindings };
   return new Function(...Object.keys(scope), `${compiled.code}; return { ${names.join(",")} };`)(...Object.values(scope));
 }
 

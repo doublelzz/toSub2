@@ -1,3 +1,4 @@
+import * as proxyPoolUi from "./proxy-pool-ui-support.mjs";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import React, { act, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
@@ -14,7 +15,7 @@ async function load(file, names, bindings = {}, end) {
   const code = source.replace(/^import[\s\S]*?;\r?\n/gm, "").replace("export default function", "function").replace(/^export /gm, "");
   const compiled = await transformWithEsbuild(code, file, { loader: "jsx", jsx: "transform" });
   const usedIcons = Object.fromEntries([...code.matchAll(/<([A-Z]\w*)/g)].map((match) => match[1]).filter((name) => icons[name]).map((name) => [name, icons[name]]));
-  const scope = { React, useCallback, useEffect, useId, useMemo, useRef, useState, ...usedIcons, ...bindings };
+  const scope = { ...proxyPoolUi, React, useCallback, useEffect, useId, useMemo, useRef, useState, ...usedIcons, ...bindings };
   return new Function(...Object.keys(scope), `${compiled.code};return {${names.join(",")}};`)(...Object.values(scope));
 }
 
@@ -36,6 +37,7 @@ globalThis.fetch = async (url, options = {}) => {
   const method = options.method || "GET"; const body = options.body ? JSON.parse(options.body) : null;
   calls.push({ url, method, body });
   if (url === "/api/bootstrap") return Response.json(auth);
+  if (url === "/api/settings/workspace") return Response.json({ ok: true });
   if (url === "/api/imports/preview") {
     const emails = body.mode === "single" ? [body.payload.email] : body.payload.text.split(/\r?\n/).filter(Boolean).map((line) => line.split("----")[0]);
     const count = new Set(emails.map((email) => email.toLowerCase())).size;
@@ -148,7 +150,7 @@ try {
   const emailInput = container.querySelector('input[type="email"]');
   await act(() => { Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set.call(emailInput, "new-pool-account@example.invalid"); emailInput.dispatchEvent(new window.Event("input", { bubbles: true })); });
   await act(() => container.querySelector('[aria-label="允许手机号接码"]').click());
-  await checkImportConfirmation(() => click("添加任务"), "/api/jobs", { email: "new-pool-account@example.invalid", proxyUrl: "", phoneBindingMode: "automatic", phoneBindingEnabled: true, smsProvider: { id: "pool", config: { categoryId: "other", quotedFee: 3, feeVersion: 1 } } }, 1);
+  await checkImportConfirmation(() => click("添加任务"), "/api/jobs", { email: "new-pool-account@example.invalid", useProxyPool: true, phoneBindingMode: "automatic", phoneBindingEnabled: true, smsProvider: { id: "pool", config: { categoryId: "other", quotedFee: 3, feeVersion: 1 } } }, 1);
   await render();
   await click("新建任务");
   await click("批量导入");
@@ -164,7 +166,7 @@ try {
   assert.equal(importDialog(), null, "Escape cancels the pending fee confirmation");
   assert.equal(container.querySelector("#batch-input").value, batchText, "canceling preserves batch input");
   assert.equal(button("创建 2 条任务").disabled, false, "canceling clears the pending busy state");
-  await checkImportConfirmation(() => click("创建 2 条任务"), "/api/jobs/batch", { text: batchText, proxyUrl: "", phoneBindingMode: "automatic", phoneBindingEnabled: true, smsProvider: { id: "pool", config: { categoryId: "other", quotedFee: 3, feeVersion: 1 } } }, 2);
+  await checkImportConfirmation(() => click("创建 2 条任务"), "/api/jobs/batch", { text: batchText, useProxyPool: true, phoneBindingMode: "automatic", phoneBindingEnabled: true, smsProvider: { id: "pool", config: { categoryId: "other", quotedFee: 3, feeVersion: 1 } } }, 2);
   assert.equal(container.querySelector("#batch-input"), null, "successful batch creation closes its drawer");
   assert.equal(document.body.style.overflow, "", "closing all batch confirmations restores scrolling");
   const categories = [{ id: "us", name: "美区", enabled: true, fee: 7 }, { id: "other", name: "其他", enabled: true, fee: 3 }];

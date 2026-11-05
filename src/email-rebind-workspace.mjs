@@ -84,7 +84,7 @@ export function createRebindRunner(protocolScript, directory) {
 }
 
 export async function createEmailRebindWorkspace({ root, vault, listSources, resolveSource, isAccountBusy, lookupSync = () => null, runStep,
-  pollMailbox = fetchMailboxOtpCandidates, pollIntervalMs = 2000, now = Date.now }) {
+  pollMailbox = fetchMailboxOtpCandidates, pollIntervalMs = 2000, now = Date.now, proxyPool = null }) {
   const directory = path.join(root, "email-rebind");
   const statePath = path.join(directory, "state.enc");
   const items = new Map(); const active = new Map();
@@ -180,7 +180,17 @@ export async function createEmailRebindWorkspace({ root, vault, listSources, res
         // Reserve both identities before yielding to credential reads.
         items.set(item.id, item); added.push(item);
       }
-      try { for (const item of added) { try { item.snapshot = await sourceSnapshot(item); } catch { item.snapshot = null; } } concurrency = desiredConcurrency; await persist(); }
+      try {
+        for (const item of added) {
+          try { item.snapshot = await sourceSnapshot(item); } catch { item.snapshot = null; }
+        }
+        for (const item of added) {
+          if (item.snapshot && proxyPool) {
+            item.snapshot = { ...item.snapshot, credentials: { ...item.snapshot.credentials, proxyUrl: proxyPool.resolve({ mode: "workspace" }) } };
+          }
+        }
+        concurrency = desiredConcurrency; await persist();
+      }
       catch (failure) { for (const item of added) items.delete(item.id); throw failure; }
     });
     pump(); return { batchId, count: body.ids.length };
@@ -220,7 +230,16 @@ export async function createEmailRebindWorkspace({ root, vault, listSources, res
       item.attempt = (item.attempt || 0) + 1;
       await journal.append(item, `[attempt:${item.attempt}] ${item.oldEmail} -> ${item.newEmail}，收码方式=${item.mode}`);
       await update(item, "checking", "检查已有登录信息和换绑资格");
-      item.snapshot = await sourceSnapshot(item);
+      const previous = accountSnapshot(item);
+      const refreshed = await sourceSnapshot(item);
+      // Refresh the login information without changing the exit used by this mapping.
+      if (previous?.credentials && Object.hasOwn(previous.credentials, "proxyUrl")) {
+        refreshed.credentials = { ...refreshed.credentials, proxyUrl: previous.credentials.proxyUrl };
+      } else if (proxyPool) {
+        refreshed.credentials = { ...refreshed.credentials, proxyUrl: proxyPool.resolve({ mode: "workspace" }) };
+      }
+      item.snapshot = refreshed;
+      await serialize(persist);
       await step(item, "eligibility", null, run.controller.signal);
       if (item.cancelRequested || stopping) { await update(item, "cancelled", "已停止，未确认换绑"); return; }
       await baseline(item);

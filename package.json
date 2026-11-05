@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "check:storage": "node --check src/workspace-storage.mjs && node test/workspace-storage.mjs && node test/credential-store.mjs && node test/lazy-credentials.mjs && node test/console-restore-shutdown-smoke.mjs",
+    "check:proxy-pool": "node --check src/proxy-pool.mjs && node test/proxy-pool.mjs && node test/proxy-pool-console.mjs && node test/proxy-pool-client-settings.mjs && node test/tls-transport.mjs && node test/offer-proxy-retry.mjs && node test/workspace-settings-ui.mjs",
     "build": "vite build web --outDir dist",
     "predev": "npm run build",
     "prestart": "npm run build",

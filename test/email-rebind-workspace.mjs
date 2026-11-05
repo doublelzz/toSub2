@@ -6,6 +6,7 @@ import path from "node:path";
 import { createCdkVault } from "../src/cdk-vault.mjs";
 import { createEmailRebindWorkspace, parseRebindTargets } from "../src/email-rebind-workspace.mjs";
 import { emailRebindStep, rebindError } from "../src/email-rebind-protocol.mjs";
+import { createProxyPool } from "../src/proxy-pool.mjs";
 
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "tosub2-rebind-unit-"));
 process.env.TOSUB2_ENCRYPTION_KEY = crypto.randomBytes(32).toString("base64");
@@ -15,13 +16,16 @@ const sources = ["one", "two", "uncertain", "cancel"].map((name) => ({ id: name,
 const calls = []; const begun = new Set(); const imported = new Map(); let instance;
 const sourceSession = (email) => ({ type: "chatgpt-session", version: 1, email, accessToken: "synthetic-private-access-token", accountId: "stable-account", expiresAt: "2099-01-01T00:00:00Z" });
 const credentials = { password: "synthetic-private-password", totpSecret: "JBSWY3DPEHPK3PXP", proxyUrl: "" };
-const options = { root, vault, listSources: () => structuredClone(sources), isAccountBusy: () => false,
+const poolUrls = ["http://fixture:pool-secret-a@a.example.invalid:8080", "socks5h://fixture:pool-secret-b@b.example.invalid:1080", "http://c.example.invalid:8080"];
+let poolState = {};
+const proxyPool = createProxyPool({ readPool: () => poolUrls, readState: () => poolState, writeState: (value) => { poolState = value; } });
+const options = { root, vault, proxyPool, listSources: () => structuredClone(sources), isAccountBusy: () => false,
   now: () => clock, pollIntervalMs: 10,
   resolveSource: async (id, email) => ({ session: sourceSession(email), credentials: { ...credentials } }),
   lookupSync: (row) => imported.get(row.id),
   pollMailbox: async (url) => begun.has(url) ? [{ code: "001234", key: "fresh-code-fingerprint", receivedAt: clock + 1 }] : [{ code: "999999", key: "historical-code-fingerprint", receivedAt: clock - 60000 }],
   runStep: async (operation, payload) => {
-    calls.push({ operation, email: payload.email, newEmail: payload.newEmail, code: payload.code });
+    calls.push({ operation, email: payload.email, newEmail: payload.newEmail, code: payload.code, proxyUrl: payload.proxyUrl });
     if (operation === "begin") begun.add("https://mail.example.com/private-retrieval-key");
     if (operation === "verify" && payload.newEmail.startsWith("uncertain")) throw rebindError("UNCERTAIN");
     if (operation === "verify" && payload.code !== "001234") throw rebindError("CODE_INVALID");
@@ -72,6 +76,7 @@ try {
   const preview = instance.preview(body);
   assert.doesNotMatch(JSON.stringify(preview), /private-retrieval-key/);
   await assert.rejects(instance.start({ ...body, digest: "stale-preview" }), /映射已变化/);
+  assert.deepEqual(poolState, {}, "rebind previews and invalid confirmations do not consume an exit");
   await instance.start({ ...body, digest: preview.digest });
   await assert.rejects(instance.start({ ...body, digest: preview.digest }), /任务|占用/);
   const auto = await waitFor(() => instance.list().items.find((row) => row.oldEmail === "one@example.com" && row.status === "success"));
@@ -94,6 +99,9 @@ try {
   await instance.submit(manual.id, { code: "001234", version: 2 });
   assert.equal(instance.list().items.find((row) => row.id === manual.id).status, "success");
   assert.deepEqual(calls.filter((row) => row.operation === "verify" && row.code === "001234").map((row) => [row.email, row.newEmail]), [["one@example.com", "new-one@example.com"], ["two@example.com", "new-two@example.com"]]);
+  assert.ok(calls.filter((row) => row.email === "one@example.com").every((row) => row.proxyUrl === new URL(poolUrls[0]).toString()));
+  assert.ok(calls.filter((row) => row.email === "two@example.com").every((row) => row.proxyUrl === new URL(poolUrls[1]).toString()), "qualification, send, resend and confirmation share the mapping's assigned exit");
+  assert.equal(poolState.workspace.nextIndex, 2, "rebind protocol steps never advance the shared proxy cursor");
   const records = instance.importRecords([auto.id, manual.id]);
   assert.equal(records[0].credentials.password, credentials.password);
   imported.set(auto.id, { id: "new-auth-job" });
@@ -123,5 +131,34 @@ try {
   assert.equal(instance.list().items.find((row) => row.id === cancellable.id).status, "cancelled");
   assert.equal(instance.isBusy("cancel@example.com"), false);
   assert.equal(calls.filter((row) => row.email === "cancel@example.com" && row.operation === "verify").length, 0);
+  sources.push({ id: "pool-restart", email: "pool-restart@example.com", sources: ["mfa"] });
+  const restoreBody = { ids: ["pool-restart"], text: "pool-restored@example.com" };
+  await instance.start({ ...restoreBody, digest: instance.preview(restoreBody).digest });
+  const restoreItem = await waitFor(() => instance.list().items.find((row) => row.oldEmail === "pool-restart@example.com" && row.status === "waiting_manual"));
+  const restoreProxy = calls.find((row) => row.email === restoreItem.oldEmail).proxyUrl;
+  const cursorBeforeRestore = structuredClone(poolState);
+  await instance.shutdown(); instance = await createEmailRebindWorkspace(options);
+  await instance.retry(restoreItem.id);
+  const restoredItem = await waitFor(() => instance.list().items.find((row) => row.id === restoreItem.id && row.status === "waiting_manual"));
+  await instance.submit(restoredItem.id, { code: "001234", version: restoredItem.challengeVersion });
+  assert.equal(instance.list().items.find((row) => row.id === restoreItem.id).status, "success");
+  assert.ok(calls.filter((row) => row.email === restoreItem.oldEmail).every((row) => row.proxyUrl === restoreProxy), "a restored mapping retains the same exit across all resumed steps");
+  assert.deepEqual(poolState, cursorBeforeRestore);
+  await instance.shutdown();
+  const legacyProxy = "http://fixture:legacy-secret@legacy.example.invalid:8080";
+  const legacyOptions = { ...options, root: path.join(root, "legacy"), proxyPool: null,
+    listSources: () => [{ id: "legacy", email: "legacy@example.com", sources: ["mfa"] }],
+    resolveSource: async (id, email) => ({ session: sourceSession(email), credentials: { ...credentials, proxyUrl: legacyProxy } }) };
+  instance = await createEmailRebindWorkspace(legacyOptions);
+  const legacyBody = { ids: ["legacy"], text: "legacy-new@example.com" };
+  await instance.start({ ...legacyBody, digest: instance.preview(legacyBody).digest });
+  const legacyItem = await waitFor(() => instance.list().items.find((row) => row.oldEmail === "legacy@example.com" && row.status === "waiting_manual"));
+  await instance.shutdown();
+  const beforeLegacy = structuredClone(poolState);
+  instance = await createEmailRebindWorkspace({ ...legacyOptions, proxyPool });
+  await instance.retry(legacyItem.id);
+  await waitFor(() => instance.list().items.find((row) => row.id === legacyItem.id && row.status === "waiting_manual"));
+  assert.ok(calls.filter((row) => row.email === "legacy@example.com").every((row) => row.proxyUrl === legacyProxy), "upgrading a legacy snapshot retains its saved single proxy");
+  assert.deepEqual(poolState, beforeLegacy, "legacy checkpoint recovery does not take from the newly configured pool");
   console.log("email rebind workspace passed (exact mapping, mixed OTP, resend, uncertainty, encrypted storage and recovery)");
 } finally { await instance?.shutdown(); await fs.rm(root, { recursive: true, force: true }); }

@@ -1,3 +1,4 @@
+import * as proxyPoolUi from "./proxy-pool-ui-support.mjs";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import React, { act, useCallback, useEffect, useRef, useState } from "react";
@@ -29,8 +30,8 @@ const cdkFetch = async (url, options = {}) => {
   if (url.endsWith("/access")) return Response.json({ allowed: true });
   throw Error(`Unexpected UI request: ${url}`);
 };
-const bindings = { React, useCallback, useEffect, useRef, useState, ...usedIcons, useDialogFocus: () => {},
-  Drawer: ({ children, onClose }) => React.createElement("section", { "data-offer-drawer": true }, React.createElement("button", { "aria-label": "关闭测试详情", onClick: onClose }, "关闭详情"), children), cdkFetch, readWorkspaceValue: (key) => key === "chatgpt-onboarding.account-proxy-v1" ? workspaceProxy : "" };
+const bindings = { ...proxyPoolUi, React, useCallback, useEffect, useRef, useState, ...usedIcons, useDialogFocus: () => {},
+  Drawer: ({ children, onClose }) => React.createElement("section", { "data-offer-drawer": true }, React.createElement("button", { "aria-label": "关闭测试详情", onClick: onClose }, "关闭详情"), children), cdkFetch, readWorkspaceProxyPoolText: () => workspaceProxy };
 const { OfferWorkspace, OfferImportDialog, OfferExportDialog, OfferInput } = new Function(...Object.keys(bindings), `${compiled.code};return {OfferWorkspace,OfferImportDialog,OfferExportDialog,OfferInput};`)(...Object.values(bindings));
 const dom = new JSDOM('<div id="root"></div>', { url: "http://localhost" });
 globalThis.window = dom.window; globalThis.document = dom.window.document; globalThis.HTMLElement = dom.window.HTMLElement;
@@ -63,6 +64,7 @@ try {
   await fill(container.querySelector('input[max="20"]'), "21"); assert.equal(button("开始检测（1）").disabled, true);
   await fill(container.querySelector('input[max="20"]'), "2"); await click("开始检测（1）"); assert.equal(starts[0].id, "new-batch");
   assert.equal(importRequests[1].body.digest, "reviewed"); assert.equal(importRequests[1].body.concurrency, 2);
+  assert.equal(importRequests[1].body.useProxyPool, true, "offer imports use the workspace pool by default");
   await fill(container.querySelector("textarea"), "changed@example.com"); assert.equal(button("开始检测").disabled, true, "editing input invalidates preview");
   const inputs = [];
   await act(() => root.render(React.createElement(OfferInput, { row: { email: "first@example.com", promptKind: "email" }, onSubmit: (value) => inputs.push(value) })));
@@ -74,18 +76,21 @@ try {
   assert.doesNotMatch(failedRows[1].querySelector('[data-label="执行状态"]').textContent, /失败阶段/);
   await act(async () => failedRows[0].querySelector('[data-label="操作"] button').click());
   assert.match(container.querySelector("[data-offer-drawer]").textContent, /失败阶段：解析优惠响应/);
-  const singleProxy = container.querySelector('[aria-label="本次重试代理"]');
-  assert.equal(singleProxy.type, "password", "proxy credentials remain masked");
-  assert.equal(singleProxy.value, workspaceProxy, "single account retry starts from current workspace proxy");
+  assert.equal(container.querySelector('[aria-label="单账号重试代理方式"]').value, "workspace");
+  await fill(container.querySelector('[aria-label="单账号重试代理方式"]'), "custom");
+  assert.equal(container.querySelector('[aria-label="本次代理池地址"]'), null, "proxy credentials are absent while collapsed");
+  await click("查看 / 编辑");
+  const singleProxy = container.querySelector('[aria-label="本次代理池地址"]');
+  assert.equal(singleProxy.value, workspaceProxy, "custom pool starts from the current workspace pool");
   await fill(container.querySelector('.offer-credentials input[type="password"]'), "replacement-password");
-  await fill(singleProxy, "http://replacement.example.invalid:8080");
+  await fill(singleProxy, "http://replacement.example.invalid:8080\n\nsocks5://second.example.invalid:1080\nhttp://replacement.example.invalid:8080");
   await click("重试这个账号");
-  assert.deepEqual(calls.findLast((value) => value.url.endsWith("/retry")).body, { ids: ["row-0"], credentials: { password: "replacement-password" }, proxyUrl: "http://replacement.example.invalid:8080" }, "single retry sends proxyUrl at top level alongside credentials");
+  assert.deepEqual(calls.findLast((value) => value.url.endsWith("/retry")).body, { ids: ["row-0"], credentials: { password: "replacement-password" }, proxyPool: ["http://replacement.example.invalid:8080", "socks5://second.example.invalid:1080", "http://replacement.example.invalid:8080"] }, "custom pool preserves order and duplicates while ignoring blank lines");
   assert.equal(container.querySelector("[data-offer-drawer]"), null);
   await act(async () => container.querySelectorAll("tbody tr")[0].querySelector('[data-label="操作"] button').click());
-  const resetProxy = container.querySelector('[aria-label="本次重试代理"]'); assert.equal(resetProxy.value, workspaceProxy);
-  await fill(resetProxy, ""); await click("重试这个账号");
-  assert.deepEqual(calls.findLast((value) => value.url.endsWith("/retry")).body, { ids: ["row-0"], credentials: {}, proxyUrl: "" }, "clearing single retry proxy explicitly requests direct connection");
+  assert.equal(container.querySelector('[aria-label="单账号重试代理方式"]').value, "workspace");
+  await fill(container.querySelector('[aria-label="单账号重试代理方式"]'), "direct"); await click("重试这个账号");
+  assert.deepEqual(calls.findLast((value) => value.url.endsWith("/retry")).body, { ids: ["row-0"], credentials: {}, proxyUrl: "" }, "direct mode explicitly requests direct connection");
   await act(async () => container.querySelectorAll("tbody tr")[0].querySelector('[data-label="操作"] button').click());
   await click("关闭详情");
   await act(async () => container.querySelectorAll("tbody tr")[1].querySelector('[data-label="操作"] button').click());
@@ -94,18 +99,17 @@ try {
   const beforeRetryReview = calls.filter((value) => value.url.endsWith("/retry")).length;
   await click("继续 / 重试失败");
   assert.equal(container.querySelectorAll("[data-offer-drawer]").length, 1, "batch retry opens one settings drawer");
-  assert.equal(container.querySelector('[aria-label="重试代理方式"]').value, "keep");
+  assert.equal(container.querySelector('[aria-label="重试代理方式"]').value, "workspace");
   assert.equal(calls.filter((value) => value.url.endsWith("/retry")).length, beforeRetryReview, "opening settings does not launch a retry");
   await click("取消");
   assert.equal(calls.filter((value) => value.url.endsWith("/retry")).length, beforeRetryReview);
-  await click("继续 / 重试失败"); await click("确认继续 / 重试失败");
+  await click("继续 / 重试失败"); await fill(container.querySelector('[aria-label="重试代理方式"]'), "keep"); await click("确认继续 / 重试失败");
   assert.deepEqual(calls.findLast((value) => value.url.endsWith("/retry")).body, {}, "preserving original proxies does not send an implicit override");
   await click("继续 / 重试失败");
   await fill(container.querySelector('[aria-label="重试代理方式"]'), "workspace");
-  const batchProxy = container.querySelector('[aria-label="批量重试代理"]');
-  assert.equal(batchProxy.type, "password"); assert.equal(batchProxy.value, workspaceProxy);
+  assert.equal(container.querySelector('[aria-label="本次代理池地址"]'), null);
   await click("确认继续 / 重试失败");
-  assert.deepEqual(calls.findLast((value) => value.url.endsWith("/retry")).body, { proxyUrl: workspaceProxy }, "workspace proxy requires explicit selection");
+  assert.deepEqual(calls.findLast((value) => value.url.endsWith("/retry")).body, { useProxyPool: true }, "workspace mode delegates rotation to the server");
   await click("继续 / 重试失败");
   await fill(container.querySelector('[aria-label="重试代理方式"]'), "direct");
   await click("确认继续 / 重试失败");
@@ -116,6 +120,7 @@ try {
   assert.match(container.textContent, /已选 2 个/);
   await click("继续 / 重试失败");
   assert.match(container.querySelector("[data-offer-drawer]").textContent, /选中的 2 个账号/);
+  await fill(container.querySelector('[aria-label="重试代理方式"]'), "keep");
   await click("确认继续 / 重试失败");
   assert.deepEqual(calls.findLast((value) => value.url.endsWith("/retry")).body, { ids: ["row-0", "row-20"] }, "retry target selection is retained across pages");
   const beforeExport = downloadCount;

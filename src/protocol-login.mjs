@@ -324,6 +324,7 @@ async function run() {
       || DEFAULT_TLS_PROFILE,
     verbose: Boolean(args.verbose && !args.rotateTotp && !args.logoutAll && !args.rebindOperation && !args.offerCheck),
     maxProxySessionAttempts: process.env.CHATGPT_PROXY_MAX_ATTEMPTS || 10,
+    proxyPoolEnabled: process.env.CHATGPT_PROXY_POOL_ENABLED === "1",
     sameProxyRiskRetryDelayMs: process.env.CHATGPT_SAME_PROXY_RISK_RETRY_DELAY_MS,
   });
   try {

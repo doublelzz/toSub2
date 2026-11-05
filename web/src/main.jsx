@@ -44,7 +44,9 @@ import CdkWorkspace from "./CdkWorkspace.jsx";
 import CurrentCdk from "./CurrentCdk.jsx";
 import AnnouncementEntry from "./AnnouncementEntry.jsx";
 import { AnnouncementManager } from "./Announcement.jsx";
-import { cdkFetch, flushWorkspaceSettings, readWorkspaceValue, writeWorkspaceValue } from "./cdk-api.mjs";
+import { cdkFetch, flushWorkspaceSettings, prepareWorkspaceProxyPool, readWorkspaceProxyPoolText, readWorkspaceValue, setWorkspaceProxyPoolDraft, writeWorkspaceValue } from "./cdk-api.mjs";
+import { PROXY_POOL_STORAGE_KEY, parseProxyPoolText } from "./proxy-pool.mjs";
+import { ProxyPoolInput } from "./ProxyPoolInput.jsx";
 import SmsPriceSelector from "./SmsPriceSelector.jsx";
 import SmsServiceSelector from "./SmsServiceSelector.jsx";
 import { filterSmsOptionsByGrade, findSmsNumberOption, preferredSmsNumberOption } from "./sms-number-options.mjs";
@@ -58,7 +60,6 @@ const SMS_PROVIDER_SETTINGS_KEY = "chatgpt-onboarding.sms-provider-settings-v1";
 const MAIL_REQUEST_SETTINGS_KEY = "chatgpt-onboarding.mail-request-settings-v1";
 const SUB2API_UPLOAD_SETTINGS_KEY = "chatgpt-onboarding.sub2api-upload-settings-v1";
 const SUB2API_LINKS_VISIBLE_KEY = "tosub2.sub2api-links-visible";
-const ACCOUNT_PROXY_STORAGE_KEY = "chatgpt-onboarding.account-proxy-v1";
 const SMS_PROVIDER_ORDER = ["luban", "smsbower", "herosms", "daxigua", "custom", "pool"];
 const SMS_PROVIDER_EXTERNAL_LINKS = {
   luban: {
@@ -186,7 +187,8 @@ function App({ auth }) {
   });
   const [uploadNotice, setUploadNotice] = useState("");
   const [exportReport, setExportReport] = useState(null);
-  const [accountProxyUrl, setAccountProxyUrl] = useState(() => readLocalTextSetting(ACCOUNT_PROXY_STORAGE_KEY));
+  const [accountProxyUrl, setAccountProxyUrl] = useState(readWorkspaceProxyPoolText);
+  const accountProxyPool = parseProxyPoolText(accountProxyUrl);
   const sub2apiAnomalyScope = JSON.stringify([token, auth.workspace.id, sub2apiMonitorStatus.bindingId || null, normalizeSub2ApiSettings(sub2apiSettings)]);
   const sub2apiAnomalyContext = useRef(sub2apiAnomalyScope);
   sub2apiAnomalyContext.current = sub2apiAnomalyScope;
@@ -215,7 +217,7 @@ function App({ auth }) {
   useEffect(() => writeLocalJson(MAIL_REQUEST_SETTINGS_KEY, mailRequestSettings), [mailRequestSettings]);
   useEffect(() => writeLocalJson(SUB2API_UPLOAD_SETTINGS_KEY, sub2apiSettings), [sub2apiSettings]);
   useEffect(() => writeLocalTextSetting(SUB2API_LINKS_VISIBLE_KEY, String(sub2apiLinksVisible)), [sub2apiLinksVisible]);
-  useEffect(() => writeLocalTextSetting(ACCOUNT_PROXY_STORAGE_KEY, accountProxyUrl.trim()), [accountProxyUrl]);
+  useEffect(() => { setWorkspaceProxyPoolDraft(accountProxyUrl); if (!accountProxyPool.errors.length) writeWorkspaceValue(PROXY_POOL_STORAGE_KEY, JSON.stringify(accountProxyPool.proxies)); }, [accountProxyUrl]);
   useEffect(() => writeLocalTextSetting("tosub2.density", density), [density]);
 
   useEffect(() => {
@@ -868,7 +870,7 @@ function App({ auth }) {
       if (phoneBindingEnabled && activeSmsProvider.id === "pool" && !smsProvider) return;
       await apiFetch(token, "/api/jobs", {
         method: "POST",
-        body: JSON.stringify({ email: email.trim(), proxyUrl: accountProxyUrl.trim(), phoneBindingMode: phoneBindingEnabled ? "automatic" : "manual", phoneBindingEnabled, ...(smsProvider ? { smsProvider } : {}) }),
+        body: JSON.stringify({ email: email.trim(), ...await prepareWorkspaceProxyPool(accountProxyUrl), phoneBindingMode: phoneBindingEnabled ? "automatic" : "manual", phoneBindingEnabled, ...(smsProvider ? { smsProvider } : {}) }),
       });
       setPage(1);
       setPhoneTab(phoneBindingEnabled ? "enabled" : "disabled");
@@ -892,7 +894,7 @@ function App({ auth }) {
       if (phoneBindingEnabled && activeSmsProvider.id === "pool" && !smsProvider) return;
       await apiFetch(token, "/api/jobs/batch", {
         method: "POST",
-        body: JSON.stringify({ text: batchText, proxyUrl: accountProxyUrl.trim(), phoneBindingMode: phoneBindingEnabled ? "automatic" : "manual", phoneBindingEnabled, ...(smsProvider ? { smsProvider } : {}) }),
+        body: JSON.stringify({ text: batchText, ...await prepareWorkspaceProxyPool(accountProxyUrl), phoneBindingMode: phoneBindingEnabled ? "automatic" : "manual", phoneBindingEnabled, ...(smsProvider ? { smsProvider } : {}) }),
       });
       setPage(1);
       setPhoneTab(phoneBindingEnabled ? "enabled" : "disabled");
@@ -980,7 +982,7 @@ function App({ auth }) {
     try {
       await apiFetch(token, "/api/jobs/reauthorize-batch", {
         method: "POST",
-        body: JSON.stringify({ ids: [...selectedJobIds], proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify({ ids: [...selectedJobIds], ...await prepareWorkspaceProxyPool(accountProxyUrl) }),
       });
       setSelectedJobIds(new Set());
       setError("");
@@ -1053,7 +1055,7 @@ function App({ auth }) {
     try {
       const data = await apiFetch(token, "/api/jobs/setup-2fa-batch", {
         method: "POST",
-        body: JSON.stringify({ ids: [...selectedJobIds], proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify({ ids: [...selectedJobIds], ...await prepareWorkspaceProxyPool(accountProxyUrl) }),
       });
       setUploadNotice(`已开始为 ${data.started} 个账号设置 2FA${data.skipped ? `，跳过 ${data.skipped} 个` : ""}`);
       setSelectedJobIds(new Set());
@@ -1074,7 +1076,7 @@ function App({ auth }) {
     try {
       const data = await apiFetch(token, "/api/jobs/add-password-batch", {
         method: "POST",
-        body: JSON.stringify({ ids: [...selectedJobIds], proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify({ ids: [...selectedJobIds], ...await prepareWorkspaceProxyPool(accountProxyUrl) }),
       });
       setUploadNotice(`已开始为 ${data.started} 个账号添加密码${data.skipped ? `，跳过 ${data.skipped} 个` : ""}`);
       setSelectedJobIds(new Set());
@@ -1095,7 +1097,7 @@ function App({ auth }) {
     try {
       const data = await apiFetch(token, "/api/jobs/relogin-batch", {
         method: "POST",
-        body: JSON.stringify({ ids: [...selectedJobIds], proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify({ ids: [...selectedJobIds], ...await prepareWorkspaceProxyPool(accountProxyUrl) }),
       });
       setUploadNotice(`已开始重新登录并授权 ${data.started} 个账号${data.skipped ? `，跳过 ${data.skipped} 个` : ""}`);
       setSelectedJobIds(new Set());
@@ -1234,7 +1236,7 @@ function App({ auth }) {
         <div id="authorization-task-panel" role="tabpanel" aria-labelledby={`phone-tab-${phoneTab}`}>
         <TaskFilters value={filters} onChange={updateFilters} statuses={AUTH_STATUSES} dateFields={{ createdAt: "创建时间", lastOperationAt: "最近操作时间" }} day={calendarDay}
           extra={<button className={`secondary-button ${emailFilter.length ? "filter-active" : ""}`} type="button" onClick={() => { setFilterError(""); setFilterText(emailFilter.join("\n")); setFilterOpen(true); }} disabled={!token}><Filter size={16} />{emailFilter.length ? `精确邮箱 ${emailFilter.length}` : "精确邮箱"}</button>} />
-        <div className="config-summary"><Settings2 size={14} /><button type="button" onClick={() => setSettingsOpen(true)}>配置摘要</button><span>代理 · {accountProxyUrl.trim() ? "已配置" : "本地网络"}</span><span>短信 · {activeSmsProvider.ready ? `${activeSmsProvider.name}${activeSmsProvider.id === "pool" ? ` · ${activeSmsProvider.summary}` : ""}` : "未配置"}</span><span>邮件 · {mailRequestSettings.method}</span><span>Sub2API · {sub2apiSettings.adminApiKey ? "已配置" : "未配置"}</span>{sub2apiMonitorStatus.enabled && <span>号池巡检 · {sub2apiMonitorStatus.running ? "正在检查" : "已开启"}</span>}</div>
+        <div className="config-summary"><Settings2 size={14} /><button type="button" onClick={() => setSettingsOpen(true)}>配置摘要</button><span>代理池 · {accountProxyPool.errors.length ? "格式待修正" : accountProxyPool.proxies.length ? `${accountProxyPool.proxies.length} 个 · 顺序循环` : "本地网络"}</span><span>短信 · {activeSmsProvider.ready ? `${activeSmsProvider.name}${activeSmsProvider.id === "pool" ? ` · ${activeSmsProvider.summary}` : ""}` : "未配置"}</span><span>邮件 · {mailRequestSettings.method}</span><span>Sub2API · {sub2apiSettings.adminApiKey ? "已配置" : "未配置"}</span>{sub2apiMonitorStatus.enabled && <span>号池巡检 · {sub2apiMonitorStatus.running ? "正在检查" : "已开启"}</span>}</div>
 
         {error && (
           <div className="global-error" role="alert">
@@ -1924,24 +1926,11 @@ function App({ auth }) {
           <button type="button" className="secondary-button" disabled={!sub2apiSettings.adminApiKey} onClick={() => { setSettingsOpen(false); setRemoteBindingError(""); setRemoteBindingOpen(true); }}>关联已有远端账号</button>
         </div>
 
-        <div className="provider-toolbar account-proxy-toolbar" aria-label="代理 IP 配置">
-          <div className="provider-heading"><Globe2 size={17} /><strong>代理 IP</strong></div>
+        <div className="provider-toolbar account-proxy-toolbar" aria-label="代理池配置">
+          <div className="provider-heading"><Globe2 size={17} /><strong>代理池</strong></div>
           <div className="account-proxy-input">
-            <label className="provider-field account-proxy-field" title="支持 http://、https://、socks5:// 和 socks5h://；用户名中包含 -sid- 时会自动轮换会话编号">
-              <Globe2 size={15} aria-hidden="true" />
-              <input
-                value={accountProxyUrl}
-                onChange={(event) => setAccountProxyUrl(event.target.value)}
-                placeholder="socks5h://用户名:密码@主机:端口"
-                spellCheck="false"
-                aria-label="代理 IP 地址"
-              />
-            </label>
+            <ProxyPoolInput value={accountProxyUrl} onChange={setAccountProxyUrl} label="工作区代理池" ariaLabel="工作区代理池地址" />
           </div>
-          <span className={`provider-ready ${accountProxyUrl.trim() ? "" : "incomplete"}`}>
-            {accountProxyUrl.trim() ? <Check size={14} /> : <CircleAlert size={14} />}
-            {accountProxyUrl.trim() ? "已配置，按账号检测出口" : "未配置，使用本地 IP"}
-          </span>
           <a
             className="provider-external-link"
             href="https://invite.zooproxy.com/share/ez2v2jdb7"
@@ -2164,7 +2153,7 @@ function JobRow({ prepareSmsProvider, job, token, expanded, onToggleLogs, onErro
     try {
       await apiFetch(token, `/api/jobs/${job.id}/retry`, {
         method: "POST",
-        body: JSON.stringify({ proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify({ ...await prepareWorkspaceProxyPool(accountProxyUrl) }),
       });
       onError("");
     } catch (requestError) {
@@ -2179,7 +2168,7 @@ function JobRow({ prepareSmsProvider, job, token, expanded, onToggleLogs, onErro
     try {
       await apiFetch(token, `/api/jobs/${job.id}/regenerate`, {
         method: "POST",
-        body: JSON.stringify({ proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify({ ...await prepareWorkspaceProxyPool(accountProxyUrl) }),
       });
       onError("");
     } catch (requestError) {
@@ -2214,7 +2203,7 @@ function JobRow({ prepareSmsProvider, job, token, expanded, onToggleLogs, onErro
     try {
       await apiFetch(token, `/api/jobs/${job.id}/relogin`, {
         method: "POST",
-        body: JSON.stringify({ proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify({ ...await prepareWorkspaceProxyPool(accountProxyUrl) }),
       });
       onError("");
     } catch (requestError) {
@@ -2229,7 +2218,7 @@ function JobRow({ prepareSmsProvider, job, token, expanded, onToggleLogs, onErro
     try {
       await apiFetch(token, `/api/jobs/${job.id}/setup-2fa`, {
         method: "POST",
-        body: JSON.stringify({ proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify({ ...await prepareWorkspaceProxyPool(accountProxyUrl) }),
       });
       onError("");
     } catch (requestError) {
@@ -2245,7 +2234,7 @@ function JobRow({ prepareSmsProvider, job, token, expanded, onToggleLogs, onErro
     try {
       await apiFetch(token, `/api/jobs/${job.id}/add-password`, {
         method: "POST",
-        body: JSON.stringify({ proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify({ ...await prepareWorkspaceProxyPool(accountProxyUrl) }),
       });
       onError("");
     } catch (requestError) {

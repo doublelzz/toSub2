@@ -1,3 +1,4 @@
+import * as proxyPoolUi from "./proxy-pool-ui-support.mjs";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import React, { act, useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -14,7 +15,7 @@ const rows = Array.from({ length: 25 }, (_, index) => ({ id: `row-${index}`, ema
 let accounts = [...rows];
 const calls = [];
 const newRow = { ...rows[0], id: "newest", email: "newest@example.com" };
-const bindings = { React, useCallback, useEffect, useMemo, useRef, useState, ...usedIcons, DEFAULT_FILTERS, matchesDate,
+const bindings = { ...proxyPoolUi, React, useCallback, useEffect, useMemo, useRef, useState, ...usedIcons, DEFAULT_FILTERS, matchesDate,
   useDialogFocus: () => {}, useCalendarDay: () => "2026-10-23", TaskOverview: () => null, TaskFilters: () => null,
   Drawer: ({ children }) => React.createElement("section", null, children),
   MoreActions: ({ children }) => React.createElement("details", null, React.createElement("summary", null, "more"), children),
@@ -27,6 +28,7 @@ const bindings = { React, useCallback, useEffect, useMemo, useRef, useState, ...
     }
     if (url.endsWith("/preview")) return Response.json({ count: 1, accounts: [newRow] });
     if (url.endsWith("/import")) { accounts = [newRow, ...accounts]; return Response.json({ imported: 1 }); }
+    if (url.endsWith("/start") || url.endsWith("/logout-all")) return Response.json({ started: JSON.parse(options.body).ids.length });
     throw new Error(`Unexpected synthetic request: ${url}`);
   },
 };
@@ -65,5 +67,28 @@ try {
   assert.equal(container.querySelector(".mfa-email").textContent, "newest@example.com", "import resets pagination so new accounts are visible first");
   assert.equal(container.querySelectorAll('input[aria-label^="选择 MFA 账号"]:checked').length, 0);
   assert.ok(calls.every((call) => !/start|logout|jobs\/batch/.test(call.url)), "sync and import UI must not start MFA/login/phone workflows");
+  window.confirm = () => true;
+  await act(() => container.querySelector('[aria-label="选择 MFA 账号 newest@example.com"]').click());
+  accounts = accounts.map((row) => row.id === newRow.id ? { ...row, status: "success" } : row);
+  const changeMode = (value) => act(() => { const select = container.querySelector('[aria-label="MFA 代理方式"]'); Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, "value").set.call(select, value); select.dispatchEvent(new window.Event("change", { bubbles: true })); });
+  await act(() => button("批量修改").click());
+  assert.deepEqual(calls.findLast((call) => call.url.endsWith("/start")).body, { ids: ["newest"], concurrency: 3, useProxyPool: true });
+  const beforeInvalidPool = calls.filter((call) => call.url.endsWith("/start")).length;
+  proxyPoolUi.setWorkspaceProxyPoolDraft("invalid-workspace-proxy");
+  await act(() => button("批量修改").click());
+  assert.equal(calls.filter((call) => call.url.endsWith("/start")).length, beforeInvalidPool, "invalid shared workspace drafts prevent MFA execution");
+  assert.match(container.textContent, /第 1 行代理格式错误/);
+  proxyPoolUi.setWorkspaceProxyPoolDraft("");
+  await changeMode("custom");
+  assert.equal(container.querySelector('[aria-label="本次代理池地址"]'), null, "custom MFA proxy credentials start collapsed");
+  await act(() => button("查看 / 编辑").click());
+  const customPool = container.querySelector('[aria-label="本次代理池地址"]');
+  const firstProxy = "http://first.example.invalid:8080"; const secondProxy = "socks5h://second.example.invalid:1080";
+  await act(() => { Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set.call(customPool, `${firstProxy}\n\n${secondProxy}\n${firstProxy}`); customPool.dispatchEvent(new window.Event("input", { bubbles: true })); });
+  await act(() => button("批量修改").click());
+  assert.deepEqual(calls.findLast((call) => call.url.endsWith("/start")).body, { ids: ["newest"], concurrency: 3, proxyPool: [firstProxy, secondProxy, firstProxy] });
+  await changeMode("direct");
+  await act(() => button("登出所有设备").click());
+  assert.deepEqual(calls.findLast((call) => call.url.endsWith("/logout-all")).body, { ids: ["newest"], concurrency: 3, proxyUrl: "" });
   console.log("MFA sync UI passed (cross-page selection, partial errors, destination navigation and newest import visibility)");
 } finally { await act(() => root.unmount()); dom.window.close(); }

@@ -123,7 +123,8 @@ try {
   const detailsResponse = await request(`accounts/${primaryId}/logs`);
   assert.equal(detailsResponse.headers.get('cache-control'), 'no-store');
   const rotationLogs = (await detailsResponse.json()).logs;
-  assert.ok(rotationLogs.includes(visibleProxy), 'proxy must remain visible in detail logs');
+  assert.match(rotationLogs, /已分配代理/);
+  assert.equal(rotationLogs.includes(visibleProxy), false, 'proxy credentials must remain hidden in detail logs');
   assert.match(rotationLogs, /\[success\]/);
   assert.match(rotationLogs, /退出码：0/);
   assert.match(rotationLogs, /<redacted>/);

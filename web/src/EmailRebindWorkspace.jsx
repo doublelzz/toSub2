@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowRight, Ban, Check, CheckCheck, ChevronLeft, ChevronRight, CircleAlert, Clock3, Copy, FileText, Inbox, LoaderCircle, Mail, RefreshCw, Search, Send, X } from "lucide-react";
 import { Drawer, useDialogFocus } from "./WorkspaceUi.jsx";
-import { cdkFetch } from "./cdk-api.mjs";
+import { cdkFetch, prepareProxyNetworkOptions } from "./cdk-api.mjs";
 import "./email-rebind.css";
 
 const PAGE_SIZE = 20;
@@ -120,7 +120,7 @@ export default function EmailRebindWorkspace({ token, onOpenAuthorization }) {
       </tr>)}
     </tbody></table></div>
     <div className="rebind-pagination"><span>匹配 {filtered.length} 条 · 每页 {PAGE_SIZE} 条</span><div><button type="button" className="icon-button" aria-label="换绑上一页" disabled={currentPage <= 1} onClick={() => setPage(currentPage - 1)}><ChevronLeft size={17} /></button><span>{currentPage} / {totalPages}</span><button type="button" className="icon-button" aria-label="换绑下一页" disabled={currentPage >= totalPages} onClick={() => setPage(currentPage + 1)}><ChevronRight size={17} /></button></div></div>
-    {mapping && <MappingDialog sources={mapping} request={request} concurrency={concurrency} timeout={timeout} onClose={() => setMapping(null)} onStart={async (value) => { await post("start", value); setConcurrency(value.concurrency); setTimeoutSeconds(value.timeout); setMapping(null); setSourceIds(new Set()); switchTab("records"); await refresh(); }} />}
+    {mapping && <MappingDialog sources={mapping} request={request} concurrency={concurrency} timeout={timeout} onClose={() => setMapping(null)} onStart={async (value) => { await prepareProxyNetworkOptions("workspace"); await post("start", value); setConcurrency(value.concurrency); setTimeoutSeconds(value.timeout); setMapping(null); setSourceIds(new Set()); switchTab("records"); await refresh(); }} />}
     {detail && <Drawer title="邮箱换绑详情" onClose={() => setDetailId(null)} wide><EmailPair oldEmail={detail.oldEmail} newEmail={detail.newEmail} />
       <nav className="rebind-detail-tabs" aria-label="换绑详情视图"><button type="button" aria-pressed={detailTab === "details"} onClick={() => setDetailTab("details")}>详情</button><button type="button" aria-pressed={detailTab === "logs"} onClick={() => setDetailTab("logs")}><FileText size={14} />执行日志</button></nav>
       {detailTab === "logs" ? <RebindLogs key={detail.id} id={detail.id} request={request} /> : <><section className="detail-section"><h3>换绑结果</h3><RebindStatus item={detail} /><p className="prompt-line">{detail.message}</p></section>

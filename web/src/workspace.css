@@ -2,6 +2,25 @@
 ::selection { background: var(--green-soft); color: var(--ink); }
 * { scrollbar-color: var(--line) var(--surface-subtle); scrollbar-width: thin; }
 body { background: var(--page); color: var(--ink); font-size: 14px; }
+.proxy-pool-field, .proxy-network-options { display: grid; gap: 8px; min-width: 0; width: 100%; }
+.proxy-pool-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+.proxy-pool-heading label, .proxy-network-mode > span { font-size: 12px; font-weight: 500; color: var(--ink); }
+.proxy-pool-toggle { display: inline-flex; align-items: center; gap: 5px; min-height: 30px; padding: 3px 0; white-space: nowrap; }
+.proxy-pool-field textarea, .proxy-pool-masked, .proxy-network-mode select { width: 100%; min-width: 0; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); color: var(--ink); font: inherit; }
+.proxy-pool-field textarea { min-height: 110px; padding: 10px 11px; line-height: 1.6; resize: vertical; overflow-wrap: anywhere; }
+.proxy-pool-field textarea::placeholder { color: var(--muted); opacity: 1; }
+.proxy-pool-masked { min-height: 42px; padding: 9px 11px; text-align: left; color: var(--muted); }
+.proxy-pool-masked:hover:not(:disabled) { background: var(--surface-subtle); border-color: var(--green); }
+.proxy-pool-help, .proxy-pool-status, .proxy-pool-errors p { margin: 0; font-size: 12px; font-weight: 400; line-height: 1.6; overflow-wrap: anywhere; }
+.proxy-pool-help { color: var(--muted); }
+.proxy-pool-status { color: var(--green-strong); }
+.proxy-pool-errors { display: grid; gap: 4px; color: var(--danger); }
+.proxy-network-mode { display: grid; gap: 7px; }
+.proxy-network-mode select { min-height: 38px; padding: 8px 10px; }
+.account-proxy-toolbar { align-items: flex-start; }
+.account-proxy-toolbar .account-proxy-input { flex: 1 1 100%; width: 100%; }
+.mfa-controls > .proxy-network-options { flex: 1; min-width: min(100%, 230px); }
+.offer-import-dialog > .proxy-network-options { margin-top: 16px; }
 button, summary, select { -webkit-tap-highlight-color: transparent; }
 input, textarea { caret-color: var(--green); }
 button:focus-visible, summary:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, a:focus-visible { outline: 2px solid var(--green); outline-offset: 3px; }

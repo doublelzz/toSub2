@@ -118,6 +118,7 @@ try {
   const fixed = "socks5h://user:password@proxy.example:5000";
   assert.equal(proxySupportsSessionRotation(fixed), false);
   assert.equal(rotateProxySession(fixed), fixed);
+  await testProxyPoolPreparation();
 
   const sameProxyRetry = new TlsFingerprintTransport({
     enabled: true,
@@ -324,6 +325,106 @@ try {
 } finally {
   await transport.close();
   await new Promise((resolve) => server.close(resolve));
+}
+
+async function testProxyPoolPreparation() {
+  const proxy = "socks5h://pool-user:pool-private@proxy.example.invalid:5000";
+  const rotating = "socks5h://pool-user-sid-original-t-20:pool-private@proxy.example.invalid:5000";
+  const logs = [];
+  const originalLog = console.log;
+  console.log = (...values) => logs.push(values.join(" "));
+  const create = ({ pool = false, result = 200, attempts = 10, template = proxy } = {}) => {
+    const candidate = new TlsFingerprintTransport({
+      enabled: true, proxyPoolEnabled: pool, maxProxySessionAttempts: attempts, cloudflareSolver: false,
+    });
+    const configured = [];
+    let requests = 0;
+    candidate.send = async (message) => {
+      if (message.operation === "configure") { configured.push(message.proxy); return {}; }
+      assert.equal(message.operation, "request");
+      requests += 1;
+      if (result instanceof Error) throw result;
+      return { status: result, headers: [["content-type", "text/html"]], body: "", cookies: [] };
+    };
+    return { candidate, configured, requests: () => requests, run: () => candidate.prepareProxy(template, "https://chatgpt.com/") };
+  };
+  const attemptCount = () => logs.filter((line) => line.startsWith("[proxy-session-attempt]")).length;
+  try {
+    const fixedPool = create({ pool: true });
+    assert.equal(await fixedPool.run(), proxy);
+    assert.deepEqual(fixedPool.configured, [proxy], "pool selection belongs to the parent; transport must keep its assigned proxy");
+    assert.equal(fixedPool.requests(), 1);
+    assert.equal(attemptCount(), 1, "a fixed pool proxy with an HTTP response counts towards the parent attempt limit");
+    assert.equal(fixedPool.candidate.remainingProxySessionAttempts, 9);
+    assert.equal(logs.join("\n").includes("pool-user"), false, "success logs must conceal fixed proxy credentials");
+    assert.equal(logs.join("\n").includes("pool-private"), false);
+
+    logs.length = 0;
+    const blockedPool = create({ pool: true, result: 403 });
+    await assert.rejects(blockedPool.run(), /^Error: PROXY_RISK_CONTROL:.*HTTP 403/);
+    assert.equal(attemptCount(), 1);
+    assert.equal(blockedPool.requests(), 1, "the parent alone chooses the next pool proxy after a failed attempt");
+
+    logs.length = 0;
+    const failedPool = create({ pool: true, result: new Error(`ProxyError: failed to connect through ${proxy}`) });
+    await assert.rejects(failedPool.run(), (failure) => {
+      assert.match(failure.message, /^PROXY_CONNECTION_RETRY:/);
+      assert.equal(failure.message.includes("pool-user"), false);
+      assert.equal(failure.message.includes("pool-private"), false);
+      return true;
+    });
+    assert.equal(attemptCount(), 0, "connection failures must not consume the parent's HTTP attempt count");
+    assert.equal(failedPool.requests(), 1);
+    assert.equal(logs.join("\n").includes("pool-private"), false);
+
+    logs.length = 0;
+    const exhaustedPool = create({ pool: true, attempts: 0 });
+    await assert.rejects(exhaustedPool.run(), /^Error: PROXY_RISK_CONTROL:/);
+    assert.deepEqual(exhaustedPool.configured, []);
+    assert.equal(exhaustedPool.requests(), 0);
+
+    logs.length = 0;
+    const fixedLegacy = create({ result: 403 });
+    await assert.rejects(fixedLegacy.run(), (failure) => !/PROXY_RISK_CONTROL|PROXY_CONNECTION_RETRY/.test(failure.message));
+    assert.equal(attemptCount(), 0, "a single fixed proxy retains its existing non-rotating behavior");
+    assert.equal(fixedLegacy.candidate.remainingProxySessionAttempts, 10);
+    const fixedLegacyConnection = create({ result: new Error(`ProxyError: ${proxy}`) });
+    await assert.rejects(fixedLegacyConnection.run(), (failure) => {
+      assert.doesNotMatch(failure.message, /PROXY_RISK_CONTROL|PROXY_CONNECTION_RETRY/);
+      assert.equal(failure.message.includes("pool-private"), false);
+      return true;
+    });
+    assert.equal(attemptCount(), 0);
+
+    logs.length = 0;
+    const rotatingLegacy = create({ template: rotating });
+    const selected = new URL(await rotatingLegacy.run());
+    assert.notEqual(decodeURIComponent(selected.username), "pool-user-sid-original-t-20");
+    assert.match(decodeURIComponent(selected.username), /^pool-user-sid-[A-Za-z0-9]{8}-t-20$/);
+    assert.equal(attemptCount(), 1, "a single sid proxy must continue rotating without the pool flag");
+    const failedRotatingLegacy = create({ template: rotating, result: 403 });
+    await assert.rejects(failedRotatingLegacy.run(), /^Error: PROXY_RISK_CONTROL:.*HTTP 403/);
+    assert.equal(attemptCount(), 2);
+
+    logs.length = 0;
+    const usernameOnly = "http://private-user@proxy.example.invalid:8080";
+    const usernameFailure = create({ pool: true, template: usernameOnly, result: new Error(`ProxyError: ${usernameOnly}`) });
+    await assert.rejects(usernameFailure.run(), (failure) => {
+      assert.match(failure.message, /^PROXY_CONNECTION_RETRY:/);
+      assert.equal(failure.message.includes("private-user"), false);
+      return true;
+    });
+    assert.equal(logs.join("\n").includes("private-user"), false);
+
+    logs.length = 0;
+    const direct = create({ pool: true, template: "" });
+    assert.equal(await direct.run(), null);
+    assert.deepEqual(direct.configured, [null]);
+    assert.equal(direct.requests(), 0);
+    assert.equal(attemptCount(), 0);
+  } finally {
+    console.log = originalLog;
+  }
 }
 
 async function testConfigureStageProfileFallback() {

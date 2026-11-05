@@ -12,6 +12,7 @@ import { assertOfferAccess } from "./offer-workspace.mjs";
 import { createSmsPool } from "./sms-pool.mjs";
 import { createAnnouncementSanitizer } from "./announcement-html.mjs";
 import { createAnnouncementStore } from "./announcement-store.mjs";
+import { createProxyPool, normalizeProxyPool, workspaceProxyPool, PROXY_POOL_SETTING_KEY, LEGACY_PROXY_SETTING_KEY } from "./proxy-pool.mjs";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cookieName = "tosub2_session";
@@ -107,6 +108,16 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
   };
   const namespace = crypto.createHash("sha256").update(root).digest("hex");
   const workspaces = new Map(); const creating = new Map(); const importing = new Map();
+  const proxyPools = new Map();
+  function proxyPoolFor(id) {
+    if (!proxyPools.has(id)) proxyPools.set(id, createProxyPool({
+      readPool: () => workspaceProxyPool(store.setting(id, "workspace") || {}),
+      readState: () => store.setting(id, "proxy-pool-state"),
+      writeState: (value) => store.saveSetting(id, "proxy-pool-state", value),
+      fingerprint: vault.fingerprint,
+    }));
+    return proxyPools.get(id);
+  }
   const recoveryLocked = new Set();
   const trustedProxies = String(process.env.TOSUB2_TRUSTED_PROXIES || "").split(",").map((value) => value.trim()).filter(Boolean);
   if (trustedProxies.some((address) => !normalizeClientIp(address))) throw new Error("TOSUB2_TRUSTED_PROXIES 需要有效的明确 IP 地址列表");
@@ -146,6 +157,7 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
       const workspaceRoot = id === store.adminId ? root : path.join(root, "cdk", id);
       const workspace = await createWorkspace({
         root: workspaceRoot, cdkId: id, namespace, legacyEmails: id === store.adminId ? initialLegacyEmails : new Set(),
+        proxyPool: proxyPoolFor(id),
         credentialVault: { seal: (value, scope) => vault.seal(value, `credentials:${id}:${scope}`), open: (value, scope) => vault.open(value, `credentials:${id}:${scope}`) },
         smsPool: smsPool.forOwner(id),
         smsProviderAllowed: (providerId) => store.smsProviderAllowed(id, providerId),
@@ -300,9 +312,23 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
       else if (req.method === "PUT") {
         const body = await readRequestJson(req);
         if (body.workspaceId !== owner) throw cdkError(409, "工作区已变化，请重新加载配置");
-        const allowed = new Set(["chatgpt-onboarding.sms-provider-settings-v1", "chatgpt-onboarding.mail-request-settings-v1", "chatgpt-onboarding.sub2api-upload-settings-v1", "chatgpt-onboarding.account-proxy-v1", "chatgpt-onboarding.luban-api-key", "chatgpt-onboarding.luban-service-id"]);
+        const allowed = new Set(["chatgpt-onboarding.sms-provider-settings-v1", "chatgpt-onboarding.mail-request-settings-v1", "chatgpt-onboarding.sub2api-upload-settings-v1", PROXY_POOL_SETTING_KEY, LEGACY_PROXY_SETTING_KEY, "chatgpt-onboarding.luban-api-key", "chatgpt-onboarding.luban-service-id"]);
         const settings = Object.fromEntries(Object.entries(body.settings || {}).filter(([key]) => allowed.has(key)));
-        store.saveSetting(owner, "workspace", mergeWorkspaceSettings(owner, settings, store.setting(owner, "workspace") || {})); send(res, 200, { ok: true });
+        const previous = store.setting(owner, "workspace") || {};
+        if (Object.hasOwn(settings, PROXY_POOL_SETTING_KEY)) {
+          const proxies = workspaceProxyPool(settings);
+          settings[PROXY_POOL_SETTING_KEY] = typeof settings[PROXY_POOL_SETTING_KEY] === "string" ? JSON.stringify(proxies) : proxies;
+          delete settings[LEGACY_PROXY_SETTING_KEY];
+        } else if (Object.hasOwn(previous, PROXY_POOL_SETTING_KEY)) {
+          // A stale browser must not replace the migrated pool with its old URL.
+          settings[PROXY_POOL_SETTING_KEY] = previous[PROXY_POOL_SETTING_KEY];
+          delete settings[LEGACY_PROXY_SETTING_KEY];
+        } else if (Object.hasOwn(settings, LEGACY_PROXY_SETTING_KEY)) normalizeProxyPool(settings[LEGACY_PROXY_SETTING_KEY]);
+        const merged = mergeWorkspaceSettings(owner, settings, previous);
+        const changedPool = JSON.stringify(workspaceProxyPool(previous)) !== JSON.stringify(workspaceProxyPool(merged));
+        store.saveSetting(owner, "workspace", merged);
+        if (changedPool) proxyPoolFor(owner).reset();
+        send(res, 200, { ok: true });
       } else throw cdkError(405, "请求方法不支持");
       return;
     }
