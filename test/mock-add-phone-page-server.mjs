@@ -17,15 +17,20 @@ let addPasswordMode = false;
 const phoneRequests = { send: 0, validate: 0 };
 const oauthRequests = [];
 let tokenEmail = "add-phone-page@example.com";
+const emailGate = { enabled: true, logins: 0, selections: 0, rebind: [] };
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", base);
   const body = await readBody(req);
+  if (url.pathname === "/__email-gate") {
+    if (req.method === "POST") emailGate.enabled = parseJson(body)?.enabled !== false;
+    return sendJson(res, 200, emailGate);
+  }
   if (req.method === "GET" && url.pathname === "/__oauth-requests") return sendJson(res, 200, oauthRequests);
   if (url.pathname === "/__phone-requests") return sendJson(res, 200, phoneRequests);
   if (req.method === "GET" && url.pathname === "/api/auth/session") return sendJson(res, 200, {
-    user: { email: "add-phone-page@example.com" },
-    accessToken: `e30.${Buffer.from(JSON.stringify({ email: "add-phone-page@example.com", exp: Math.floor(Date.now() / 1000) + 3600, "https://api.openai.com/auth": { chatgpt_account_id: "mock-personal-account", chatgpt_plan_type: "plus" } })).toString("base64url")}.synthetic-session-signature`,
+    user: { email: lastLoginHint === "codex-email-gate@example.com" ? lastLoginHint : "add-phone-page@example.com" },
+    accessToken: `e30.${Buffer.from(JSON.stringify({ email: lastLoginHint === "codex-email-gate@example.com" ? lastLoginHint : "add-phone-page@example.com", exp: Math.floor(Date.now() / 1000) + 3600, "https://api.openai.com/auth": { chatgpt_account_id: "mock-personal-account", chatgpt_plan_type: "plus" } })).toString("base64url")}.synthetic-session-signature`,
   });
 
   if (req.method === "GET" && url.pathname === "/") {
@@ -39,6 +44,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && url.pathname === "/api/auth/csrf") return sendJson(res, 200, { csrfToken: "mock-csrf" });
   if (req.method === "POST" && url.pathname === "/api/auth/signin/openai") {
     lastLoginHint = url.searchParams.get("login_hint") || "";
+    if (lastLoginHint === "codex-email-gate@example.com") emailGate.logins++;
     addPasswordMode = url.searchParams.get("post_login_add_password") === "true";
     return sendJson(res, 200, { url: `${publicBase}/api/accounts/authorize` });
   }
@@ -180,6 +186,12 @@ const server = http.createServer(async (req, res) => {
     return sendText(res, 200, '<html><input name="session_id" value="us_1234567890abcdef"></html>', "text/html");
   }
   if (req.method === "POST" && url.pathname === "/api/accounts/session/select") {
+    if (lastLoginHint === "codex-email-gate@example.com") {
+      emailGate.selections++;
+      return sendJson(res, 200, emailGate.enabled
+        ? { page: { type: "email_otp_send" }, continue_url: `${publicBase}/api/accounts/email-otp/send` }
+        : { continue_url: "http://localhost:1455/auth/callback?code=mock-code&state=mock-state" });
+    }
     res.setHeader("set-cookie", "oai-client-auth-session=mock-auth-session; Path=/");
     if (lastLoginHint === "no-phone-needed@example.com") return sendJson(res, 200, { "oai-client-auth-session": { workspaces: [{ id: "workspace-personal", kind: "personal" }] } });
     return sendJson(res, 200, {
@@ -273,6 +285,11 @@ const server = http.createServer(async (req, res) => {
   });
   if (req.method === "GET" && url.pathname === "/backend-api/wham/rate-limit-reset-credits") return sendJson(res, 200, { available_count: 1 });
   if (req.method === "GET" && url.pathname === "/backend-api/subscriptions") return sendJson(res, 200, { plan_type: "plus", active_until: "2099-01-01T00:00:00Z", will_renew: true });
+  if (url.pathname.startsWith("/backend-api/accounts/change_email/")) {
+    const operation = url.pathname.split("/").at(-1);
+    emailGate.rebind.push(operation);
+    return sendJson(res, 200, operation === "eligibility" ? { eligible: true } : { success: true });
+  }
   return sendJson(res, 404, { error: "not found" });
 });
 

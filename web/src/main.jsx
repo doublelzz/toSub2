@@ -426,7 +426,7 @@ function App({ auth }) {
     () => jobSelectionIndex.filter((job) => selectedJobIds.has(job.id)),
     [jobSelectionIndex, selectedJobIds],
   );
-  const downloadableSelectedCount = selectedJobs.filter((job) => job.canDownload).length;
+  const downloadableSelectedCount = selectedJobs.filter((job) => job.canExportSub2Api ?? job.canDownload).length;
   const allPageSelected = pageJobIds.length > 0 && pageJobIds.every((id) => selectedJobIds.has(id));
   const canDownloadSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
     && downloadableSelectedCount > 0;
@@ -2154,6 +2154,7 @@ function Sub2ApiLinkSummary({ value, loading, error, detailed = false }) {
 function JobRow({ prepareSmsProvider, job, token, expanded, onToggleLogs, onError, onPreviewExport, onDownloadNotice, onMfaStarted, mfaChangeAvailable, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, showSub2apiLinks = false, sub2apiLink, sub2apiLinksLoading, sub2apiLinksError, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, detail = false }) {
   const [value, setValue] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const canExportSub2Api = job.canExportSub2Api ?? job.canDownload;
 
   useEffect(() => setValue(""), [job.status]);
 
@@ -2340,7 +2341,7 @@ function JobRow({ prepareSmsProvider, job, token, expanded, onToggleLogs, onErro
   }
 
   const inputConfig = getInputConfig(job.status, job.currentPhone);
-  const terminal = ["completed", "failed", "canceled", "reauth_required", "resume_available", "phone_skipped"].includes(job.status);
+  const terminal = ["completed", "failed", "canceled", "reauth_required", "resume_available", "phone_skipped", "login_ready"].includes(job.status);
 
   const stepContent = <>
         <div className="prompt-line">{job.prompt}</div>
@@ -2460,9 +2461,9 @@ function JobRow({ prepareSmsProvider, job, token, expanded, onToggleLogs, onErro
               {submitting ? <LoaderCircle className="spin" size={16} /> : <PhoneIncoming size={16} />}开始接码
             </button>
           )}
-          {job.canDownload && (
+          {canExportSub2Api && (
             <button type="button" className="download-button" onClick={download}>
-              <Download size={16} />下载
+              <Download size={16} />{job.canDownload ? "下载" : "导出 JSON"}
             </button>
           )}
           {job.canDownload && sub2apiUploadAvailable && (
@@ -2516,7 +2517,7 @@ function JobRow({ prepareSmsProvider, job, token, expanded, onToggleLogs, onErro
     <td className="insight-cell quota-column">{quotaContent}</td>
     <td className="sms-column"><SmsSummary summary={job.smsSummary} billing={job.smsPoolBilling} /></td>
     <td className="task-time-cell"><div><span>创建</span><time dateTime={job.createdAt} title={formatInsightDate(job.createdAt)}>{formatDateTime(job.createdAt)}</time></div><div><span>操作</span><time dateTime={job.lastOperationAt || job.createdAt} title={formatInsightDate(job.lastOperationAt || job.createdAt)}>{formatDateTime(job.lastOperationAt || job.createdAt)}</time></div><small>{operationLabel(job.lastOperationType)}</small></td>
-    <td className="actions-cell"><div className="row-actions"><button type="button" className="text-action" onClick={onToggleLogs} aria-label={`查看 ${job.email} 的任务详情`}>查看</button>{job.canDownload && <button type="button" className="text-action" onClick={download}><Download size={14} />下载</button>}{mfaChangeAvailable && (job.canChangeMfa || job.mfaBusy) && <button type="button" className="text-action" onClick={changeMfa} disabled={submitting || job.mfaBusy} title="复用已有授权，成功后同步账号资料"><ShieldCheck size={14} />{job.mfaBusy ? "MFA 处理中" : "修改 MFA"}</button>}{job.canRetry && !job.canDownload && <button type="button" className="text-action" onClick={retry} disabled={submitting}>{job.canResume ? "继续" : "重试"}</button>}<MoreActions label="更多">{actionContent}</MoreActions></div></td>
+    <td className="actions-cell"><div className="row-actions"><button type="button" className="text-action" onClick={onToggleLogs} aria-label={`查看 ${job.email} 的任务详情`}>查看</button>{canExportSub2Api && <button type="button" className="text-action" onClick={download}><Download size={14} />{job.canDownload ? "下载" : "导出 JSON"}</button>}{mfaChangeAvailable && (job.canChangeMfa || job.mfaBusy) && <button type="button" className="text-action" onClick={changeMfa} disabled={submitting || job.mfaBusy} title="复用已有授权，成功后同步账号资料"><ShieldCheck size={14} />{job.mfaBusy ? "MFA 处理中" : "修改 MFA"}</button>}{job.canRetry && !job.canDownload && <button type="button" className="text-action" onClick={retry} disabled={submitting}>{job.canResume ? "继续" : "重试"}</button>}<MoreActions label="更多">{actionContent}</MoreActions></div></td>
     {showSub2apiLinks && <td className="sub2api-link-column"><Sub2ApiLinkSummary value={sub2apiLink} loading={sub2apiLinksLoading} error={sub2apiLinksError} /></td>}
   </tr>;
 }
@@ -2567,6 +2568,7 @@ function StatusBadge({ status }) {
     refreshing: ["刷新授权", <RefreshCw className="spin" size={14} />],
     checking_account: ["检测额度", <LoaderCircle className="spin" size={14} />],
     completed: ["已完成", <Check size={14} />],
+    login_ready: ["已登录", <Check size={14} />],
     failed: ["失败", <CircleAlert size={14} />],
     canceled: ["已取消", <Ban size={14} />],
     reauth_required: ["待重新授权", <RefreshCw size={14} />],

@@ -18,6 +18,7 @@ import { matchesTaskQuery, normalizeTaskQuery, summarizeTasks } from "./task-que
 import { ACCOUNT_SESSION_FILENAME, loadAccountInsights, publicAccountInsights } from "./account-insights.mjs";
 import { exportAccountAccessTokens } from "./account-token-export.mjs";
 import { withSub2ApiExpiry, validateSub2ApiData, summarizeSub2ApiTokens, mergeSub2ApiCredentials } from "./sub2api-export.mjs";
+import { CODEX_EMAIL_VERIFICATION_REQUIRED, LOGIN_READY_PROMPT, sub2ApiAuthorizationError, sub2ApiExportError } from "./sub2api-authorization.mjs";
 import { createSub2ApiLinker, publicSub2ApiAccount } from "./sub2api-linking.mjs";
 import { phoneVerificationStatus, recordSmsOrder, publicSmsSummary } from "./sms-orders.mjs";
 import { readPhoneEvidence, writePhoneEvidence } from "./phone-verification-evidence.mjs";
@@ -421,7 +422,7 @@ async function handleApi(req, res, requestUrl) {
     const body = await readJson(req);
     const selected = resolveSelectedJobs(body.ids);
     const unsupported = selected.find(
-      (job) => !["completed", "failed", "canceled", "reauth_required", "resume_available", "phone_skipped"].includes(job.status),
+      (job) => !["completed", "failed", "canceled", "reauth_required", "resume_available", "phone_skipped", "login_ready"].includes(job.status),
     );
     if (unsupported) throw httpError(409, `${unsupported.email} 当前仍在进行中，不能重新授权`);
     const proxyOptions = await batchProxyOptions(body, selected, () => true, (job) => job.status !== "completed");
@@ -1238,7 +1239,7 @@ async function savePhoneOptions(job, options) {
 }
 
 function canStartPhoneBinding(job) {
-  return !job.child && ["failed", "canceled", "reauth_required", "resume_available", "phone_skipped"].includes(job.status)
+  return !job.child && ["failed", "canceled", "reauth_required", "resume_available", "phone_skipped", "login_ready"].includes(job.status)
     && phoneVerificationStatus(job) !== "verified"
     && (job.loginCheckpointAvailable || job.accountSessionAvailable || job.status === "phone_skipped");
 }
@@ -1308,6 +1309,7 @@ async function createJobRecord(email, credentials = {}, proxyUrl = null, phoneBi
     child: null,
     parserTail: "",
     resultSaved: false,
+    sub2ApiAuthorizationError: null,
     loginMode,
     phoneBindingEnabled,
     phoneBindingMode: phoneOptions.phoneBindingMode || "manual",
@@ -1484,6 +1486,7 @@ function launchJob(job, options = {}) {
   job.runMode = mode;
   job.mailOtpRequestedAt = null;
   if (["full", "refresh"].includes(mode)) {
+    job.sub2ApiAuthorizationError = null;
     job.phoneBindingSkipped = false;
     job.accountInsightsError = null;
     job.accountInsightsSource = null;
@@ -1610,6 +1613,20 @@ async function handleChildClose(job, { code, signal, mode, runId }) {
     scheduleQueuedJobs();
     return;
   }
+  if (code === 0 && job.sub2ApiAuthorizationError) {
+    job.status = job.resultSaved ? "completed" : "login_ready";
+    job.prompt = LOGIN_READY_PROMPT;
+    job.accountInsights = await loadJobInsights(job);
+    job.loginCheckpointAvailable = await fileExists(job.checkpointPath);
+    job.lastError = null;
+    job.runMode = null;
+    job.runId = null;
+    touch(job);
+    await saveJobMetadata(job);
+    await finishSub2ApiAutoRepairFailure(job);
+    scheduleQueuedJobs();
+    return;
+  }
   if (code === 0 && job.phoneBindingEnabled === false && job.phoneBindingSkipped) {
     job.status = "phone_skipped";
     job.prompt = "待接码；账号信息已保留，点击开始接码继续授权";
@@ -1626,6 +1643,7 @@ async function handleChildClose(job, { code, signal, mode, runId }) {
     return;
   }
   if (code === 0 && job.resultSaved && (await fileExists(job.outputPath))) {
+    job.sub2ApiAuthorizationError = null;
     job.accountInsights = await loadJobInsights(job);
     job.accountInsightsError = job.accountInsights ? null : "账号信息未检测成功，可点击检测额度重试";
     if (mode === "full") completeAuthorizationAutomationAttempt(job);
@@ -1698,7 +1716,7 @@ function restoreAccountInsightsStatus(job) {
 
 async function retryJob(job, options = {}) {
   assertMfaIdle(job.email);
-  if (!["failed", "canceled", "reauth_required", "resume_available", "phone_skipped"].includes(job.status)) {
+  if (!["failed", "canceled", "reauth_required", "resume_available", "phone_skipped", "login_ready"].includes(job.status)) {
     throw httpError(409, "当前任务不需要重新授权");
   }
   await assertSavedSmsSetupAllowed(job);
@@ -1976,8 +1994,8 @@ async function finishPasswordAdd(job, code, signal) {
     await removePrivateFile(job.passwordAddResultPath);
   }
 
-  job.status = job.passwordAddResumesAuthorization ? "resume_available" : "completed";
-  job.lastError = job.passwordAddResumesAuthorization
+  job.status = job.passwordAddResumesAuthorization ? (job.sub2ApiAuthorizationError ? "login_ready" : "resume_available") : "completed";
+  job.lastError = job.passwordAddResumesAuthorization && !job.sub2ApiAuthorizationError
     ? "ChatGPT 登录状态已保留，点击继续流程即可重新开始 Codex 授权"
     : null;
   job.runMode = null;
@@ -1990,12 +2008,12 @@ async function finishPasswordAdd(job, code, signal) {
 
 function restorePasswordAddFailure(job, message) {
   const resumeAuthorization = Boolean(job.passwordAddResumesAuthorization);
-  job.status = resumeAuthorization ? "resume_available" : "completed";
+  job.status = resumeAuthorization ? (job.sub2ApiAuthorizationError ? "login_ready" : "resume_available") : "completed";
   job.prompt = resumeAuthorization
     ? "本次添加密码未完成，原登录检查点仍可继续"
     : "原授权文件仍可使用，本次添加密码未完成";
   job.passwordAddError = message;
-  job.lastError = resumeAuthorization ? "点击继续流程可恢复 Codex 授权" : null;
+  job.lastError = resumeAuthorization && !job.sub2ApiAuthorizationError ? "点击继续流程可恢复 Codex 授权" : null;
   job.runMode = null;
   job.runId = null;
   job.pendingNewPassword = null;
@@ -2074,8 +2092,8 @@ async function finishTotpSetup(job, code, signal) {
       : `2FA 设置进程退出，代码 ${code ?? "未知"}`;
   }
 
-  job.status = resumeAuthorization ? "resume_available" : "completed";
-  job.lastError = resumeAuthorization
+  job.status = resumeAuthorization ? (job.sub2ApiAuthorizationError ? "login_ready" : "resume_available") : "completed";
+  job.lastError = resumeAuthorization && !job.sub2ApiAuthorizationError
     ? "ChatGPT 登录状态已保留，点击继续流程即可重新开始 Codex 授权"
     : null;
   job.runMode = null;
@@ -2101,7 +2119,7 @@ async function removePrivateFile(filePath) {
 
 function restoreTotpSetupFailure(job, message) {
   const resumeAuthorization = Boolean(job.totpSetupResumesAuthorization);
-  job.status = resumeAuthorization ? "resume_available" : "completed";
+  job.status = resumeAuthorization ? (job.sub2ApiAuthorizationError ? "login_ready" : "resume_available") : "completed";
   job.prompt = resumeAuthorization
     ? "本次 2FA 设置未完成，原登录检查点仍可继续"
     : "授权文件仍然可用，本次 2FA 设置未完成";
@@ -2109,7 +2127,7 @@ function restoreTotpSetupFailure(job, message) {
   job.totpSetupSecret = null;
   job.totpSetupUri = null;
   job.totpSetupResumesAuthorization = false;
-  job.lastError = resumeAuthorization ? "点击继续流程可恢复 Codex 授权" : null;
+  job.lastError = resumeAuthorization && !job.sub2ApiAuthorizationError ? "点击继续流程可恢复 Codex 授权" : null;
   job.runMode = null;
   job.child?.kill("SIGTERM");
   job.child = null;
@@ -2160,6 +2178,9 @@ function consumeOutput(job, rawText) {
   const scan = `${job.parserTail}${text}`;
   job.parserTail = scan.slice(-2_000);
   if (scan.includes("[phone-skipped]")) job.phoneBindingSkipped = true;
+  if (scan.includes(`[sub2api-authorization-pending] ${CODEX_EMAIL_VERIFICATION_REQUIRED}`)) {
+    job.sub2ApiAuthorizationError = CODEX_EMAIL_VERIFICATION_REQUIRED;
+  }
   if (scan.includes("[account-session-saved]")) {
     job.accountSessionAvailable = true;
     void saveJobMetadata(job).catch(() => {});
@@ -3671,7 +3692,7 @@ async function cancelAllJobs() {
 
 async function downloadResult(res, job) {
   if (!job.resultSaved || !(await fileExists(job.outputPath))) {
-    sendJson(res, 409, { error: "The sub2api import file is not ready" });
+    sendJson(res, 409, { error: sub2ApiExportError(job) || "The sub2api import file is not ready" });
     return;
   }
   const safeEmail = job.email.replace(/[^a-zA-Z0-9@._+-]/g, "_");
@@ -3699,7 +3720,7 @@ async function downloadBatchResult(res, ids) {
   if (selected.some((job) => !job)) throw httpError(404, "部分任务不存在，请刷新页面后重试");
   const collected = await buildSub2ApiUploadPayload(selected);
   const { accounts, proxies } = collected;
-  if (!accounts.length) throw httpError(409, "没有通过校验的导入文件，请查看导出检查结果");
+  if (!accounts.length) throw httpError(409, collected.errors[0]?.message || "没有通过校验的导入文件，请查看导出检查结果");
 
   const payload = Buffer.from(`${JSON.stringify({
     type: "sub2api-data",
@@ -3728,6 +3749,13 @@ async function buildSub2ApiUploadPayload(selected) {
   let skipped = 0;
   for (const job of selected) {
     if (!job.resultSaved) {
+      const message = sub2ApiExportError(job);
+      if (message) {
+        const row = { id: job.id, email: job.email, status: "failed", message };
+        errors.push(row);
+        rows.push(row);
+        continue;
+      }
       skipped++;
       rows.push({ id: job.id, email: job.email, status: "skipped", message: "任务尚未生成导入文件" });
       continue;
@@ -4625,6 +4653,7 @@ function publicJob(job) {
     completedAt: job.completedAt,
     lastError: job.lastError,
     canDownload: Boolean(job.resultSaved),
+    canExportSub2Api: canExportSub2Api(job),
     accountInsights: publicAccountInsights(job.accountInsights),
     accountInsightsError: job.accountInsightsError || null,
     accountInsightsChecking: Boolean(job.accountInsightsDetecting) || job.status === "checking_account" || (job.status === "queued" && job.queuedMode === "account_insights"),
@@ -4651,7 +4680,7 @@ function publicJob(job) {
     smsNumberRetryIntervalMs: Number(job.smsNumberRetryIntervalMs ?? DEFAULT_SMS_NUMBER_RETRY_INTERVAL_MS),
     smsAutoRetrying: Boolean(job.smsRetryPending || job.smsNumberAcquisitionPromise),
     securityCheckRequired: Boolean(job.securityCheckRequired),
-    canRetry: ["failed", "canceled", "reauth_required", "resume_available", "phone_skipped"].includes(job.status),
+    canRetry: ["failed", "canceled", "reauth_required", "resume_available", "phone_skipped", "login_ready"].includes(job.status),
     canResume: job.status === "resume_available",
     canRegenerate: job.status === "completed" && job.resultSaved,
     canForceRelogin: canForceRelogin(job),
@@ -4681,7 +4710,8 @@ function publicSelectionJob(job) {
     phoneBindingEnabled: job.phoneBindingEnabled !== false,
     canStartPhoneBinding: canStartPhoneBinding(job),
     canDownload: Boolean(job.resultSaved),
-    canRetry: ["failed", "canceled", "reauth_required", "resume_available", "phone_skipped"].includes(job.status),
+    canExportSub2Api: canExportSub2Api(job),
+    canRetry: ["failed", "canceled", "reauth_required", "resume_available", "phone_skipped", "login_ready"].includes(job.status),
     canRegenerate: job.status === "completed" && job.resultSaved,
     canForceRelogin: canForceRelogin(job),
     canSetupTotp: canSetupTotp(job),
@@ -4690,8 +4720,12 @@ function publicSelectionJob(job) {
   };
 }
 
+function canExportSub2Api(job) {
+  return Boolean(job.resultSaved) || Boolean(job.sub2ApiAuthorizationError && !isActive(job.status) && !job.child);
+}
+
 function canForceRelogin(job) {
-  return ["completed", "failed", "canceled", "reauth_required", "resume_available", "phone_skipped"].includes(job.status);
+  return ["completed", "failed", "canceled", "reauth_required", "resume_available", "phone_skipped", "login_ready"].includes(job.status);
 }
 
 function canChangeMfa(job) {
@@ -4703,14 +4737,14 @@ function canSetupTotp(job) {
   if (job.totpSecret || job.hasTotpCredential || job.totpKnownEnabled || job.pendingTotpRecovery) return false;
   if (job.status === "completed" && job.resultSaved) return true;
   return Boolean(job.loginCheckpointAvailable)
-    && ["phone", "phone_otp", "resume_available", "failed", "canceled", "reauth_required"].includes(job.status);
+    && ["phone", "phone_otp", "resume_available", "failed", "canceled", "reauth_required", "login_ready"].includes(job.status);
 }
 
 function canAddPassword(job) {
   if (job.password || job.hasPasswordCredential || job.pendingPasswordRecovery) return false;
   if (job.status === "completed" && job.resultSaved) return true;
   return Boolean(job.loginCheckpointAvailable)
-    && ["phone", "phone_otp", "resume_available", "failed", "canceled", "reauth_required"].includes(job.status);
+    && ["phone", "phone_otp", "resume_available", "failed", "canceled", "reauth_required", "login_ready"].includes(job.status);
 }
 
 function setStage(job, status, prompt) {
@@ -4842,7 +4876,7 @@ function getQueuePosition(job) {
 }
 
 function isTerminalStatus(status) {
-  return ["completed", "failed", "canceled", "reauth_required", "resume_available", "phone_skipped"].includes(status);
+  return ["completed", "failed", "canceled", "reauth_required", "resume_available", "phone_skipped", "login_ready"].includes(status);
 }
 
 function uniqueByJson(items) {
@@ -4963,18 +4997,28 @@ async function syncCompletedOutputs(force = false) {
       const outputDir = path.join(OUTPUT_ROOT, id);
       const resultSaved = metadata.result_saved === true;
       const checkpoint = metadata.login_checkpoint_available === true;
+      let authorizationError = sub2ApiAuthorizationError(metadata.sub2api_authorization_error);
+      let recoveredWebSession = false;
+      if (!authorizationError && !resultSaved && sub2ApiAuthorizationError(metadata.last_error)) {
+        try {
+          await readMfaSession(path.join(outputDir, ACCOUNT_SESSION_FILENAME), metadata.email);
+          authorizationError = CODEX_EMAIL_VERIFICATION_REQUIRED;
+          recoveredWebSession = true;
+        } catch {}
+      }
+      const loginReady = !resultSaved && authorizationError && ["failed", "login_ready", "resume_available"].includes(metadata.status);
       const savedStatus = restoredTaskStatus(metadata);
       const restartable = !resultSaved && !checkpoint && ["queued", "starting"].includes(savedStatus);
       const interrupted = Boolean(savedStatus) && !isTerminalStatus(savedStatus) && !restartable;
       const completedAt = metadata.completed_at || metadata.result_file_mtime;
       const emptyRecovery = { recovered: false, error: null };
       const operation = resultSaved ? restoredOutputOperationState(metadata, completedAt, emptyRecovery, emptyRecovery) : null;
-      const status = operation?.status || (checkpoint ? isTerminalStatus(savedStatus) ? savedStatus : "resume_available"
+      const status = loginReady ? "login_ready" : operation?.status || (checkpoint ? isTerminalStatus(savedStatus) ? savedStatus : "resume_available"
         : restartable ? "queued" : interrupted || !savedStatus ? "failed" : savedStatus);
       const stamp = metadata.updated_at || metadata.created_at || new Date().toISOString();
       const mailApiUrl = validateMailApiUrl(metadata.mail_api_url) ? metadata.mail_api_url : null;
       const pendingRecovery = metadata.pending_password_recovery || metadata.pending_totp_recovery;
-      const prompt = operation?.prompt || (status === "phone_skipped" ? "已跳过接码，可查看账号信息；新的 OAuth 授权尚未完成"
+      const prompt = status === "login_ready" ? LOGIN_READY_PROMPT : operation?.prompt || (status === "phone_skipped" ? "已跳过接码，可查看账号信息；新的 OAuth 授权尚未完成"
         : pendingRecovery ? "上次账号操作结果已保留，将在执行操作时恢复凭据"
         : restartable ? "服务重启后已恢复，等待任务槽位"
         : checkpoint ? metadata.prompt || "检测到邮箱登录检查点，可以继续流程"
@@ -4992,7 +5036,8 @@ async function syncCompletedOutputs(force = false) {
         totpResultPath: path.join(outputDir, TOTP_SETUP_RESULT_FILENAME),
         passwordAddResultPath: path.join(outputDir, PASSWORD_ADD_RESULT_FILENAME),
         logs: operation?.log || (interrupted && !checkpoint ? "[restore] 上次任务在生成授权文件前中断，已恢复为可重试状态。\n" : "[restore] 已加载任务元数据，账号凭据将在操作时读取。\n"),
-        lastError: operation ? operation.lastError : metadata.last_error || (interrupted && !checkpoint ? `上次 ${savedStatus} 阶段未完成` : null),
+        lastError: loginReady ? null : operation ? operation.lastError : metadata.last_error || (interrupted && !checkpoint ? `上次 ${savedStatus} 阶段未完成` : null),
+        sub2ApiAuthorizationError: authorizationError,
         child: null, parserTail: "", resultSaved,
         accountInsights: metadata.account_insights_snapshot || null,
         loginMode: metadata.login_mode === "password" || flags.hasPasswordCredential ? "password" : mailApiUrl ? "email_otp" : metadata.login_mode || "manual",
@@ -5017,6 +5062,7 @@ async function syncCompletedOutputs(force = false) {
         totpSetupResumesAuthorization: false, passwordAddResumesAuthorization: false,
         loginCheckpointAvailable: checkpoint, securityCheckRequired: Boolean(metadata.security_check_required),
         ...newSmsState(), ...restoredSmsState(metadata),
+        ...(recoveredWebSession ? { accountSessionAvailable: true } : {}),
       });
     }
   })().finally(() => { outputSyncPromise = null; });
@@ -5858,6 +5904,7 @@ async function saveJobMetadata(job) {
         prompt: job.prompt || null,
         last_error: job.lastError || null,
         result_saved: Boolean(job.resultSaved),
+        sub2api_authorization_error: job.sub2ApiAuthorizationError || null,
         completed_at: job.completedAt || null,
         attempt: Number(job.attempt || 1),
         security_check_required: Boolean(job.securityCheckRequired),

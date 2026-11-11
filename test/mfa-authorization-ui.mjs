@@ -34,7 +34,10 @@ const baseJob = { id: "fixture-job", email: "fixture-ui@example.com", status: "c
 const props = { job: baseJob, token: "fixture-console-token", mfaChangeAvailable: true,
   smsProvider: { id: "custom", name: "fixture-provider", config: {}, ready: false },
   onMfaStarted: (id) => started.push(id), onError: (error) => errors.push(error), accountProxyUrl: "" };
-const render = (extra = {}) => act(() => root.render(React.createElement("table", null, React.createElement("tbody", null, React.createElement(JobRow, { ...props, ...extra })))));
+const render = (extra = {}) => act(() => {
+  const row = React.createElement(JobRow, { ...props, ...extra });
+  root.render(extra.detail ? row : React.createElement("table", null, React.createElement("tbody", null, row)));
+});
 try {
   await render();
   const button = [...container.querySelectorAll("button")].find((item) => item.textContent === "修改 MFA");
@@ -55,5 +58,20 @@ try {
   await render({ job: { ...baseJob, canChangeMfa: false, mfaBusy: true } });
   const busy = [...container.querySelectorAll("button")].find((item) => item.textContent === "MFA 处理中");
   assert.equal(busy.disabled, true);
+  const pending = { ...baseJob, status: "login_ready", canDownload: false, canExportSub2Api: true, lastError: null };
+  const exportCalls = [];
+  for (const detail of [false, true]) {
+    await render({ job: pending, detail, onPreviewExport: async (ids) => {
+      exportCalls.push(ids);
+      throw new Error("Sub2API 授权需要邮箱验证码");
+    } });
+    assert.equal(container.querySelector(".row-error"), null, "Codex export must not mark account management as failed");
+    const exportButton = [...container.querySelectorAll("button")].find((item) => item.textContent === "导出 JSON");
+    assert.ok(exportButton, "pending OAuth accounts retain an explicit JSON export action");
+    assert.ok([...container.querySelectorAll("button")].some((item) => item.textContent === "修改 MFA"));
+    await act(() => exportButton.click());
+    assert.match(errors.at(-1), /Sub2API.*邮箱验证码/);
+  }
+  assert.deepEqual(exportCalls, [[baseJob.id], [baseJob.id]]);
   console.log("authorization MFA UI tests passed (direct action, loading, task navigation, expiry errors)");
 } finally { await act(() => root.unmount()); dom.window.close(); }

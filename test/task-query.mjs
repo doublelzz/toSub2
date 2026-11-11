@@ -21,6 +21,7 @@ assert.equal(taskStatusGroup("phone_otp"), "waiting");
 assert.equal(taskStatusGroup("checking_account"), "running");
 assert.equal(taskStatusGroup("resume_available"), "recoverable");
 assert.equal(taskStatusGroup("phone_skipped"), "recoverable");
+assert.equal(taskStatusGroup("login_ready"), "recoverable");
 const phoneJobs = [{ ...jobs[0], phoneBindingEnabled: false }, jobs[1]];
 assert.equal(phoneJobs.filter(job => matchesTaskQuery(job, normalizeTaskQuery({ phoneBinding: "disabled" }))).length, 1);
 assert.deepEqual(phoneJobs.filter(job => matchesTaskQuery(job, normalizeTaskQuery({ phoneBinding: "enabled" }))), [jobs[1]]);

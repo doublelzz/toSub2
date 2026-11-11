@@ -8,6 +8,7 @@ import { createInterface as createLineReader } from "node:readline";
 import { stdin as input, stdout as output } from "node:process";
 import { ACCOUNT_SESSION_FILENAME, checkAccountInsights, sessionIdentity } from "./account-insights.mjs";
 import { normalizeOAuthCredentials, withSub2ApiExpiry, validateSub2ApiData } from "./sub2api-export.mjs";
+import { CODEX_EMAIL_VERIFICATION_REQUIRED, isCodexEmailVerificationRequired } from "./sub2api-authorization.mjs";
 import { readMfaSession, writeMfaSession } from "./mfa-session.mjs";
 import { emailRebindStep } from "./email-rebind-protocol.mjs";
 import { describeRebindError, formatRebindDiagnostic, traceRebindTransport } from "./email-rebind-logs.mjs";
@@ -742,6 +743,12 @@ async function run() {
       await removeProtocolCheckpoint(checkpointPath);
     }
     } catch (error) {
+      if (isCodexEmailVerificationRequired(error.message)) {
+        // The Codex challenge does not invalidate the earlier ChatGPT login.
+        await readMfaSession(path.join(path.dirname(sub2apiOutPath), ACCOUNT_SESSION_FILENAME), email);
+        console.log(`[sub2api-authorization-pending] ${CODEX_EMAIL_VERIFICATION_REQUIRED}`);
+        return;
+      }
       if (error.message !== "PHONE_BINDING_DISABLED") throw error;
       console.log("[phone-skipped] 等待手动开始接码；登录检查点与额度检测结果已保留，OAuth 授权尚未完成。");
     } finally {
@@ -2650,6 +2657,7 @@ async function removeProtocolCheckpoint(checkpointPath) {
 }
 
 function isExpiredCheckpointError(error) {
+  if (isCodexEmailVerificationRequired(error?.message)) return false;
   return /CHECKPOINT_INVALID|SESSION_SELECTION_INVALID|CODEX_AUTH_LOGIN_REQUIRED|TOTP_ACCESS_TOKEN_MISSING|invalid_state|no longer valid|session.+(?:invalid|expired)|expired.+session/i.test(
     String(error?.message || ""),
   );

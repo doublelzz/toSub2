@@ -27,7 +27,7 @@ export function hasPhoneAttempt(job) {
 export function phoneVerificationStatus(job) {
   if (job.phoneVerifiedAt || job.smsOrders?.some(order => order.verifiedAt) || job.smsStatus === "completed") return "verified";
   if (hasPhoneAttempt(job)) {
-    if (["phone", "phone_otp"].includes(job.status) || (job.phoneBindingRequested && !["canceled", "failed", "phone_skipped", "resume_available", "reauth_required"].includes(job.status))) return "processing";
+    if (["phone", "phone_otp"].includes(job.status) || (job.phoneBindingRequested && !["canceled", "failed", "phone_skipped", "resume_available", "reauth_required", "login_ready"].includes(job.status))) return "processing";
     return job.status === "canceled" ? "canceled" : "failed";
   }
   return job.status === "completed" ? "not_required" : "not_started";

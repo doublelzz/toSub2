@@ -1,6 +1,6 @@
 const RUNNING = new Set(["starting", "working", "finalizing", "refreshing", "checking_account", "totp_starting", "password_add_starting"]);
 const WAITING = new Set(["password", "mfa_otp", "totp_setup_otp", "email_otp", "phone", "phone_otp"]);
-const RECOVERABLE = new Set(["reauth_required", "resume_available", "phone_skipped"]);
+const RECOVERABLE = new Set(["reauth_required", "resume_available", "phone_skipped", "login_ready"]);
 const GROUPS = new Set(["all", "running", "queued", "waiting", "completed", "failed", "canceled", "recoverable"]);
 
 function badQuery(message) {
