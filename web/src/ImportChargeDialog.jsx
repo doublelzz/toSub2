@@ -6,13 +6,14 @@ import "./cdk.css";
 export default function ImportChargeDialog({ quote, onClose }) {
   const panel = useRef(null);
   const pool = quote.smsPool;
+  const rebind = quote.reason === "email_rebind_sync";
   const maximum = quote.charge + (pool?.maximum || 0);
   const affordable = pool && !pool.admin ? Math.min(pool.count, Math.max(0, Math.floor(quote.after / pool.fee))) : pool?.count;
   useDialogFocus(true, () => onClose(false), panel);
 
   return <div className="modal-backdrop cdk-import-backdrop">
     <section ref={panel} className={`cdk-confirm${pool ? " cdk-combined-confirm" : ""}`} role="dialog" aria-modal="true" aria-labelledby="import-quote-title">
-      <header className="cdk-confirm-heading"><h2 id="import-quote-title">{pool ? "确认导入并使用接码池" : "确认导入账号"}</h2><button type="button" className="icon-button" aria-label="关闭费用确认" onClick={() => onClose(false)}><X size={18} /></button></header>
+      <header className="cdk-confirm-heading"><h2 id="import-quote-title">{pool ? "确认导入并使用接码池" : rebind ? "确认同步换绑账号" : "确认导入账号"}</h2><button type="button" className="icon-button" aria-label="关闭费用确认" onClick={() => onClose(false)}><X size={18} /></button></header>
       <p>去重后 {quote.count} 个账号，其中新增 {quote.added} 个，已有 {quote.updated} 个。</p>
       {pool ? <>
         <dl className="cdk-charge-lines">
@@ -28,9 +29,9 @@ export default function ImportChargeDialog({ quote, onClose }) {
         </>}
       </> : <>
         <div className="cdk-equation"><div><span>当前可用</span><strong>{quote.balance ?? "不限"}</strong></div><div><span>本次扣次</span><strong>{quote.charge}</strong></div><div><span>导入后可用</span><strong>{quote.after ?? "不限"}</strong></div></div>
-        <p className="cdk-helper">已有账号更新和内部流转不重复扣次。新增账号入库后，任务失败或取消不自动退次。</p>
+        <p className="cdk-helper">{rebind ? "换绑成功的账号同步回当前 CDK 工作区不扣次数。保留原账号资料，新邮箱需重新登录后才能生成授权。" : "已有账号更新和内部流转不重复扣次。新增账号入库后，任务失败或取消不自动退次。"}</p>
       </>}
-      <footer><button className="secondary-button" type="button" onClick={() => onClose(false)}>取消</button><button className="primary-button" type="button" onClick={() => onClose(true)}>{pool ? "确认导入并创建任务" : `确认导入${quote.charge ? `，消耗 ${quote.charge} 次` : "，不扣次数"}`}</button></footer>
+      <footer><button className="secondary-button" type="button" onClick={() => onClose(false)}>取消</button><button className="primary-button" type="button" onClick={() => onClose(true)}>{pool ? "确认导入并创建任务" : rebind ? "确认同步，不扣次数" : `确认导入${quote.charge ? `，消耗 ${quote.charge} 次` : "，不扣次数"}`}</button></footer>
     </section>
   </div>;
 }

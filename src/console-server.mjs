@@ -4686,6 +4686,7 @@ function publicJob(job) {
     canForceRelogin: canForceRelogin(job),
     canSetupTotp: canSetupTotp(job),
     canChangeMfa: canChangeMfa(job),
+    canRebindEmail: canChangeMfa(job),
     mfaBusy: mfaWorkspace?.isBusy(job.email) || false,
     canAddPassword: canAddPassword(job),
     restartRequired: job.restartRequired,
@@ -4716,6 +4717,7 @@ function publicSelectionJob(job) {
     canForceRelogin: canForceRelogin(job),
     canSetupTotp: canSetupTotp(job),
     canChangeMfa: canChangeMfa(job),
+    canRebindEmail: canChangeMfa(job),
     canAddPassword: canAddPassword(job),
   };
 }

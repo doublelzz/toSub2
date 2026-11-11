@@ -469,7 +469,7 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
     if (url.pathname === "/api/imports/preview" && req.method === "POST") {
       const body = await readRequestJson(req); const mode = ["single", "authorization", "mfa", "rebind"].includes(body.mode) ? body.mode : "authorization";
       if (["single", "authorization"].includes(mode)) assertSmsRequest(owner, body.payload || {});
-      const emails = workspace.planImport(mode, body.payload || {}); send(res, 200, store.preview(owner, emails)); return;
+      const emails = workspace.planImport(mode, body.payload || {}); send(res, 200, store.preview(owner, emails, { mode })); return;
     }
     const importMode = req.method === "POST" && ({ "/api/jobs": "single", "/api/jobs/batch": "authorization", "/api/mfa/import": "mfa", "/api/rebind/sync": "rebind" })[url.pathname];
     if (importMode) {

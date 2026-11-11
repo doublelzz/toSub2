@@ -671,19 +671,28 @@ export async function createCdkStore(root, vault) {
         for (const email of emails) db.prepare("INSERT INTO accounts VALUES(?,?,?,NULL) ON CONFLICT(cdk_id,email) DO UPDATE SET deleted_at=NULL").run(id, email.toLowerCase(), Date.now());
       });
     },
-    preview(id, emails) {
+    preview(id, emails, { mode = "authorization" } = {}) {
       const row = requireActive(id); const unique = [...new Set(emails.map((email) => email.trim().toLowerCase()))];
       const added = unique.filter((email) => !db.prepare("SELECT 1 FROM accounts WHERE cdk_id=? AND email=?").get(id, email));
-      const charge = row.role === "admin" ? 0 : added.length;
-      return { count: unique.length, added: added.length, updated: unique.length - added.length, charge, balance: row.role === "admin" ? null : row.balance - row.reserved, after: row.role === "admin" ? null : row.balance - row.reserved - charge, canImport: row.role === "admin" || row.balance - row.reserved >= charge };
+      const charge = row.role === "admin" || mode === "rebind" ? 0 : added.length;
+      return { count: unique.length, added: added.length, updated: unique.length - added.length, charge, balance: row.role === "admin" ? null : row.balance - row.reserved, after: row.role === "admin" ? null : row.balance - row.reserved - charge, canImport: row.role === "admin" || row.balance - row.reserved >= charge,
+        ...(mode === "rebind" ? { reason: "email_rebind_sync" } : {}) };
     },
     prepareImport(id, mode, emails, body, requestKey, actorId = id) {
       if (!requestKey || requestKey.length > 120) throw cdkError(422, "导入缺少有效幂等标识");
       return transaction(() => {
         const digest = vault.fingerprint(JSON.stringify({ mode, body }));
         const previous = db.prepare("SELECT * FROM imports WHERE cdk_id=? AND request_key=?").get(id, requestKey);
-        if (previous) { if (previous.digest !== digest) throw cdkError(409, "幂等标识对应的导入内容不同"); return previous; }
-        const quote = store.preview(id, emails); if (!quote.canImport) throw cdkError(409, "可用导入次数不足", "INSUFFICIENT_QUOTA");
+        if (previous) {
+          if (previous.digest !== digest) throw cdkError(409, "幂等标识对应的导入内容不同");
+          if (mode === "rebind" && previous.status === "pending" && previous.charge > 0) {
+            db.prepare("UPDATE cdks SET reserved=reserved-? WHERE id=?").run(previous.charge, id);
+            db.prepare("UPDATE imports SET charge=0 WHERE id=?").run(previous.id);
+            return db.prepare("SELECT * FROM imports WHERE id=?").get(previous.id);
+          }
+          return previous;
+        }
+        const quote = store.preview(id, emails, { mode }); if (!quote.canImport) throw cdkError(409, "可用导入次数不足", "INSUFFICIENT_QUOTA");
         const requestId = crypto.randomUUID(); const now = Date.now();
         db.prepare("UPDATE cdks SET reserved=reserved+? WHERE id=?").run(quote.charge, id);
         db.prepare("INSERT INTO imports(id,cdk_id,request_key,digest,mode,status,charge,emails,payload,result,created_at,actor_id) VALUES(?,?,?,?,?,'pending',?,?,?,?,?,?)").run(requestId, id, requestKey, digest, mode, quote.charge, JSON.stringify([...new Set(emails.map((email) => email.toLowerCase()))]), vault.seal(body, `import:${requestId}`), null, now, actorId);

@@ -36,7 +36,7 @@ import {
 import "./styles.css";
 import "./workspace.css";
 import MfaWorkspace from "./MfaWorkspace.jsx";
-import EmailRebindWorkspace from "./EmailRebindWorkspace.jsx";
+import EmailRebindWorkspace, { AuthorizationRebindDialog } from "./EmailRebindWorkspace.jsx";
 import OfferWorkspace from "./OfferWorkspace.jsx";
 import SmsPoolWorkspace, { SmsPoolChoice, SmsPoolChargeDialog } from "./SmsPoolWorkspace.jsx";
 import CdkGate from "./CdkGate.jsx";
@@ -136,12 +136,15 @@ function App({ auth }) {
   const [jobSelectionIndex, setJobSelectionIndex] = useState([]);
   const [batchAction, setBatchAction] = useState("");
   const [accountExportPreview, setAccountExportPreview] = useState(null);
+  const [authorizationRebind, setAuthorizationRebind] = useState(null);
+  const [rebindInitialTab, setRebindInitialTab] = useState("sources");
   const accountExportRequest = useRef(null);
   const accountExportScope = JSON.stringify([auth.workspace.id, auth.token, activeWorkspace]);
   const accountExportContext = useRef(accountExportScope);
   accountExportContext.current = accountExportScope;
   useEffect(() => {
     setAccountExportPreview(null);
+    setAuthorizationRebind(null);
     accountExportRequest.current?.abort(); accountExportRequest.current = null;
     setBatchAction((current) => ["source", "at"].includes(current) ? "" : current);
     return () => { accountExportRequest.current?.abort(); accountExportRequest.current = null; };
@@ -444,6 +447,13 @@ function App({ auth }) {
   const passwordAddSelectedCount = selectedJobs.filter((job) => job.canAddPassword).length;
   const canAddPasswordSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
     && passwordAddSelectedCount > 0;
+  const canRebindSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
+    && selectedJobs.length <= 500 && selectedJobs.every((job) => job.canRebindEmail);
+
+  function openAuthorizationRebind(ids) {
+    setExpandedJobId(null);
+    setAuthorizationRebind({ ids: [...ids], scope: accountExportScope });
+  }
 
   function openSmsSettings() {
     const draft = withSmsProviderDefaults(smsProviderDefinitions, smsSettings);
@@ -1237,7 +1247,7 @@ function App({ auth }) {
       {activeWorkspace === "announcement" && adminView && auth.account.role === "admin" && <AnnouncementManager token={token} onChanged={auth.reload} onStateChange={reportAnnouncementState} />}
       {activeWorkspace === "sms-pool" && auth.account.role === "admin" && <SmsPoolWorkspace token={token} />}
       {activeWorkspace === "offers" && <OfferWorkspace token={token} balance={auth.workspace.balance} />}
-      {activeWorkspace === "rebind" && <EmailRebindWorkspace token={token} onOpenAuthorization={() => { setPhoneTab("disabled"); setFilters(DEFAULT_FILTERS); setPage(1); setSelectedJobIds(new Set()); setExpandedJobId(null); setEmailFilter([]); setActiveWorkspace("authorization"); }} />}
+      {activeWorkspace === "rebind" && <EmailRebindWorkspace token={token} initialTab={rebindInitialTab} onOpenAuthorization={() => { setPhoneTab("disabled"); setFilters(DEFAULT_FILTERS); setPage(1); setSelectedJobIds(new Set()); setExpandedJobId(null); setEmailFilter([]); setActiveWorkspace("authorization"); }} />}
       {activeWorkspace === "mfa" && <MfaWorkspace token={token} defaultProxyUrl={accountProxyUrl} focusAccountId={mfaFocusAccountId} onReconnect={() => setConnectionAttempt((current) => current + 1)} onOpenAuthorization={() => {
         setPhoneTab("disabled"); setFilters(DEFAULT_FILTERS); setEmailFilter([]); setSelectedJobIds(new Set()); setExpandedJobId(null); setPage(1); setActiveWorkspace("authorization");
       }} />}
@@ -1312,6 +1322,9 @@ function App({ auth }) {
               </button>
             </div>
             <div className="bulk-actions">
+              <button type="button" className="secondary-button bulk-button" onClick={() => openAuthorizationRebind([...selectedJobIds])} disabled={!canRebindSelected || Boolean(batchAction)}>
+                <MailCheck size={16} />邮箱换绑（{selectedJobIds.size}）
+              </button>
               {features.batchPhoneBinding && phoneTab !== "enabled" && (
                 <button type="button" className="primary-button bulk-button" onClick={startPhoneSelected}
                   disabled={!canStartPhoneSelected || !activeSmsProvider.ready || Boolean(batchAction)}
@@ -1402,6 +1415,7 @@ function App({ auth }) {
                     onPreviewExport={previewExport}
                     onDownloadNotice={setUploadNotice}
                     onMfaStarted={showStartedMfa}
+                    onEmailRebind={openAuthorizationRebind}
                     mfaChangeAvailable={Boolean(features.mfaChange)}
                     selected={selectedJobIds.has(job.id)}
                     onToggleSelected={() => toggleJobSelection(job.id)}
@@ -1432,6 +1446,7 @@ function App({ auth }) {
                     onPreviewExport={previewExport}
                     onDownloadNotice={setUploadNotice}
                     onMfaStarted={showStartedMfa}
+                    onEmailRebind={openAuthorizationRebind}
                     mfaChangeAvailable={Boolean(features.mfaChange)}
                     selected={selectedJobIds.has(job.id)}
                     onToggleSelected={() => toggleJobSelection(job.id)}
@@ -1819,6 +1834,11 @@ function App({ auth }) {
         </div>
       )}
       {activeWorkspace === "authorization" && <>
+      {authorizationRebind?.scope === accountExportScope && <AuthorizationRebindDialog key={authorizationRebind.scope}
+        token={token} jobIds={authorizationRebind.ids} onClose={() => setAuthorizationRebind(null)} onStarted={() => {
+          if (accountExportContext.current !== authorizationRebind.scope) return;
+          setAuthorizationRebind(null); setSelectedJobIds(new Set()); setRebindInitialTab("records"); setActiveWorkspace("rebind");
+        }} />}
       {accountExportPreview?.scope === accountExportScope && <AccountExportDialog data={accountExportPreview} onClose={closeAccountExport} />}
       {batchOpen && (
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
@@ -2151,7 +2171,7 @@ function Sub2ApiLinkSummary({ value, loading, error, detailed = false }) {
   </div>)}{status === "linked" && <small className="sub2api-link-saved-at">{checkedAt ? <>结果更新于：<time dateTime={checkedAt}>{formatInsightDate(checkedAt)}</time></> : incomplete ? "已保存关联关系，详情待更新" : "已保存关联结果"}</small>}{loading && value && <small role="status">正在更新所选关联</small>}{value.refreshError && <small className="sub2api-link-refresh-error">刷新失败，保留上次结果：{value.refreshError}</small>}{status !== "linked" && <small>{value?.message || (status === "unlinked" ? "推送预检时核对远端账号" : "勾选此账号后重新查询")}</small>}</div>;
 }
 
-function JobRow({ prepareSmsProvider, job, token, expanded, onToggleLogs, onError, onPreviewExport, onDownloadNotice, onMfaStarted, mfaChangeAvailable, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, showSub2apiLinks = false, sub2apiLink, sub2apiLinksLoading, sub2apiLinksError, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, detail = false }) {
+function JobRow({ prepareSmsProvider, job, token, expanded, onToggleLogs, onError, onPreviewExport, onDownloadNotice, onMfaStarted, onEmailRebind, mfaChangeAvailable, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, showSub2apiLinks = false, sub2apiLink, sub2apiLinksLoading, sub2apiLinksError, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, detail = false }) {
   const [value, setValue] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const canExportSub2Api = job.canExportSub2Api ?? job.canDownload;
@@ -2488,6 +2508,7 @@ function JobRow({ prepareSmsProvider, job, token, expanded, onToggleLogs, onErro
               <ShieldCheck size={16} />{job.mfaBusy ? "MFA 处理中" : "修改 MFA"}
             </button>
           )}
+          {detail && onEmailRebind && <button type="button" className="secondary-button" onClick={() => onEmailRebind([job.id])} disabled={submitting || !job.canRebindEmail}><MailCheck size={16} />邮箱换绑</button>}
           {totpSetupAvailable && job.canSetupTotp && (
             <button type="button" className="icon-button" onClick={setupTotp} disabled={submitting} title="设置 2FA">
               {submitting ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}设置 2FA
@@ -2517,7 +2538,7 @@ function JobRow({ prepareSmsProvider, job, token, expanded, onToggleLogs, onErro
     <td className="insight-cell quota-column">{quotaContent}</td>
     <td className="sms-column"><SmsSummary summary={job.smsSummary} billing={job.smsPoolBilling} /></td>
     <td className="task-time-cell"><div><span>创建</span><time dateTime={job.createdAt} title={formatInsightDate(job.createdAt)}>{formatDateTime(job.createdAt)}</time></div><div><span>操作</span><time dateTime={job.lastOperationAt || job.createdAt} title={formatInsightDate(job.lastOperationAt || job.createdAt)}>{formatDateTime(job.lastOperationAt || job.createdAt)}</time></div><small>{operationLabel(job.lastOperationType)}</small></td>
-    <td className="actions-cell"><div className="row-actions"><button type="button" className="text-action" onClick={onToggleLogs} aria-label={`查看 ${job.email} 的任务详情`}>查看</button>{canExportSub2Api && <button type="button" className="text-action" onClick={download}><Download size={14} />{job.canDownload ? "下载" : "导出 JSON"}</button>}{mfaChangeAvailable && (job.canChangeMfa || job.mfaBusy) && <button type="button" className="text-action" onClick={changeMfa} disabled={submitting || job.mfaBusy} title="复用已有授权，成功后同步账号资料"><ShieldCheck size={14} />{job.mfaBusy ? "MFA 处理中" : "修改 MFA"}</button>}{job.canRetry && !job.canDownload && <button type="button" className="text-action" onClick={retry} disabled={submitting}>{job.canResume ? "继续" : "重试"}</button>}<MoreActions label="更多">{actionContent}</MoreActions></div></td>
+    <td className="actions-cell"><div className="row-actions"><button type="button" className="text-action" onClick={onToggleLogs} aria-label={`查看 ${job.email} 的任务详情`}>查看</button>{canExportSub2Api && <button type="button" className="text-action" onClick={download}><Download size={14} />{job.canDownload ? "下载" : "导出 JSON"}</button>}{mfaChangeAvailable && (job.canChangeMfa || job.mfaBusy) && <button type="button" className="text-action" onClick={changeMfa} disabled={submitting || job.mfaBusy} title="复用已有授权，成功后同步账号资料"><ShieldCheck size={14} />{job.mfaBusy ? "MFA 处理中" : "修改 MFA"}</button>}{onEmailRebind && <button type="button" className="text-action" onClick={() => onEmailRebind([job.id])} disabled={submitting || !job.canRebindEmail}><MailCheck size={14} />邮箱换绑</button>}{job.canRetry && !job.canDownload && <button type="button" className="text-action" onClick={retry} disabled={submitting}>{job.canResume ? "继续" : "重试"}</button>}<MoreActions label="更多">{actionContent}</MoreActions></div></td>
     {showSub2apiLinks && <td className="sub2api-link-column"><Sub2ApiLinkSummary value={sub2apiLink} loading={sub2apiLinksLoading} error={sub2apiLinksError} /></td>}
   </tr>;
 }

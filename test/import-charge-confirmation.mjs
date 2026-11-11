@@ -85,5 +85,10 @@ try {
   reset(); pool.available = false; await assert.rejects(importBatch(), /已停用或暂时无法取号/); assert.equal(confirmations.length, 0); assert.equal(calls.length, 2);
   reset(); pool.available = true; pool.fee = -1; await assert.rejects(importBatch(), /费用尚未确认/); assert.equal(confirmations.length, 0); assert.equal(calls.length, 2);
   reset(); poolStatus = 500; await assert.rejects(importBatch(), /无法读取接码池费用/); assert.equal(confirmations.length, 0); assert.equal(calls.length, 2);
+  markup = render({ count: 2, added: 2, updated: 0, charge: 0, balance: 0, after: 0, reason: "email_rebind_sync" });
+  assert.match(markup, /确认同步换绑账号/);
+  assert.match(markup, /同步回当前 CDK 工作区不扣次数/);
+  assert.match(markup, /确认同步，不扣次数/);
+  assert.doesNotMatch(markup, /失败或取消不自动退次/);
   console.log("Import charge confirmation passed (one review, unchanged import fee, deduplicated SMS cap, live fee pinning, cancellation, ownership, partial balance and manual/private provider paths)");
 } finally { setImportConfirmation(null); globalThis.fetch = originalFetch; globalThis.window = originalWindow; }

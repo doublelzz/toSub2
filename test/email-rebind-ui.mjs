@@ -58,15 +58,15 @@ try {
   await act(() => root.render(React.createElement(CodeForm, { item: { id: "task", newEmail: "new@example.com", challengeVersion: 2 }, onSubmit: (value) => codes.push(value) })));
   assert.equal(container.querySelector("input").value, "", "resending invalidates the previous input");
 
-  // Exercise the actual charged-import client path and its explicit confirmation.
+  // Exercise the free rebind sync client path and its explicit confirmation.
   const originalFetch = globalThis.fetch; const originalEvent = globalThis.Event;
   globalThis.Event = window.Event;
   try {
     const { cdkFetch, setImportConfirmation } = await import("../web/src/cdk-api.mjs");
     const importCalls = [];
     globalThis.fetch = async (route, options) => { importCalls.push({ route, options }); return Response.json(route === "/api/imports/preview"
-      ? { count: 1, added: 1, updated: 0, charge: 1, balance: 3, after: 2, canImport: true } : { created: 1 }); };
-    setImportConfirmation(async (quote) => { assert.equal(quote.charge, 1); return false; });
+      ? { count: 1, added: 1, updated: 0, charge: 0, balance: 0, after: 0, canImport: true, reason: "email_rebind_sync" } : { created: 1 }); };
+    setImportConfirmation(async (quote) => { assert.equal(quote.charge, 0); assert.equal(quote.reason, "email_rebind_sync"); return false; });
     await assert.rejects(cdkFetch("/api/rebind/sync", { method: "POST", body: JSON.stringify({ ids: ["confirmed-task"] }) }), /已取消/);
     assert.equal(importCalls.length, 1, "cancelled confirmation cannot import or charge");
     assert.equal(JSON.parse(importCalls[0].options.body).mode, "rebind");
@@ -120,5 +120,5 @@ try {
   await act(async () => button("确认并开始换绑").click());
   assert.equal(workflowCalls.filter((call) => call.url.endsWith("/start")).length, 1);
   proxyPoolUi.setWorkspaceProxyPoolDraft("");
-  console.log("email rebind UI passed (mapping, OTP, charged import, complete paged logs, safe text rendering, copy and record isolation)");
+  console.log("email rebind UI passed (mapping, OTP, free synchronization, complete paged logs, safe text rendering, copy and record isolation)");
 } finally { await act(() => root.unmount()); dom.window.close(); }

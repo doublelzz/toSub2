@@ -11,9 +11,9 @@ const STOPPABLE = new Set(["queued", "checking", "beginning", "waiting_auto", "w
 const time = (value) => value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "—";
 const countLines = (value) => value.replace(/^\uFEFF/, "").split(/\r?\n/).filter((line) => line.trim()).length;
 
-export default function EmailRebindWorkspace({ token, onOpenAuthorization }) {
+export default function EmailRebindWorkspace({ token, onOpenAuthorization, initialTab = "sources" }) {
   const [data, setData] = useState({ sources: [], items: [] });
-  const [tab, setTab] = useState("sources");
+  const [tab, setTab] = useState(initialTab);
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState("all");
   const [page, setPage] = useState(1);
@@ -86,7 +86,7 @@ export default function EmailRebindWorkspace({ token, onOpenAuthorization }) {
   const sync = (items) => perform("sync", async () => {
     setDetailId(null);
     const value = await post("sync", { ids: items.map((row) => row.id) });
-    setNotice(`已同步 ${value.created} 个新账号。请在授权页使用新邮箱恢复登录；本次未发起接码。`);
+    setNotice(`已同步 ${value.imported} 个账号，不扣 CDK 次数。请在授权页使用新邮箱恢复登录；本次未发起接码。`);
     setRecordIds(new Set()); await refresh();
   });
 
@@ -132,7 +132,7 @@ export default function EmailRebindWorkspace({ token, onOpenAuthorization }) {
         {detail.status === "uncertain" && <button type="button" className="secondary-button" disabled={busy.has(detail.id)} onClick={() => void itemAction(detail, "reconcile")}>核对新邮箱登录状态</button>}
         {detail.status === "success" && !detail.syncedJobId && <button type="button" className="primary-button" disabled={busy.has("sync")} onClick={() => void sync([detail])}><Send size={15} />同步到账号授权</button>}
         {detail.syncedJobId && onOpenAuthorization && <button type="button" className="secondary-button" onClick={onOpenAuthorization}>查看账号授权</button>}
-      </div><p className="rebind-secondary">同步按新邮箱首次导入计次，不覆盖原账号。旧登录信息不能作为新邮箱授权。</p></section>
+      </div><p className="rebind-secondary">换绑成功后同步回账号授权不扣 CDK 次数，保留原账号资料。旧登录信息不能作为新邮箱授权。</p></section>
       <section className="detail-section"><h3>执行历史</h3><ol className="rebind-events">{detail.events.map((event, index) => <li key={index}><time>{time(event.at)}</time><strong>{LABELS[event.status]}</strong><span>{event.message}</span></li>)}</ol></section></>}
     </Drawer>}
   </section>;
@@ -201,9 +201,51 @@ export function MappingDialog({ sources, request, concurrency, timeout, onClose,
     <div className="rebind-mapping-count" role="status"><strong>已选 {sources.length} 个账号</strong><span className={count !== sources.length ? "rebind-count-error" : ""}>已输入 {count} 条</span>{preview && <span>自动 {preview.rows.filter((row) => row.mode === "auto").length} 条，手动 {preview.rows.filter((row) => row.mode === "manual").length} 条</span>}</div>
     <div className="rebind-mapping-body"><label className="rebind-target-input"><span>新邮箱，每行一条</span><textarea value={raw} onChange={(event) => { setRaw(event.target.value); setPreview(null); setError(""); }} disabled={busy} placeholder={'new-a@example.com----https://mail.example.com/inbox/xxx\nnew-b@example.com'} autoComplete="off" spellCheck="false" autoFocus /><small>带取件 URL 自动收码；纯邮箱显示手动验证码输入框。</small></label>
       <div className="rebind-map-review"><strong>对应关系核对</strong><ol>{sources.map((source, index) => <li key={source.id}><span className="rebind-map-number">{index + 1}</span><div><small>原账号</small><strong>{source.email}</strong><ArrowRight size={14} aria-hidden="true" /><span className={preview ? "rebind-map-target" : "rebind-secondary"}>{preview?.rows[index]?.newEmail || "核对后显示新邮箱"}</span>{preview && <small>{preview.rows[index].mode === "auto" ? "自动收码，取件地址已配置" : "手动输入验证码"}</small>}</div></li>)}</ol></div></div>
-    <div className="rebind-mapping-options"><label>同时执行<input aria-label="换绑并发数" type="number" min="1" max="30" value={workers} onChange={(event) => setWorkers(event.target.value)} disabled={busy} /></label><label>等待验证码（秒）<input aria-label="验证码等待秒数" type="number" min="30" max="600" value={seconds} onChange={(event) => setSeconds(event.target.value)} disabled={busy} /></label><p>换绑成功仅记录在本页；不会改写原授权和 MFA 资料。</p></div>
+    <div className="rebind-mapping-options"><label>同时执行<input aria-label="换绑并发数" type="number" min="1" max="30" value={workers} onChange={(event) => setWorkers(event.target.value)} disabled={busy} /></label><label>等待验证码（秒）<input aria-label="验证码等待秒数" type="number" min="30" max="600" value={seconds} onChange={(event) => setSeconds(event.target.value)} disabled={busy} /></label><p>换绑结果保存在换绑记录中；同步回账号授权不扣 CDK 次数，原授权和 MFA 资料独立保留。</p></div>
     {error && <p className="dialog-error" role="alert">{error}</p>}
     <footer><button type="button" className="cancel-button" disabled={busy} onClick={onClose}>取消</button><div><button type="button" className="secondary-button" disabled={busy || count !== sources.length} onClick={() => void run(async () => setPreview(await request("preview", { method: "POST", body: JSON.stringify({ ids: sources.map((source) => source.id), text: raw }) })))}>核对映射</button>
       <button type="button" className="primary-button" disabled={busy || !preview || count !== sources.length || !validSettings} onClick={() => void run(() => onStart({ ids: sources.map((source) => source.id), text: raw, digest: preview.digest, concurrency: Number(workers), timeout: Number(seconds) }))}>{busy ? <LoaderCircle size={15} className="spin" /> : <Mail size={15} />}确认并开始换绑（{sources.length}）</button></div></footer>
   </section></div>;
+}
+
+export function AuthorizationRebindDialog({ token, jobIds, onClose, onStarted }) {
+  const [sources, setSources] = useState(null);
+  const [error, setError] = useState("");
+  const mounted = useRef(false);
+  const selectionKey = jobIds.join("\n");
+  const request = useCallback(async (route, options = {}) => {
+    const response = await cdkFetch(`/api/rebind/${route}`, { ...options,
+      headers: { "content-type": "application/json", "x-console-token": token } });
+    const value = await response.json();
+    if (!response.ok) throw new Error(value.error || `请求失败（${response.status}）`);
+    return value;
+  }, [token]);
+  useEffect(() => {
+    mounted.current = true;
+    const controller = new AbortController();
+    setSources(null); setError("");
+    void (async () => {
+      if (!jobIds.length || jobIds.length > 500) throw new Error("请选择 1 至 500 个账号换绑邮箱");
+      const state = await request("state", { signal: controller.signal });
+      if (state.error) throw new Error(state.error);
+      const byId = new Map(state.sources.map((source) => [source.id, source]));
+      const selected = jobIds.map((id) => byId.get(`authorization:${id}`));
+      if (selected.some((source) => !source)) throw new Error("部分账号已不存在，请刷新账号列表后重试");
+      if (selected.some((source) => source.busy || source.rebound)) throw new Error("所选账号正在执行其他操作或已完成换绑，请重新选择");
+      if (!controller.signal.aborted) setSources(selected);
+    })().catch((failure) => { if (!controller.signal.aborted) setError(failure.message); });
+    return () => { mounted.current = false; controller.abort(); };
+  }, [token, selectionKey, request]);
+
+  if (!sources) return <Drawer title="邮箱换绑" onClose={onClose}>
+    <p className={error ? "dialog-error" : "prompt-line"} role={error ? "alert" : "status"}>{error || "正在核对所选账号的换绑状态…"}</p>
+    {error && <button type="button" className="secondary-button" onClick={onClose}>返回账号授权</button>}
+  </Drawer>;
+  return <MappingDialog sources={sources} request={request} concurrency={1} timeout={180} onClose={onClose}
+    onStart={async (payload) => {
+      await prepareProxyNetworkOptions("workspace");
+      if (!mounted.current) return;
+      const result = await request("start", { method: "POST", body: JSON.stringify(payload) });
+      if (mounted.current) onStarted(result);
+    }} />;
 }
