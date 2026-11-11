@@ -216,7 +216,15 @@ mfaWorkspace = await createMfaWorkspace({
     await withEmailJobLock(email, async () => {
       for (const job of [...jobs.values()].filter((item) => item.email.toLowerCase() === email.toLowerCase())) {
         await invalidateMfaSession(path.join(path.dirname(job.outputPath), ACCOUNT_SESSION_FILENAME), email);
+        await removePrivateFile(job.checkpointPath);
         job.accountSessionAvailable = false;
+        job.loginCheckpointAvailable = false;
+        if (!job.resultSaved) {
+          job.status = "reauth_required";
+          job.prompt = "所有设备已登出，请重新登录后再管理账号";
+          job.lastError = null;
+        }
+        recordJobOperation(job, "logout_all");
         appendJobLog(job, "[mfa] 所有设备已登出，已有登录会话已标记失效。\n");
         touch(job);
         await saveJobMetadata(job);
@@ -476,6 +484,16 @@ async function handleApi(req, res, requestUrl) {
       started: eligible.length,
       skipped: selected.length - eligible.length,
     });
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/jobs/logout-devices-batch") {
+    if (shuttingDown) throw httpError(503, "服务正在关闭，请稍后重试");
+    const body = await readJson(req);
+    const selected = resolveSelectedJobs(body.ids);
+    if (selected.some((job) => !canLogoutDevices(job))) throw httpError(409, "部分账号正在执行其他操作或未保存登录会话，请重新选择");
+    const result = await mfaWorkspace.logoutFromAuthorization(selected.map((job) => job.email), { concurrency: body.concurrency });
+    sendJson(res, 200, result);
     return;
   }
 
@@ -757,7 +775,7 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
-  const match = /^\/api\/jobs\/([a-f0-9-]+)(?:\/(input|cancel|retry|regenerate|relogin|setup-2fa|change-mfa|add-password|account-insights|logs|download|start-phone|sms-number|luban-number))?$/.exec(requestUrl.pathname);
+  const match = /^\/api\/jobs\/([a-f0-9-]+)(?:\/(input|cancel|retry|regenerate|relogin|setup-2fa|change-mfa|logout-devices|add-password|account-insights|logs|download|start-phone|sms-number|luban-number))?$/.exec(requestUrl.pathname);
   if (!match) {
     sendJson(res, 404, { error: "Not found" });
     return;
@@ -770,6 +788,13 @@ async function handleApi(req, res, requestUrl) {
   }
 
   const action = match[2];
+  if (req.method === "POST" && action === "logout-devices") {
+    if (shuttingDown) throw httpError(503, "服务正在关闭，请稍后重试");
+    if (!canLogoutDevices(job)) throw httpError(409, "请等待当前操作结束，并确认账号已保存登录会话后再登出设备");
+    const result = await mfaWorkspace.logoutFromAuthorization([job.email]);
+    sendJson(res, 200, result);
+    return;
+  }
   if (req.method === "POST" && action === "change-mfa") {
     if (shuttingDown) throw httpError(503, "服务正在关闭，请稍后重试");
     if (!canChangeMfa(job)) throw httpError(409, "请等待账号当前操作结束后再修改 MFA");
@@ -4687,6 +4712,7 @@ function publicJob(job) {
     canSetupTotp: canSetupTotp(job),
     canChangeMfa: canChangeMfa(job),
     canRebindEmail: canChangeMfa(job),
+    canLogoutDevices: canLogoutDevices(job),
     mfaBusy: mfaWorkspace?.isBusy(job.email) || false,
     canAddPassword: canAddPassword(job),
     restartRequired: job.restartRequired,
@@ -4718,6 +4744,7 @@ function publicSelectionJob(job) {
     canSetupTotp: canSetupTotp(job),
     canChangeMfa: canChangeMfa(job),
     canRebindEmail: canChangeMfa(job),
+    canLogoutDevices: canLogoutDevices(job),
     canAddPassword: canAddPassword(job),
   };
 }
@@ -4733,6 +4760,10 @@ function canForceRelogin(job) {
 function canChangeMfa(job) {
   return !isActive(job.status) && !job.child && !mfaWorkspace?.isBusy(job.email) && !rebindWorkspace?.isBusy(job.email) && !offerWorkspace?.isBusy(job.email)
     && Boolean(job.resultSaved || job.accountSessionAvailable);
+}
+
+function canLogoutDevices(job) {
+  return canChangeMfa(job) && Boolean(job.accountSessionAvailable);
 }
 
 function canSetupTotp(job) {

@@ -141,7 +141,7 @@ export default function MfaWorkspace({ token, defaultProxyUrl, focusAccountId, o
   const cancelable = selected.filter((account) => ACTIVE_STATUSES.has(account.status) || ACTIVE_STATUSES.has(account.logoutStatus));
   const retryable = (selectedIds.size ? selected : filtered).filter((account) => RETRY_STATUSES.has(account.status));
   const exportable = (selectedIds.size ? selected : accounts).filter((account) => account.status === "success");
-  const logoutable = (selectedIds.size ? selected : filtered).filter((account) => account.status === "success");
+  const logoutable = (selectedIds.size ? selected : filtered).filter((account) => !ACTIVE_STATUSES.has(account.status) && !ACTIVE_STATUSES.has(account.logoutStatus));
   const allPageSelected = pageAccounts.length > 0 && pageAccounts.every((account) => selectedIds.has(account.id));
   const counts = accounts.reduce((result, account) => ({ ...result, [account.status]: (result[account.status] || 0) + 1 }), {});
   const validConcurrency = Number.isInteger(Number(concurrency)) && Number(concurrency) >= 1 && Number(concurrency) <= 30;
@@ -246,13 +246,14 @@ export default function MfaWorkspace({ token, defaultProxyUrl, focusAccountId, o
     });
   }
 
-  function logoutDevices() {
-    if (!logoutable.length || !validConcurrency) return;
-    if (!window.confirm(`使用已有授权，为${selectedIds.size ? "所选" : "当前筛选中"} ${logoutable.length} 个 MFA 修改成功的账号登出所有设备？包括本次会话。授权过期时会提示，不会重新登录。`)) return;
+  function logoutDevices(items = logoutable) {
+    if (!items.length || !validConcurrency) return;
+    const target = items.length === 1 ? `账号 ${items[0].email}` : `${selectedIds.size ? "所选" : "当前筛选中"} ${items.length} 个账号`;
+    if (!window.confirm(`为${target}登出所有设备？包括当前会话。此操作使用已有登录会话，不修改 2FA；会话缺失或过期时提示重新登录。`)) return;
     void perform("logout-all", async () => {
       const proxyOptions = proxyMode === "workspace" ? await prepareWorkspaceProxyPool(defaultProxyUrl ?? readWorkspaceProxyPoolText()) : await prepareProxyNetworkOptions(proxyMode, proxyUrl);
       const data = await (await request("logout-all", {
-        method: "POST", body: JSON.stringify({ ids: logoutable.map((account) => account.id), concurrency: Number(concurrency), ...proxyOptions }),
+        method: "POST", body: JSON.stringify({ ids: items.map((account) => account.id), concurrency: Number(concurrency), ...proxyOptions }),
       })).json();
       setNotice(`已安排 ${data.started} 个账号使用已有授权登出；授权过期时提示，不会重新登录，结果显示在“设备登出”列。`);
       await refresh();
@@ -327,7 +328,7 @@ export default function MfaWorkspace({ token, defaultProxyUrl, focusAccountId, o
           <button type="button" className="secondary-button bulk-button" disabled={!token || !selected.length || Boolean(action)} onClick={() => syncAuthorization(selected)} title="复用已有登录会话，进入未接码并检测额度；失效时提示，不自动登录或接码">{action === "sync-authorization" ? <LoaderCircle className="spin" size={15} /> : <Send size={15} />}同步到账号授权（{selected.length}）</button>
           <button type="button" className="primary-button bulk-button" disabled={!token || running || !startable.length || !validConcurrency || Boolean(action)} onClick={() => startAccounts(startable)} title={running ? "当前批次结束后可开始下一批" : "修改所选账号的 MFA"}>{action === "start" ? <LoaderCircle className="spin" size={15} /> : <ShieldCheck size={15} />}批量修改 {startable.length || ""}</button>
           <button type="button" className="secondary-button bulk-button" disabled={running || !retryable.length || !validConcurrency || Boolean(action)} onClick={() => startAccounts(retryable, true)} title={running ? "当前批次结束后可重试" : selectedIds.size ? "重试所选账号中的失败和中断任务" : "重试筛选结果中的失败和中断任务"}>{action === "retry" ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}重试失败 / 中断 {retryable.length || ""}</button>
-          <button type="button" className="secondary-button bulk-button" disabled={!token || running || !logoutable.length || !validConcurrency || Boolean(action)} onClick={logoutDevices} title={selectedIds.size ? "登出所选成功账号的所有设备" : "登出当前筛选中成功账号的所有设备"}>{action === "logout-all" ? <LoaderCircle className="spin" size={15} /> : <LogOut size={15} />}登出所有设备 {logoutable.length || ""}</button>
+          <button type="button" className="secondary-button bulk-button" disabled={!token || running || !logoutable.length || !validConcurrency || Boolean(action)} onClick={() => logoutDevices()} title={selectedIds.size ? "登出所选账号的所有设备" : "登出当前筛选中账号的所有设备"}>{action === "logout-all" ? <LoaderCircle className="spin" size={15} /> : <LogOut size={15} />}登出所有设备 {logoutable.length || ""}</button>
           <button type="button" className="secondary-button bulk-button" disabled={!cancelable.length || Boolean(action)} onClick={cancelAccounts}><Ban size={15} />停止所选</button>
         </div>
       </div>}
@@ -339,7 +340,7 @@ export default function MfaWorkspace({ token, defaultProxyUrl, focusAccountId, o
 
       <div className="list-heading mfa-list-heading"><strong>任务列表</strong><span aria-live="polite">匹配 {filtered.length} 条 · 最近导入在前</span><div><button type="button" className="selection-text-button" disabled={!filtered.length} onClick={() => setSelectedIds(new Set(filtered.map((account) => account.id)))}>全选筛选结果</button><MoreActions label="更多操作">
           <button type="button" className="secondary-button bulk-button" disabled={running || !retryable.length || !validConcurrency || Boolean(action)} onClick={() => startAccounts(retryable, true)} title={running ? "当前批次结束后可重试" : selectedIds.size ? "重试所选账号中的失败和中断任务" : "重试筛选结果中的失败和中断任务"}>{action === "retry" ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}重试失败 / 中断 {retryable.length || ""}</button>
-          <button type="button" className="secondary-button bulk-button" disabled={!token || running || !logoutable.length || !validConcurrency || Boolean(action)} onClick={logoutDevices} title={selectedIds.size ? "登出所选成功账号的所有设备" : "登出当前筛选中成功账号的所有设备"}>{action === "logout-all" ? <LoaderCircle className="spin" size={15} /> : <LogOut size={15} />}登出所有设备 {logoutable.length || ""}</button>
+          <button type="button" className="secondary-button bulk-button" disabled={!token || running || !logoutable.length || !validConcurrency || Boolean(action)} onClick={() => logoutDevices()} title={selectedIds.size ? "登出所选账号的所有设备" : "登出当前筛选中账号的所有设备"}>{action === "logout-all" ? <LoaderCircle className="spin" size={15} /> : <LogOut size={15} />}登出所有设备 {logoutable.length || ""}</button>
       </MoreActions></div></div>
       <div className="table-frame"><table className="mfa-table"><thead><tr>
         <th className="select-heading"><input type="checkbox" checked={allPageSelected} disabled={!pageAccounts.length} onChange={selectPage} aria-label="选择当前页全部 MFA 账号" /></th><th>账号</th><th>状态</th><th>当前进度</th><th>设备登出</th><th>时间</th><th>详情</th>
@@ -361,7 +362,7 @@ export default function MfaWorkspace({ token, defaultProxyUrl, focusAccountId, o
         <p className="detail-email">{detailAccount.email}</p>
         <section className="detail-section"><h3>账号授权</h3><p className="prompt-line">复用已有登录会话，同步到未接码列表并自动检测额度。</p><button type="button" className="secondary-button" disabled={!token || Boolean(action) || ACTIVE_STATUSES.has(detailAccount.status) || ACTIVE_STATUSES.has(detailAccount.logoutStatus)} onClick={() => syncAuthorization([detailAccount])}><Send size={16} />同步到账号授权</button></section>
         <section className="detail-section"><h3>修改进度</h3><MfaStatus status={detailAccount.status} /><p className="prompt-line">{STAGE_LABELS[detailAccount.stage] || detailAccount.stage}</p>{detailAccount.error && <p className="row-error">{detailAccount.error}</p>}</section>
-        <section className="detail-section"><h3>设备登出</h3><MfaStatus status={detailAccount.logoutStatus || "idle"} logout />{detailAccount.logoutError && <p className="row-error">{detailAccount.logoutError}</p>}{detailAccount.logoutAt && <p className="prompt-line">{formatTime(detailAccount.logoutAt)}</p>}</section>
+        <section className="detail-section"><h3>设备登出</h3><MfaStatus status={detailAccount.logoutStatus || "idle"} logout /><p className="prompt-line">使用已有登录会话即可登出，无需先修改 2FA。</p><button type="button" className="secondary-button" disabled={!token || running || Boolean(action) || !validConcurrency || ACTIVE_STATUSES.has(detailAccount.status) || ACTIVE_STATUSES.has(detailAccount.logoutStatus)} onClick={() => logoutDevices([detailAccount])}><LogOut size={16} />登出所有设备</button>{detailAccount.logoutError && <p className="row-error">{detailAccount.logoutError}</p>}{detailAccount.logoutAt && <p className="prompt-line">{formatTime(detailAccount.logoutAt)}</p>}</section>
         <section className="detail-section"><h3>时间</h3><dl className="detail-dates"><div><dt>创建时间</dt><dd>{detailAccount.createdAt ? formatTime(detailAccount.createdAt) : "未知"}</dd></div><div><dt>最近更新</dt><dd>{formatTime(detailAccount.updatedAt)}</dd></div><div><dt>修改成功</dt><dd>{formatTime(detailAccount.changedAt)}</dd></div></dl></section>
         <section className="detail-section"><h3>详情日志</h3><MfaLogs key={detailAccount.id} accountId={detailAccount.id} request={request} /></section>
       </Drawer>}

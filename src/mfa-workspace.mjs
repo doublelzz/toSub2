@@ -390,11 +390,11 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
     } catch { throw operationError("checkpoint"); }
   }
 
-  async function loadCredentials(account, requirePassword = !account.sessionOnly) {
+  async function loadCredentials(account, requirePassword = !account.sessionOnly, validateTotp = true) {
     try {
       const credentials = credentialsOnly(await credentialStore.load(account.email));
       if (requirePassword && !credentials.password) throw new Error();
-      if (credentials.totpSecret) credentials.totpSecret = normalizeSecret(credentials.totpSecret);
+      if (validateTotp && credentials.totpSecret) credentials.totpSecret = normalizeSecret(credentials.totpSecret);
       return credentials;
     } catch { throw operationError("credentials"); }
   }
@@ -472,7 +472,7 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
     try {
       await serialize(persist);
       if (entry.interrupted) throw operationError("interrupted");
-      const credentials = activeCredentials.get(account.id) || await loadCredentials(account, false);
+      const credentials = activeCredentials.get(account.id) || await loadCredentials(account, false, false);
       const reusable = await reusableSessionPath(account, true);
       const attemptId = crypto.randomUUID();
       await runProtocol(account, entry, ["--logout-all", "--email", account.email,
@@ -607,7 +607,6 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
     ensureAvailable();
     const selected = selectedAccounts(options.ids);
     const logout = operation === "logout_all";
-    if (logout && selected.some((account) => account.status !== "success")) throw requestError(400, "只能为 MFA 修改成功的账号登出所有设备");
     const requestedConcurrency = options.concurrency === undefined ? 3 : Number(options.concurrency);
     if (!Number.isInteger(requestedConcurrency) || requestedConcurrency < 1 || requestedConcurrency > 30) throw requestError(400, "并发数必须为 1 至 30 的整数");
     if ([...accounts.values()].some(processing) || activeTasks.size) throw requestError(409, "请等待当前批次结束后再启动下一批");
@@ -628,9 +627,8 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
         if ([...accounts.values()].some(processing)) throw requestError(409, "已有批次正在运行");
         const loaded = [];
         for (const account of selected) {
-          const credentials = await loadCredentials(account, !logout && !account.sessionOnly);
-          const checkpoint = await readCheckpoint(account);
-          if (logout && checkpoint) throw requestError(409, "账号有待恢复的 MFA 检查点，请先重试完成恢复");
+          const credentials = await loadCredentials(account, !logout && !account.sessionOnly, !logout);
+          const checkpoint = logout ? null : await readCheckpoint(account);
           loaded.push([account.id, credentials, checkpoint, { ...credentials }]);
         }
         // Complete credential/checkpoint validation before advancing the shared cursor.
@@ -729,6 +727,73 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
     } finally { release(); }
     pump();
     return { ...list(), accountId: target.id, started: 1, count: 1 };
+  }
+
+  async function logoutFromAuthorization(emailValues, options = {}) {
+    ensureAvailable();
+    if (!Array.isArray(emailValues) || !emailValues.length || emailValues.length > 500) throw requestError(400, "请选择 1 至 500 个账号");
+    const emails = [...new Set(emailValues.map(normalizeEmail))];
+    if (emails.some((email) => !email)) throw requestError(400, "账号邮箱不正确");
+    const requestedConcurrency = options.concurrency === undefined ? 3 : Number(options.concurrency);
+    if (!Number.isInteger(requestedConcurrency) || requestedConcurrency < 1 || requestedConcurrency > 30) throw requestError(400, "并发数必须为 1 至 30 的整数");
+    const release = reserve(emails);
+    const prepared = [];
+    try {
+      await serialize(async () => {
+        if ([...accounts.values()].some(processing) || activeTasks.size) throw requestError(409, "请等待当前批次结束后再登出设备");
+        for (const email of emails) {
+          const authorization = await resolveAuthorization(email);
+          if (!authorization?.sessionPath) throw operationError("MFA_SESSION_MISSING");
+          let session;
+          try { session = await readMfaSession(authorization.sessionPath, email); }
+          catch (error) { throw operationError(error.mfaCode || "MFA_SESSION_INVALID"); }
+          const existing = [...accounts.values()].find((account) => account.email === email);
+          const target = existing || { id: crypto.randomUUID(), email, status: "ready", stage: "ready", error: "",
+            createdAt: new Date().toISOString(), changedAt: "", sessionOnly: true };
+          const previousCredentials = credentialsOnly(await credentialStore.load(email));
+          // Device logout never replaces a password or a 2FA key.
+          const credentials = { ...previousCredentials, proxyUrl: previousCredentials.proxyUrl || authorization.credentials?.proxyUrl || "" };
+          let previousSession;
+          try { previousSession = await fs.readFile(sessionPath(target)); }
+          catch (error) { if (error.code !== "ENOENT") throw operationError("storage"); }
+          prepared.push({ target, previous: existing ? { ...existing } : null, session, previousSession, credentials, previousCredentials });
+        }
+        if (accounts.size + prepared.filter((item) => !item.previous).length > MAX_ACCOUNTS) throw requestError(400, `工作区最多保存 ${MAX_ACCOUNTS} 个账号`);
+        const previousConcurrency = concurrency;
+        try {
+          for (const item of prepared) {
+            if (item.credentials.proxyUrl !== item.previousCredentials.proxyUrl) await credentialStore.save(item.target.email, item.credentials);
+            await writeMfaSession(sessionPath(item.target), item.session, item.target.email);
+            if (!item.previous) {
+              item.target.hasPassword = Boolean(item.credentials.password);
+              item.target.hasTotpKey = Boolean(item.credentials.totpSecret);
+            }
+            markLogout(item.target, "queued");
+            item.target.logoutStartedAt = item.target.updatedAt;
+            item.target.logoutAt = "";
+            accounts.set(item.target.id, item.target);
+          }
+          concurrency = requestedConcurrency;
+          await persist();
+        } catch (error) {
+          concurrency = previousConcurrency;
+          for (const item of prepared) {
+            if (item.previous) Object.assign(item.target, item.previous);
+            else accounts.delete(item.target.id);
+            if (item.credentials.proxyUrl !== item.previousCredentials.proxyUrl) await credentialStore.save(item.target.email, item.previousCredentials).catch(() => {});
+            if (item.previousSession) await fs.writeFile(sessionPath(item.target), item.previousSession, { mode: 0o600 }).catch(() => {});
+            else await fs.rm(sessionPath(item.target), { force: true }).catch(() => {});
+          }
+          throw operationError(error.mfaCode || "storage");
+        }
+        for (const item of prepared) {
+          activeCredentials.set(item.target.id, item.credentials);
+          await appendLog(item.target, "[queued] 从账号授权页发起设备登出，复用已有登录会话；不修改 2FA，不自动登录");
+        }
+      });
+    } finally { release(); }
+    pump();
+    return { ...list(), accountId: prepared[0].target.id, accountIds: prepared.map((item) => item.target.id), started: prepared.length, count: prepared.length };
   }
 
   async function syncToAuthorization(options = {}) {
@@ -902,5 +967,5 @@ export async function createMfaWorkspace({ root, protocolScript, credentialStore
     initializationError = "MFA 工作区资料无法读取或保存，请检查本地数据文件";
   }
 
-  return { list, logs, preview: (text) => { const rows = parseImport(text); return { accounts: rows.map(({ email }) => ({ email })), count: rows.length }; }, importAccounts, start, startFromAuthorization, syncToAuthorization, logoutAll: (options) => start(options, "logout_all"), cancel, exportAccounts, history, isBusy, shutdown };
+  return { list, logs, preview: (text) => { const rows = parseImport(text); return { accounts: rows.map(({ email }) => ({ email })), count: rows.length }; }, importAccounts, start, startFromAuthorization, logoutFromAuthorization, syncToAuthorization, logoutAll: (options) => start(options, "logout_all"), cancel, exportAccounts, history, isBusy, shutdown };
 }

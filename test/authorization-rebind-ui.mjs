@@ -27,7 +27,7 @@ globalThis.matchMedia = window.matchMedia = () => ({ matches: false, addEventLis
 window.HTMLElement.prototype.getClientRects = function () { return this.isConnected ? [{ width: 100, height: 20 }] : []; };
 const ui = await load("../web/src/WorkspaceUi.jsx", ["Drawer", "MoreActions", "TaskFilters", "TaskOverview", "ThemeControl", "useCalendarDay", "useDialogFocus"], filters);
 let auth = { authenticated: true, token: "fixture-rebind-owner", account: { id: "owner", role: "user" }, workspace: { id: "owner" }, features: { bulkActions: true }, logout() {} };
-const jobs = ["one", "two", "three", "four"].map(id => ({ id, email: `${id}@fixture.invalid`, status: "login_ready", canRebindEmail: id !== "four", prompt: "登录成功，可以管理账号", createdAt: "2026-11-11T01:00:00Z" }));
+const jobs = ["one", "two", "three", "four"].map(id => ({ id, email: `${id}@fixture.invalid`, status: "login_ready", canRebindEmail: id !== "four", canLogoutDevices: id !== "four", prompt: "登录成功，可以管理账号", createdAt: "2026-11-11T01:00:00Z" }));
 const calls = []; let busySource = false; let holdState = false; const pendingState = []; let pendingStart; let holdStart = false;
 const states = () => ({ sources: [...jobs].reverse().map(job => ({ id: `authorization:${job.id}`, email: job.email, sources: ["authorization"], busy: busySource, rebound: false })), items: [] });
 const cdkFetch = async (route, options = {}) => {
@@ -42,6 +42,7 @@ const cdkFetch = async (route, options = {}) => {
     ? new Promise(resolve => pendingState.push({ signal: options.signal, complete: () => resolve(Response.json(states())) })) : Response.json(states());
   if (route === "/api/rebind/preview") return Response.json({ digest: "fixture-reviewed-mapping", rows: body.ids.map((id, index) => ({ oldEmail: states().sources.find(row => row.id === id).email, newEmail: body.text.split("\n")[index], mode: "manual" })) });
   if (route === "/api/rebind/start") return holdStart ? new Promise(resolve => { pendingStart = () => resolve(Response.json({ batchId: "fixture-batch", count: body.ids.length })); }) : Response.json({ batchId: "fixture-batch", count: body.ids.length });
+  if (route === "/api/jobs/logout-devices-batch") return Response.json({ accountId: "logout-task", started: body.ids.length });
   throw Error(`Unexpected authorization rebind request: ${route}`);
 };
 const rebind = await load("../web/src/EmailRebindWorkspace.jsx", ["AuthorizationRebindDialog"], { ...ui, cdkFetch, prepareProxyNetworkOptions: async () => ({}) });
@@ -114,6 +115,18 @@ try {
   assert.equal(pendingState[0].signal.aborted, true);
   await act(async () => pendingState.shift().complete());
   assert.equal(container.querySelector(".rebind-mapping-dialog"), null, "old workspace response cannot open another workspace's dialog");
+  holdState = false;
+  await select("three@fixture.invalid");
+  await act(async () => container.querySelector('[aria-label="上一页"]').click());
+  await select("one@fixture.invalid");
+  let confirmLogout = false;
+  window.confirm = () => confirmLogout;
+  await click("登出设备（2）");
+  assert.equal(calls.some(call => call.route === "/api/jobs/logout-devices-batch"), false);
+  confirmLogout = true;
+  await click("登出设备（2）");
+  assert.deepEqual(calls.find(call => call.route === "/api/jobs/logout-devices-batch").body.ids, ["three", "one"]);
+  assert.equal(calls.some(call => call.route.endsWith("/change-mfa")), false);
   console.log("Authorization email rebind UI passed (direct row action, cross-page batch, fixed mapping, confirmation, busy guards, record navigation, cancellation and CDK isolation).");
 } finally {
   await act(() => root.unmount()); dom.window.close(); globalThis.matchMedia = oldMedia;

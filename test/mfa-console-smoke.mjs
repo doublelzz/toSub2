@@ -95,7 +95,11 @@ try {
   assert.equal((await fetch(`${base}/api/mfa/accounts/${primaryId}/logs`)).status, 401);
   assert.equal((await request('accounts/missing/logs')).status, 404);
   assert.equal((await (await request(`accounts/${primaryId}/logs`)).json()).logs, '');
-  assert.equal((await request("logout-all", { ids: [primaryId] })).status, 400);
+  assert.equal((await request("logout-all", { ids: [primaryId] })).status, 200);
+  await until(async () => (await (await request("accounts")).json()).accounts.find((account) => account.id === primaryId)?.logoutStatus === "failed");
+  const unmodifiedLogout = (await (await request("accounts")).json()).accounts.find((account) => account.id === primaryId);
+  assert.equal(unmodifiedLogout.status, "ready");
+  assert.match(unmodifiedLogout.logoutError, /没有可复用|无法读取/);
   assert.equal((await request("start", { ids, concurrency: 31 })).status, 400);
   assert.equal((await request("start", { ids, concurrency: 1, proxyUrl: "invalid-proxy" })).status, 400);
   const visibleProxy = 'http://fixture-user:fixture-proxy-secret@127.0.0.1:7890';

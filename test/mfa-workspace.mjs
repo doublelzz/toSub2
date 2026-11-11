@@ -223,7 +223,11 @@ try {
   await deviceLogout.instance.importAccounts(`logout-a@example.com----password-a----${oldSecret}\nlogout-failed@example.com----password-b----${oldSecret}\nlogout-c@example.com----password-c----${oldSecret}\nlogout-stale@example.com----password-d----${oldSecret}\nnot-rotated@example.com----password-e----${oldSecret}`);
   const logoutIds = deviceLogout.instance.list().accounts.slice(0, 4).map((account) => account.id);
   const unrotatedId = deviceLogout.instance.list().accounts[4].id;
-  await assert.rejects(deviceLogout.instance.logoutAll({ ids: [unrotatedId] }), { status: 400 });
+  await deviceLogout.instance.logoutAll({ ids: [unrotatedId] });
+  await settled(deviceLogout.instance);
+  assert.equal(deviceLogout.instance.list().accounts.find((account) => account.id === unrotatedId).logoutStatus, "failed");
+  assert.match(deviceLogout.instance.list().accounts.find((account) => account.id === unrotatedId).logoutError, /没有可复用/);
+  assert.equal(deviceLogout.instance.list().accounts.find((account) => account.id === unrotatedId).status, "ready", "logout cannot require or perform a 2FA change");
   await deviceLogout.instance.start({ ids: logoutIds, concurrency: 2 });
   await settled(deviceLogout.instance);
   const staleAccount = deviceLogout.instance.list().accounts[3];
@@ -363,6 +367,30 @@ try {
   await pooledRestart.instance.logoutAll({ ids: [successfulPool.id], useProxyPool: true });
   await settled(pooledRestart.instance);
   assert.equal((await logRows(pooled.directory)).filter((row) => row.event === "logout-start").at(-1).proxy, new URL(poolUrls[1]).toString(), "a new logout operation receives the next exit");
+
+  const independent = await workspace("independent-logout");
+  await independent.instance.importAccounts(`no-rotation@example.com----unchanged-password----${oldSecret}`);
+  const independentAccount = independent.instance.list().accounts[0];
+  const independentCredentials = { ...independent.store.values.get(independentAccount.email), totpSecret: "unused-invalid-secret" };
+  independent.store.values.set(independentAccount.email, independentCredentials);
+  const independentCheckpoint = path.join(independent.directory, "mfa", `${independentAccount.id}.checkpoint.json`);
+  await fs.writeFile(independentCheckpoint, "unreadable MFA recovery checkpoint");
+  await fs.writeFile(path.join(independent.directory, "mfa", `${independentAccount.id}.session.json`), JSON.stringify({ ...session, email: independentAccount.email }));
+  await independent.instance.shutdown();
+  const independentMetadataPath = path.join(independent.directory, "mfa", "accounts.json");
+  const independentMetadata = JSON.parse(await fs.readFile(independentMetadataPath, "utf8"));
+  Object.assign(independentMetadata.accounts[0], { status: "failed", stage: "activating" });
+  await fs.writeFile(independentMetadataPath, JSON.stringify(independentMetadata));
+  const independentRestart = await workspace("independent-logout", { credentialStore: independent.store });
+  await independentRestart.instance.logoutAll({ ids: [independentAccount.id] });
+  await settled(independentRestart.instance);
+  const loggedOut = independentRestart.instance.list().accounts[0];
+  assert.equal(loggedOut.logoutStatus, "success");
+  assert.equal(loggedOut.status, "failed", "logout is available even when the independent MFA operation failed");
+  assert.equal(loggedOut.changedAt, "");
+  assert.deepEqual(independent.store.values.get(independentAccount.email), independentCredentials, "logout does not normalize or replace 2FA credentials");
+  assert.equal(await fs.readFile(independentCheckpoint, "utf8"), "unreadable MFA recovery checkpoint");
+  assert.deepEqual((await logRows(independent.directory)).map((row) => row.event), ["logout-start"]);
 
   const corruptDirectory = path.join(root, "corrupt", "mfa");
   await fs.mkdir(corruptDirectory, { recursive: true });

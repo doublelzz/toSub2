@@ -50,6 +50,19 @@ try {
   await act(() => container.querySelector('[title="MFA 下一页"]').click());
   await act(() => container.querySelector('[aria-label="选择 MFA 账号 row-20@example.com"]').click());
   assert.match(button("同步到账号授权").textContent, /（2）/);
+  const confirmations = [];
+  let confirmLogout = false;
+  window.confirm = (message) => { confirmations.push(message); return confirmLogout; };
+  const logout = button("登出所有设备");
+  assert.equal(logout.disabled, false, "ready accounts can logout without modifying MFA");
+  await act(() => logout.click());
+  assert.equal(calls.some((call) => call.url.endsWith("/logout-all")), false);
+  confirmLogout = true;
+  await act(async () => button("登出所有设备").click());
+  assert.deepEqual(calls.find((call) => call.url.endsWith("/logout-all")).body.ids, ["row-0", "row-20"]);
+  assert.match(confirmations.at(-1), /不修改 2FA/);
+  assert.equal(calls.some((call) => call.url.endsWith("/start")), false, "logout cannot invoke the rotation endpoint");
+  const beforeSyncCalls = calls.length;
   await act(() => button("同步到账号授权").click());
   assert.deepEqual(calls.find((call) => call.url.endsWith("/sync-authorization")).body.ids, ["row-0", "row-20"]);
   assert.match(container.textContent, /成功 1 条，失败 1 条/);
@@ -66,7 +79,7 @@ try {
   await act(() => button("确认导入").click());
   assert.equal(container.querySelector(".mfa-email").textContent, "newest@example.com", "import resets pagination so new accounts are visible first");
   assert.equal(container.querySelectorAll('input[aria-label^="选择 MFA 账号"]:checked').length, 0);
-  assert.ok(calls.every((call) => !/start|logout|jobs\/batch/.test(call.url)), "sync and import UI must not start MFA/login/phone workflows");
+  assert.ok(calls.slice(beforeSyncCalls).every((call) => !/start|logout|jobs\/batch/.test(call.url)), "sync and import UI must not start MFA/login/phone workflows");
   window.confirm = () => true;
   await act(() => container.querySelector('[aria-label="选择 MFA 账号 newest@example.com"]').click());
   accounts = accounts.map((row) => row.id === newRow.id ? { ...row, status: "success" } : row);

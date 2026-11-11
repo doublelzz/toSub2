@@ -73,5 +73,23 @@ try {
     assert.match(errors.at(-1), /Sub2API.*邮箱验证码/);
   }
   assert.deepEqual(exportCalls, [[baseJob.id], [baseJob.id]]);
+  let confirmLogout = false;
+  const confirmations = [];
+  window.confirm = (message) => { confirmations.push(message); return confirmLogout; };
+  response = async () => ({ accountId: "fixture-independent-logout" });
+  const beforeLogout = calls.length;
+  for (const detail of [false, true]) {
+    await render({ detail, mfaChangeAvailable: false, job: { ...pending, canChangeMfa: false, canLogoutDevices: true } });
+    const logoutButton = [...container.querySelectorAll("button")].find((item) => item.textContent === "登出设备");
+    assert.ok(logoutButton, "logout is available independently of the MFA change action");
+    await act(() => logoutButton.click());
+    assert.equal(calls.length, beforeLogout + (detail ? 1 : 0), "cancelling does not perform a logout");
+    confirmLogout = true;
+    await act(() => logoutButton.click());
+    assert.equal(calls.at(-1).endpoint, "/api/jobs/fixture-job/logout-devices");
+    confirmLogout = false;
+  }
+  assert.match(confirmations.at(-1), /不修改 2FA/);
+  assert.equal(started.at(-1), "fixture-independent-logout");
   console.log("authorization MFA UI tests passed (direct action, loading, task navigation, expiry errors)");
 } finally { await act(() => root.unmount()); dom.window.close(); }

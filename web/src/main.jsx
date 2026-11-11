@@ -18,6 +18,7 @@ import {
   ListPlus,
   LoaderCircle,
   LogIn,
+  LogOut,
   Mail,
   MailCheck,
   Megaphone,
@@ -449,6 +450,19 @@ function App({ auth }) {
     && passwordAddSelectedCount > 0;
   const canRebindSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
     && selectedJobs.length <= 500 && selectedJobs.every((job) => job.canRebindEmail);
+  const canLogoutSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
+    && selectedJobs.length <= 500 && selectedJobs.every((job) => job.canLogoutDevices);
+
+  async function logoutSelectedDevices() {
+    if (!canLogoutSelected || batchAction) return;
+    if (!window.confirm(`为所选 ${selectedJobs.length} 个账号登出所有设备？包括当前会话。此操作不修改 2FA，之后管理账号需要重新登录。`)) return;
+    setBatchAction("logout-devices");
+    try {
+      const result = await apiFetch(token, "/api/jobs/logout-devices-batch", { method: "POST", body: JSON.stringify({ ids: [...selectedJobIds] }) });
+      setError(""); setSelectedJobIds(new Set()); showStartedMfa(result.accountId);
+    } catch (failure) { setError(failure.message); }
+    finally { setBatchAction(""); }
+  }
 
   function openAuthorizationRebind(ids) {
     setExpandedJobId(null);
@@ -1324,6 +1338,9 @@ function App({ auth }) {
             <div className="bulk-actions">
               <button type="button" className="secondary-button bulk-button" onClick={() => openAuthorizationRebind([...selectedJobIds])} disabled={!canRebindSelected || Boolean(batchAction)}>
                 <MailCheck size={16} />邮箱换绑（{selectedJobIds.size}）
+              </button>
+              <button type="button" className="secondary-button bulk-button" onClick={logoutSelectedDevices} disabled={!canLogoutSelected || Boolean(batchAction)}>
+                {batchAction === "logout-devices" ? <LoaderCircle size={16} className="spin" /> : <LogOut size={16} />}登出设备（{selectedJobIds.size}）
               </button>
               {features.batchPhoneBinding && phoneTab !== "enabled" && (
                 <button type="button" className="primary-button bulk-button" onClick={startPhoneSelected}
@@ -2255,6 +2272,17 @@ function JobRow({ prepareSmsProvider, job, token, expanded, onToggleLogs, onErro
     finally { setSubmitting(false); }
   }
 
+  async function logoutDevices() {
+    if (submitting || !job.canLogoutDevices) return;
+    if (!window.confirm(`为 ${job.email} 登出所有设备？包括当前会话。此操作不修改 2FA，之后管理账号需要重新登录。`)) return;
+    setSubmitting(true);
+    try {
+      const result = await apiFetch(token, `/api/jobs/${job.id}/logout-devices`, { method: "POST", body: "{}" });
+      onError(""); onMfaStarted(result.accountId);
+    } catch (failure) { onError(failure.message); }
+    finally { setSubmitting(false); }
+  }
+
   async function forceRelogin() {
     setSubmitting(true);
     try {
@@ -2509,6 +2537,7 @@ function JobRow({ prepareSmsProvider, job, token, expanded, onToggleLogs, onErro
             </button>
           )}
           {detail && onEmailRebind && <button type="button" className="secondary-button" onClick={() => onEmailRebind([job.id])} disabled={submitting || !job.canRebindEmail}><MailCheck size={16} />邮箱换绑</button>}
+          {detail && job.canLogoutDevices && <button type="button" className="secondary-button" onClick={logoutDevices} disabled={submitting}><LogOut size={16} />登出设备</button>}
           {totpSetupAvailable && job.canSetupTotp && (
             <button type="button" className="icon-button" onClick={setupTotp} disabled={submitting} title="设置 2FA">
               {submitting ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}设置 2FA
@@ -2538,7 +2567,7 @@ function JobRow({ prepareSmsProvider, job, token, expanded, onToggleLogs, onErro
     <td className="insight-cell quota-column">{quotaContent}</td>
     <td className="sms-column"><SmsSummary summary={job.smsSummary} billing={job.smsPoolBilling} /></td>
     <td className="task-time-cell"><div><span>创建</span><time dateTime={job.createdAt} title={formatInsightDate(job.createdAt)}>{formatDateTime(job.createdAt)}</time></div><div><span>操作</span><time dateTime={job.lastOperationAt || job.createdAt} title={formatInsightDate(job.lastOperationAt || job.createdAt)}>{formatDateTime(job.lastOperationAt || job.createdAt)}</time></div><small>{operationLabel(job.lastOperationType)}</small></td>
-    <td className="actions-cell"><div className="row-actions"><button type="button" className="text-action" onClick={onToggleLogs} aria-label={`查看 ${job.email} 的任务详情`}>查看</button>{canExportSub2Api && <button type="button" className="text-action" onClick={download}><Download size={14} />{job.canDownload ? "下载" : "导出 JSON"}</button>}{mfaChangeAvailable && (job.canChangeMfa || job.mfaBusy) && <button type="button" className="text-action" onClick={changeMfa} disabled={submitting || job.mfaBusy} title="复用已有授权，成功后同步账号资料"><ShieldCheck size={14} />{job.mfaBusy ? "MFA 处理中" : "修改 MFA"}</button>}{onEmailRebind && <button type="button" className="text-action" onClick={() => onEmailRebind([job.id])} disabled={submitting || !job.canRebindEmail}><MailCheck size={14} />邮箱换绑</button>}{job.canRetry && !job.canDownload && <button type="button" className="text-action" onClick={retry} disabled={submitting}>{job.canResume ? "继续" : "重试"}</button>}<MoreActions label="更多">{actionContent}</MoreActions></div></td>
+    <td className="actions-cell"><div className="row-actions"><button type="button" className="text-action" onClick={onToggleLogs} aria-label={`查看 ${job.email} 的任务详情`}>查看</button>{canExportSub2Api && <button type="button" className="text-action" onClick={download}><Download size={14} />{job.canDownload ? "下载" : "导出 JSON"}</button>}{mfaChangeAvailable && (job.canChangeMfa || job.mfaBusy) && <button type="button" className="text-action" onClick={changeMfa} disabled={submitting || job.mfaBusy} title="复用已有授权，成功后同步账号资料"><ShieldCheck size={14} />{job.mfaBusy ? "MFA 处理中" : "修改 MFA"}</button>}{onEmailRebind && <button type="button" className="text-action" onClick={() => onEmailRebind([job.id])} disabled={submitting || !job.canRebindEmail}><MailCheck size={14} />邮箱换绑</button>}{job.canLogoutDevices && <button type="button" className="text-action" onClick={logoutDevices} disabled={submitting}><LogOut size={14} />登出设备</button>}{job.canRetry && !job.canDownload && <button type="button" className="text-action" onClick={retry} disabled={submitting}>{job.canResume ? "继续" : "重试"}</button>}<MoreActions label="更多">{actionContent}</MoreActions></div></td>
     {showSub2apiLinks && <td className="sub2api-link-column"><Sub2ApiLinkSummary value={sub2apiLink} loading={sub2apiLinksLoading} error={sub2apiLinksError} /></td>}
   </tr>;
 }
@@ -2845,6 +2874,7 @@ function operationLabel(type) {
     resume: "继续中断流程",
     setup_2fa: "设置 2FA",
     change_mfa: "修改 MFA",
+    logout_all: "登出所有设备",
     sync_mfa_authorization: "从 MFA 同步",
     email_rebind_import: "换绑后新账号导入",
     add_password: "添加密码",
