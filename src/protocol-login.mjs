@@ -1519,8 +1519,15 @@ async function loginChatgptWeb(client, { chatgptBase, authBase, email, rl, passw
 
   let authenticated;
   let loginMethod;
-  if (isPasswordLoginPage(authPage.finalUrl)) {
+  let loginReferer = authPage.finalUrl;
+  const preferPassword = Boolean(password) && isEmailVerificationPage(authPage.finalUrl);
+  if (isPasswordLoginPage(authPage.finalUrl) || preferPassword) {
     loginMethod = "password";
+    if (preferPassword) {
+      // The web UI switches locally; password/verify accepts the same auth session.
+      loginReferer = `${authBase}/log-in/password`;
+      console.log("[login] Email OTP page reached; switching to the configured password login.");
+    }
     console.log("[3/5] Password login page reached.");
     authenticated = await verifyPassword(client, {
       authBase,
@@ -1528,19 +1535,10 @@ async function loginChatgptWeb(client, { chatgptBase, authBase, email, rl, passw
       deviceId,
       password,
       nonInteractive,
-      referer: authPage.finalUrl,
+      referer: loginReferer,
     });
   } else if (isEmailVerificationPage(authPage.finalUrl)) {
-    if (nonInteractive) throw new Error("MFA_EMAIL_VERIFICATION_REQUIRED: Complete the account email verification before retrying");
     loginMethod = "email_otp";
-    console.log(`[email-otp-requested-at] ${authRequestStartedAt}`);
-    console.log("[3/5] Email OTP page reached. Enter code, or type r to resend.");
-    authenticated = await verifyEmailOtp(client, {
-      authBase,
-      rl,
-      deviceId,
-      referer: authPage.finalUrl,
-    });
   } else if (isCompletedChatgptLoginPage(authPage.finalUrl, chatgptBase, client)) {
     loginMethod = "existing_session";
     authenticated = { continue_url: authPage.finalUrl };
@@ -1553,6 +1551,21 @@ async function loginChatgptWeb(client, { chatgptBase, authBase, email, rl, passw
     throw new Error(`UNEXPECTED_LOGIN_PAGE: Expected password or email verification, received ${pathname}`);
   }
 
+  if (loginMethod === "email_otp"
+      || authenticated?.page?.type === "email_otp_verification"
+      || isEmailVerificationPage(getContinueUrl(authenticated))) {
+    if (nonInteractive) throw new Error("MFA_EMAIL_VERIFICATION_REQUIRED: Complete the account email verification before retrying");
+    loginReferer = new URL(getContinueUrl(authenticated) || "/email-verification", authBase).toString();
+    console.log(`[email-otp-requested-at] ${authRequestStartedAt}`);
+    console.log("[3/5] Email OTP page reached. Enter code, or type r to resend.");
+    authenticated = await verifyEmailOtp(client, {
+      authBase,
+      rl,
+      deviceId,
+      referer: loginReferer,
+    });
+  }
+
   const mfaRequired = isMfaChallengePayload(authenticated);
   authenticated = await completeTotpMfaIfNeeded(client, {
     authBase,
@@ -1561,7 +1574,7 @@ async function loginChatgptWeb(client, { chatgptBase, authBase, email, rl, passw
     payload: authenticated,
     totpSecret,
     nonInteractive,
-    referer: authPage.finalUrl,
+    referer: loginReferer,
   });
   if (existingOnly && isAccountProfileRequired(authenticated)) {
     throw new Error("MFA_EXISTING_ACCOUNT_REQUIRED: The login flow requested account creation");

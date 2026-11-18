@@ -164,6 +164,41 @@ try {
   assert.equal(setupResult.secret, "NB2W45DFOIZAQWER");
   assert.equal(setupResult.activation_mode, "automatic");
   assert.equal(setupResult.activation_succeeded, true);
+
+  for (const scenario of [
+    { name: "mfa", steps: ["password/verify", "mfa/issue_challenge", "mfa/verify"] },
+    { name: "no-mfa", steps: ["password/verify"] },
+    { name: "retry", password: "wrong-fixture-password", input: [{ pattern: /Password \(q=quit/, value: "local-test-password" }],
+      steps: ["password/verify", "password/verify", "mfa/issue_challenge", "mfa/verify"] },
+    { name: "email-gate", input: [{ pattern: /Email OTP \(r=resend/, value: "123456" }],
+      steps: ["password/verify", "email-otp/validate", "mfa/issue_challenge", "mfa/verify"] },
+  ]) {
+    const sessionPath = path.join(tempRoot, `passwordless-${scenario.name}.json`);
+    const switchedLogin = await runNode([
+      path.join(projectRoot, "src", "protocol-login.mjs"),
+      "--email", `passwordless-${scenario.name}@example.com`,
+      "--chatgpt-base", baseUrl, "--auth-base", baseUrl,
+      "--web-only", "--out", sessionPath,
+      "--sub2api-out", path.join(tempRoot, `passwordless-${scenario.name}`, "sub2api.json"),
+      "--checkpoint", path.join(tempRoot, `passwordless-${scenario.name}-checkpoint.json`),
+    ], {
+      CHATGPT_LOGIN_PASSWORD: scenario.password || "local-test-password",
+      CHATGPT_TOTP_SECRET: "JBSWY3DPEHPK3PXP",
+    }, scenario.input || []);
+    assert.equal(switchedLogin.code, 0, processFailure(switchedLogin));
+    assert.match(switchedLogin.output, /switching to the configured password login/);
+    assert.match(switchedLogin.output, /\[3\/5\] Password login page reached\./, "console automation must recognize password login");
+    assert.match(switchedLogin.output, /\[ok\] Password accepted/);
+    assert.doesNotMatch(switchedLogin.output, /local-test-password|wrong-fixture-password|JBSWY3DPEHPK3PXP/);
+    if (scenario.name !== "email-gate") {
+      assert.doesNotMatch(switchedLogin.output, /Email OTP \(r=resend|\[email-otp-requested-at\]/);
+    }
+    const switchedState = await fetch(`${baseUrl}/__test/state`).then((response) => response.json());
+    assert.deepEqual(switchedState.authRequests, scenario.steps);
+    const session = JSON.parse(await fs.readFile(sessionPath, "utf8"));
+    assert.equal(session.web.loginMethod, "password");
+    assert.equal(session.web.mfaVerified, scenario.name !== "no-mfa");
+  }
   console.log("password/email OTP + 2FA workspace smoke tests passed");
 } catch (error) {
   error.message = `${error.message}\nMock server output:\n${serverLogs}`;

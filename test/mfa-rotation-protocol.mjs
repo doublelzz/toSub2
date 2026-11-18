@@ -35,6 +35,20 @@ try {
   assert.equal(basic.calls.disable, 1, "a completed checkpoint must not rotate twice");
   assert.equal(basic.calls.login, 1, "a completed checkpoint needs no new login");
 
+  const passwordless = fixture("passwordless-login", { passwordless: true });
+  result = await run(passwordless);
+  assert.equal(result.code, 0, result.output);
+  await assertComplete(passwordless);
+  assert.match(result.output, /switching to the configured password login/);
+  assert.doesNotMatch(result.output, /Email OTP \(r=resend|Password \(q=quit/);
+
+  const emailRequired = fixture("passwordless-email-gate", { passwordless: true, emailGate: true });
+  result = await run(emailRequired);
+  assert.equal(result.code, 1, result.output);
+  assert.match(result.output, /MFA_EMAIL_VERIFICATION_REQUIRED/);
+  assert.doesNotMatch(result.output, /Email OTP \(r=resend/);
+  assert.equal(emailRequired.calls.disable + emailRequired.calls.enroll, 0);
+
   const firstSetup = fixture("first-setup", { active: "" });
   result = await run(firstSetup, { CHATGPT_TOTP_SECRET: "" });
   assert.equal(result.code, 0, result.output);
@@ -367,11 +381,12 @@ async function handle(req, res) {
       res.end("<!doctype html><title>Just a moment</title><body>Security check required</body>");
       return;
     }
-    return redirect("/log-in/password");
+    return redirect(value.passwordless ? "/email-verification" : "/log-in/password");
   }
-  if (url.pathname === "/log-in/password") return send(200, {});
+  if (["/log-in/password", "/email-verification"].includes(url.pathname)) return send(200, {});
   if (url.pathname === "/api/accounts/password/verify") {
     if (payload.password !== password) return send(401, leakedError("invalid password"));
+    if (value.emailGate) return send(200, { page: { type: "email_otp_verification" }, continue_url: `${base}/email-verification` });
     if (value.profileRequired) return send(200, { page: { type: "about_you" }, continue_url: `${base}/about-you` });
     if (!value.active) return send(200, callback());
     return send(200, { page: { type: "mfa_challenge" }, continue_url: `${base}/mfa-challenge/${value.active}`,

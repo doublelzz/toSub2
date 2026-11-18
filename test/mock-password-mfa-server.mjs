@@ -15,6 +15,7 @@ let workspaceSelectionCount = 0;
 let selectedEmail = "mfa-test@example.com";
 let totpEnabled = false;
 let passwordVerifySentinelCount = 0;
+let authRequests = [];
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", base);
@@ -41,13 +42,16 @@ const server = http.createServer(async (req, res) => {
       chatgptWorkspaceSelected,
       workspaceSelectionCount,
       passwordVerifySentinelCount,
+      authRequests,
     });
   }
   if (req.method === "POST" && url.pathname === "/api/auth/signin/openai") {
     chatgptWorkspaceSelected = false;
     chatgptLoginComplete = false;
     selectedEmail = url.searchParams.get("login_hint") || selectedEmail;
-    const passwordMode = selectedEmail !== "email-mfa@example.com";
+    authRequests = [];
+    res.setHeader("set-cookie", `mock-login-email=${encodeURIComponent(selectedEmail)}; Path=/`);
+    const passwordMode = selectedEmail !== "email-mfa@example.com" && !selectedEmail.startsWith("passwordless-");
     return sendJson(res, 200, { url: `${base}/api/accounts/authorize?mode=${passwordMode ? "password" : "email"}` });
   }
   if (req.method === "GET" && url.pathname === "/api/accounts/authorize") {
@@ -69,14 +73,22 @@ const server = http.createServer(async (req, res) => {
     });
   }
   if (req.method === "POST" && url.pathname === "/api/accounts/password/verify") {
+    authRequests.push("password/verify");
     const payload = parseJson(body);
+    if (!(req.headers.cookie || "").includes(`mock-login-email=${encodeURIComponent(selectedEmail)}`)) {
+      return sendJson(res, 400, { error: { message: "missing login session" } });
+    }
     if (!hasPasswordVerifySentinel(req) || payload.password !== password || Object.keys(payload).length !== 1) {
       return sendJson(res, 401, { error: { message: "invalid password" } });
     }
-    if (selectedEmail === "setup-totp@example.com") return sendJson(res, 200, { continue_url: `${base}/web-callback`, page: { type: "external_url" } });
+    if (selectedEmail === "passwordless-email-gate@example.com") {
+      return sendJson(res, 200, { continue_url: `${base}/email-verification`, page: { type: "email_otp_verification" } });
+    }
+    if (["setup-totp@example.com", "passwordless-no-mfa@example.com"].includes(selectedEmail)) return sendJson(res, 200, { continue_url: `${base}/web-callback`, page: { type: "external_url" } });
     return sendJson(res, 200, mfaPayload());
   }
   if (req.method === "POST" && url.pathname === "/api/accounts/email-otp/validate") {
+    authRequests.push("email-otp/validate");
     const payload = parseJson(body);
     if (payload.code !== "123456" || Object.keys(payload).length !== 1) {
       return sendJson(res, 400, { error: { message: "invalid email code" } });
@@ -111,6 +123,7 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 200, { success: true });
   }
   if (req.method === "POST" && url.pathname === "/api/accounts/mfa/issue_challenge") {
+    authRequests.push("mfa/issue_challenge");
     const payload = parseJson(body);
     if (payload.type !== "totp" || payload.id !== factorId || payload.force_fresh_challenge !== false) {
       return sendJson(res, 400, { error: { message: "invalid challenge request" } });
@@ -118,6 +131,7 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 200, { "oai-client-auth-session": mfaSession() });
   }
   if (req.method === "POST" && url.pathname === "/api/accounts/mfa/verify") {
+    authRequests.push("mfa/verify");
     const payload = parseJson(body);
     const acceptedCodes = [-1, 0, 1].map((offset) => generateTotp(totpSecret, Date.now() + offset * 30_000));
     if (!hasPasswordVerifySentinel(req) || payload.type !== "totp" || payload.id !== factorId || !acceptedCodes.includes(payload.code)) {
