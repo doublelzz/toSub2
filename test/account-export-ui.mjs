@@ -35,7 +35,7 @@ window.HTMLAnchorElement.prototype.click = function () { downloads.push({ filena
 const ui = await load("../web/src/WorkspaceUi.jsx", ["Drawer", "MoreActions", "TaskFilters", "TaskOverview", "ThemeControl", "useCalendarDay", "useDialogFocus"], filters);
 let auth = { authenticated: true, token: "fixture-export-token-a", account: { id: "owner-a", role: "user" }, workspace: { id: "owner-a" }, features: { bulkActions: true, sourceExport: true, atExport: true }, logout: async () => {} };
 const jobs = ["one", "two", "three", "four"].map((id) => ({ id, email: `${id}@fixture.invalid`, status: "completed", createdAt: "2026-11-05T01:00:00.000Z" }));
-const originalContent = "one@fixture.invalid----fixture-password----fixture-mfa\nthree@fixture.invalid----fixture-password-three";
+const originalContent = "one@fixture.invalid----fixture-password----fixture-mfa----https://mail.fixture.invalid/one\nthree@fixture.invalid----fixture-password-three";
 const entries = [
   { email: "one@fixture.invalid", accessToken: "fixture-session-expired-token", source: "session", expiresAt: "2020-01-01T00:00:00.000Z", expired: true },
   { email: "three@fixture.invalid", accessToken: "fixture-oauth-unknown-token", source: "oauth", expiresAt: null, expired: null },

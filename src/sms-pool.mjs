@@ -21,7 +21,7 @@ const validId = (value) => /^[a-zA-Z0-9_-]{1,120}$/.test(value);
 export function classifyPoolError(error) {
   const code = String(error?.code || "").toUpperCase();
   if (/^(NO_NUMBERS|NO_NUMBER|NO_STOCK|ORDER_FAILED|ORDER_CANCELLED|SERVICE_UNAVAILABLE)$/.test(code)) return "no_stock";
-  if (/^(BAD_KEY|NO_KEY|UNAUTHORIZED|INVALID_API_KEY|BANNED)/.test(code)) return "auth_invalid";
+  if (/^(BAD_KEY|NO_KEY|UNAUTHORIZED|INVALID_API_KEY|API_DISABLED|BANNED)/.test(code)) return "auth_invalid";
   if (/^(NO_BALANCE|PAYMENT_REQUIRED|INSUFFICIENT_BALANCE|INSUFFICIENT_USES)/.test(code)) return "balance_insufficient";
   if (/429|RATE_LIMIT|TOO_MANY/.test(code) || /HTTP\s+429/i.test(error?.message || "")) return "rate_limited";
   if (/^(BAD_ACTION|BAD_SERVICE|WRONG_SERVICE|WRONG_COUNTRY|WRONG_MAX_PRICE|UNPROCESSABLE_ENTITY|BAD_COUNTRY|BAD_PRICE|INVALID_PRICE|INVALID_SERVICE)/.test(code)) return "config_invalid";

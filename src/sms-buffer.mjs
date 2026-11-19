@@ -28,8 +28,11 @@ export function createSmsBuffer({ store, now, createProvider, providerOptions })
       try {
         const client = createProvider(current.providerId, current.config, providerOptions);
         const status = typeof client.inspect === "function" ? await client.inspect(current.order.requestId) : null;
+        if (status?.manualReview) throw Object.assign(new Error("order requires manual review"), { code: status.code || "ORDER_REVIEW", manualReview: true });
         if (status?.state === "cancelled") {
-          store.updateInventory(item.id, (value) => ({ ...value, state: "closed", cancelState: "confirmed", cancelledAt: now(), cancellationReceipt: "STATUS_CANCEL", nextActionAt: 0, lastError: "" })); return;
+          const confirmedRefund = daxiguaCancellation(current, status);
+          store.updateInventory(item.id, (value) => ({ ...value, state: "closed", cancelState: "confirmed", cancelledAt: now(), cancellationReceipt: confirmedRefund ? status.receipt : "STATUS_CANCEL",
+            ...(confirmedRefund ? { refundStatus: "confirmed", refundEvidence: status.refundEvidence } : {}), nextActionAt: 0, lastError: "" })); return;
         }
         if (current.cancelBeforeAt && now() >= current.cancelBeforeAt) {
           store.updateInventory(item.id, (value) => ({ ...value, state: "quarantined", cancelState: "denied", lastError: "cancellation_window_expired", nextActionAt: 0 })); return;
@@ -37,16 +40,21 @@ export function createSmsBuffer({ store, now, createProvider, providerOptions })
         if (status?.hasSms === true) throw Object.assign(new Error("order has SMS"), { code: "OTP_RECEIVED" });
         if (typeof client.cancelStrict !== "function") throw Object.assign(new Error("strict cancel unavailable"), { code: "CANCEL_UNSUPPORTED" });
         const receipt = await client.cancelStrict(current.order.requestId);
-        if (!receipt?.cancelled || receipt.receipt !== "ACCESS_CANCEL") throw new Error("cancellation was not confirmed");
+        if (!receipt?.cancelled || receipt.receipt !== "ACCESS_CANCEL" && !daxiguaCancellation(current, receipt)) throw new Error("cancellation was not confirmed");
         store.updateInventory(item.id, (value) => ({ ...value, state: "closed", cancelState: "confirmed", cancelledAt: now(), cancellationReceipt: receipt.receipt,
           refundStatus: receipt.refundStatus === "confirmed" && receipt.refundEvidence ? "confirmed" : "unconfirmed", refundEvidence: receipt.refundEvidence || null, nextActionAt: 0, lastError: "" }));
       } catch (error) {
-        const code = String(error.code || ""); const denied = /FREE_CANCELLATION_EXPIRED|OTP_RECEIVED|NEW_OTP_RECEIVED|CANCEL_UNSUPPORTED/.test(code);
+        const code = String(error.code || ""); const denied = error.manualReview === true || /FREE_CANCELLATION_EXPIRED|OTP_RECEIVED|NEW_OTP_RECEIVED|CANCEL_UNSUPPORTED/.test(code);
         store.updateInventory(item.id, (value) => ({ ...value, state: denied ? "quarantined" : "cancel_pending", cancelState: denied ? "denied" : "unknown",
           lastError: code || "cancel_unconfirmed", hasSms: value.hasSms || code === "OTP_RECEIVED", nextActionAt: denied ? 0 : Math.max(now() + 30000, value.cancelAllowedAt || 0), cancelAttempts: (value.cancelAttempts || 0) + 1 }));
       }
     })();
     cancellations.set(item.id, task); try { await task; } finally { cancellations.delete(item.id); }
+  }
+  function daxiguaCancellation(item, receipt) {
+    return item.providerId === "daxigua" && receipt?.cancelled === true
+      && String(receipt.requestId) === String(item.order.requestId) && ["cancelled", "failed"].includes(receipt.receipt)
+      && receipt.refundStatus === "confirmed" && receipt.refundEvidence === `daxigua:${item.order.requestId}:${receipt.receipt}`;
   }
   async function tick() {
     if (tickPromise) return tickPromise;

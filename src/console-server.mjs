@@ -3149,6 +3149,14 @@ async function acquireSmsNumberAttempt(job, token) {
     }
     if (error?.status === 409 && (job.status !== "phone" || !job.child)) return "stopped";
     const message = safeSmsProviderError(error, smsClient.apiKey);
+    if (error?.manualReview) {
+      job.smsStatus = "error";
+      job.smsError = `${message}，已停止自动取号，请先核查平台订单`;
+      appendJobLog(job, `[sms] ${smsClient.name} 订单需要核查，停止自动取号：${message}\n`);
+      touch(job);
+      await saveJobMetadata(job);
+      return "done";
+    }
     if (job.smsNumberAttempt >= job.smsNumberMaxAttempts) {
       job.smsStatus = "error";
       job.smsError = `${message}（已达到自动取号上限 ${job.smsNumberMaxAttempts} 次）`;
@@ -3331,9 +3339,9 @@ async function beginSmsPolling(job) {
         if (error?.terminal) {
           job.smsStatus = "error";
           const providerError = safeSmsProviderError(error, smsClient.apiKey);
-          job.smsError = `${providerError}，可以手动输入验证码或更换手机号`;
+          job.smsError = error.manualReview ? `${providerError}，已停止自动收码和换号，请先核查平台订单` : `${providerError}，可以手动输入验证码或更换手机号`;
           touch(job);
-          requestAutomaticSmsRotation(job, providerError);
+          if (!error.manualReview) requestAutomaticSmsRotation(job, providerError);
           return;
         }
         job.smsStatus = "waiting_sms";
@@ -4604,9 +4612,9 @@ async function exportSourceAccounts(res, ids) {
     }
     if (password) {
       const parts = [job.email, password];
+      if (totpSecret) parts.push(totpSecret);
       if (job.mailRequestBody) parts.push(job.mailRequestBody);
       else if (job.mailApiUrl) parts.push(job.mailApiUrl);
-      if (totpSecret) parts.push(totpSecret);
       lines.push(parts.join("----"));
       continue;
     }

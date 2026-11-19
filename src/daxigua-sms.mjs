@@ -16,6 +16,7 @@ export class DaXiGuaSmsError extends Error {
     this.retryAfterMs = options.retryAfterMs ?? 0;
     this.order = options.order ?? null;
     this.idempotencyKey = options.idempotencyKey ?? null;
+    this.manualReview = Boolean(options.manualReview);
   }
 }
 
@@ -29,11 +30,15 @@ export function createDaXiGuaSmsClient(options = {}) {
   const now = options.now || Date.now;
   const sleep = options.sleep || ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
   let pending = null;
+  let acquisition = null;
+  const retryUntil = { read: 0, write: 0 };
 
   if (!apiKey) return null;
   if (!/^https?:$/.test(apiBase.protocol)) throw new Error("大西瓜接码 API 地址必须使用 HTTP 或 HTTPS");
 
   async function request(path, { method = "GET", body, idempotencyKey } = {}) {
+    const requestKind = method === "GET" ? "read" : "write";
+    if (retryUntil[requestKind] > now()) await sleep(retryUntil[requestKind] - now());
     const url = new URL(String(path).replace(/^\/+/, ""), apiBase);
     const headers = { accept: "application/json", authorization: `Bearer ${apiKey}` };
     if (body !== undefined) headers["content-type"] = "application/json";
@@ -52,15 +57,16 @@ export function createDaXiGuaSmsClient(options = {}) {
       let payload;
       try { payload = text ? JSON.parse(text) : null; } catch {
         throw new DaXiGuaSmsError(`大西瓜接码返回 HTTP ${response.status}，但响应不是有效 JSON`, {
-          status: response.status,
-          terminal: response.status < 500 && ![408, 429].includes(response.status),
+          status: response.ok ? 502 : response.status,
+          terminal: response.status >= 400 && response.status < 500 && ![408, 429].includes(response.status),
+          retryAfterMs: retryAfterMilliseconds(response.headers.get("retry-after")),
         });
       }
       if (!response.ok || payload?.success !== true) {
-        throw responseError(payload, response.status, response.headers.get("retry-after"), apiKey);
+        throw responseError(payload, response.ok ? 502 : response.status, response.headers.get("retry-after"), apiKey);
       }
       if (!payload.data || typeof payload.data !== "object" || Array.isArray(payload.data)) {
-        throw new DaXiGuaSmsError("大西瓜接码返回的数据格式不正确", { terminal: true });
+        throw new DaXiGuaSmsError("大西瓜接码返回的数据格式不正确", { status: response.ok ? 502 : response.status });
       }
       return payload.data;
     } catch (error) {
@@ -68,6 +74,7 @@ export function createDaXiGuaSmsClient(options = {}) {
       if (error instanceof DaXiGuaSmsError) {
         error.message = safeMessage(error.message, apiKey);
         if (typeof error.code === "string") error.code = safeMessage(error.code, apiKey);
+        if (error.retryAfterMs > 0) retryUntil[requestKind] = Math.max(retryUntil[requestKind], now() + error.retryAfterMs);
         throw error;
       }
       throw new DaXiGuaSmsError(`大西瓜接码请求失败：${safeMessage(error?.message, apiKey)}`);
@@ -97,8 +104,14 @@ export function createDaXiGuaSmsClient(options = {}) {
         return pending.order;
       } catch (error) {
         lastError = error;
-        if (error.terminal) { pending = null; throw error; }
-        if (attempt < 3) await sleep(Math.max(100, Math.min(error.retryAfterMs || attempt * 250, 5_000)));
+        error.idempotencyKey = pending.idempotencyKey;
+        if (error.terminal) {
+          // Only an explicit client-error response confirms rejection. Invalid
+          // successful replies must retain the original key for later retries.
+          if (error.status >= 400 && error.status < 500) pending = null;
+          throw error;
+        }
+        if (attempt < 3) await sleep(Math.max(100, error.retryAfterMs || attempt * 250));
       }
     }
     lastError.idempotencyKey = pending.idempotencyKey;
@@ -109,6 +122,9 @@ export function createDaXiGuaSmsClient(options = {}) {
     const deadline = now() + assignmentTimeoutMs;
     let current = initial;
     while (true) {
+      if (current.terminal === true && ["creating", "assigned"].includes(current.status)) {
+        throw orderError(current, "大西瓜接码已将订单标记为终态，请核查平台订单", "ORDER_TERMINAL", true);
+      }
       if (["assigned", "received"].includes(current.status)) {
         const number = normalizePhone(current.phone_number);
         if (!number) throw orderError(current, "大西瓜接码返回的手机号不是有效的国际格式", "INVALID_PHONE", true);
@@ -116,16 +132,20 @@ export function createDaXiGuaSmsClient(options = {}) {
       }
       if (current.status === "failed") throw orderError(current, current.failure_reason || "大西瓜接码取号失败，次数已退回", "NO_NUMBERS");
       if (current.status === "cancelled") throw orderError(current, "大西瓜接码订单已取消，次数已退回", "ORDER_CANCELLED");
-      if (current.status === "review") throw orderError(current, current.failure_reason || "大西瓜接码订单待人工核查", "ORDER_REVIEW", true);
+      if (current.status === "review") throw orderError(current, reviewMessage(current), "ORDER_REVIEW", true);
       if (current.status !== "creating") throw orderError(current, "大西瓜接码返回了未知订单状态", "UNKNOWN_ORDER_STATUS", true);
       if (now() >= deadline) {
         throw orderError(current, "大西瓜接码订单仍在取号，请稍后继续查询，勿重复创建订单", "ORDER_PENDING");
       }
       await sleep(Math.min(pollIntervalMs, Math.max(1, deadline - now())));
       try {
-        current = normalizeOrder(await request(`orders/${encodeURIComponent(String(current.id))}`));
+        current = await orderStatus(current.id);
       } catch (error) {
         error.order ||= { requestId: String(current.id), number: normalizePhone(current.phone_number) || "", ...providerOrderLifecycle(current) };
+        if (!error.terminal && now() < deadline) {
+          const backoff = Math.max(pollIntervalMs, error.retryAfterMs || 0);
+          if (now() + backoff < deadline) { await sleep(backoff); continue; }
+        }
         throw error;
       }
       pending.order = current;
@@ -133,15 +153,53 @@ export function createDaXiGuaSmsClient(options = {}) {
   }
 
   async function orderStatus(orderId) {
-    return normalizeOrder(await request(`orders/${encodeURIComponent(String(orderId))}`));
+    const order = normalizeOrder(await request(`orders/${encodeURIComponent(String(orderId))}`));
+    if (order.id !== String(orderId)) throw new DaXiGuaSmsError("大西瓜接码返回的订单编号不匹配", { code: "ORDER_MISMATCH", terminal: true, manualReview: true });
+    return order;
   }
 
   async function cancelStrict(orderId) {
-    const order = normalizeOrder(await request(`orders/${encodeURIComponent(String(orderId))}/cancel`, { method: "POST" }));
+    let order;
+    try {
+      order = normalizeOrder(await request(`orders/${encodeURIComponent(String(orderId))}/cancel`, { method: "POST" }));
+    } catch (error) {
+      // A lost/409 cancellation response is not a refund. Read the original
+      // order before deciding whether cancellation actually completed.
+      if (error.terminal && error.code !== "ORDER_NOT_CANCELLABLE" && error.status >= 400 && error.status < 500) throw error;
+      try { order = await orderStatus(orderId); }
+      catch { throw error; }
+      if (!["cancelled", "failed"].includes(order.status)) {
+        if (order.status === "review") throw orderError(order, reviewMessage(order), "ORDER_REVIEW", true);
+        throw error;
+      }
+    }
+    if (order.id !== String(orderId)) throw new DaXiGuaSmsError("大西瓜接码取消回执的订单编号不匹配", { code: "ORDER_MISMATCH", terminal: true, manualReview: true });
+    if (order.status === "review") throw orderError(order, reviewMessage(order), "ORDER_REVIEW", true);
     if (!["cancelled", "failed"].includes(order.status)) {
       throw orderError(order, "大西瓜接码未确认订单已取消", "CANCEL_NOT_CONFIRMED");
     }
-    return { requestId: String(order.id), cancelled: true, receipt: order.status, refundStatus: "confirmed" };
+    return cancellationProof(order);
+  }
+
+  function orderError(order, message, code, terminal = false) {
+    return new DaXiGuaSmsError(safeMessage(message, apiKey), {
+      code,
+      terminal,
+      manualReview: ["ORDER_REVIEW", "ORDER_TERMINAL", "UNKNOWN_ORDER_STATUS", "INVALID_PHONE"].includes(code),
+      order: { requestId: String(order.id), number: normalizePhone(order.phone_number) || "", ...providerOrderLifecycle(order) },
+    });
+  }
+
+  async function acquireNumber(country, project) {
+    const order = await createOrder(country, project);
+    try {
+      const result = await waitForNumber(order);
+      pending = null;
+      return result;
+    } catch (error) {
+      if (["NO_NUMBERS", "ORDER_CANCELLED"].includes(error.code)) pending = null;
+      throw error;
+    }
   }
 
   return {
@@ -159,20 +217,23 @@ export function createDaXiGuaSmsClient(options = {}) {
       if (!/^[a-zA-Z0-9_-]{1,16}$/.test(country) || !/^[a-zA-Z0-9_-]{1,80}$/.test(project)) {
         throw new DaXiGuaSmsError("请先查询并选择大西瓜接码服务", { code: "INVALID_SERVICE", terminal: true });
       }
-      const order = await createOrder(country, project);
-      try {
-        const result = await waitForNumber(order);
-        pending = null;
-        return result;
-      } catch (error) {
-        if (["NO_NUMBERS", "ORDER_CANCELLED", "INVALID_PHONE"].includes(error.code)) pending = null;
-        throw error;
+      if (acquisition) {
+        if (acquisition.country !== country || acquisition.project !== project) throw new DaXiGuaSmsError("上一笔大西瓜接码取号尚未结束，不能切换服务重复下单", { code: "ORDER_PENDING" });
+        return acquisition.promise;
       }
+      const active = { country, project, promise: acquireNumber(country, project) };
+      acquisition = active;
+      try {
+        return await active.promise;
+      } finally { if (acquisition === active) acquisition = null; }
     },
 
     async getSms(orderId) {
       const order = await orderStatus(orderId);
-      if (["creating", "assigned"].includes(order.status)) return { status: "waiting" };
+      if (["creating", "assigned"].includes(order.status)) {
+        if (order.terminal === true) throw orderError(order, "大西瓜接码已将订单标记为终态，请核查平台订单", "ORDER_TERMINAL", true);
+        return { status: "waiting" };
+      }
       if (order.status === "received") {
         const code = /(?:^|\D)(\d{6})(?!\d)/.exec(String(order.sms_content || ""))?.[1];
         if (!code) throw orderError(order, "大西瓜接码短信中没有找到独立的 6 位数字验证码", "INVALID_SMS", true);
@@ -180,16 +241,18 @@ export function createDaXiGuaSmsClient(options = {}) {
       }
       if (order.status === "failed") throw orderError(order, order.failure_reason || "大西瓜接码订单失败，次数已退回", "ORDER_FAILED", true);
       if (order.status === "cancelled") throw orderError(order, "大西瓜接码订单已取消，次数已退回", "ORDER_CANCELLED", true);
-      if (order.status === "review") throw orderError(order, order.failure_reason || "大西瓜接码订单待人工核查", "ORDER_REVIEW", true);
+      if (order.status === "review") throw orderError(order, reviewMessage(order), "ORDER_REVIEW", true);
       throw orderError(order, "大西瓜接码返回了未知订单状态", "UNKNOWN_ORDER_STATUS", true);
     },
 
     async inspect(orderId) {
       const order = await orderStatus(orderId);
-      if (["creating", "assigned"].includes(order.status)) return { state: "waiting", hasSms: false };
-      if (order.status === "received") return { state: "received", hasSms: Boolean(String(order.sms_content || "").trim()) };
-      if (["failed", "cancelled"].includes(order.status)) return { state: "cancelled", hasSms: false };
-      return { state: "unknown", hasSms: false };
+      if (["creating", "assigned"].includes(order.status)) return order.terminal === true
+        ? { state: "unknown", hasSms: false, manualReview: true, code: "ORDER_TERMINAL" }
+        : { state: "waiting", hasSms: false };
+      if (order.status === "received") return { state: "received", hasSms: true };
+      if (["failed", "cancelled"].includes(order.status)) return { state: "cancelled", hasSms: false, ...cancellationProof(order) };
+      return { state: "unknown", hasSms: false, manualReview: true, code: order.status === "review" ? "ORDER_REVIEW" : "UNKNOWN_ORDER_STATUS" };
     },
 
     cancelStrict,
@@ -228,12 +291,18 @@ function normalizePhone(value) {
   return /^\+[1-9]\d{6,14}$/.test(number) ? number : null;
 }
 
-function orderError(order, message, code, terminal = false) {
-  return new DaXiGuaSmsError(message, {
-    code,
-    terminal,
-    order: { requestId: String(order.id), number: normalizePhone(order.phone_number) || "", ...providerOrderLifecycle(order) },
-  });
+function reviewMessage(order) {
+  return `大西瓜接码订单待人工核查，次数仍冻结${order.failure_reason ? `：${order.failure_reason}` : ""}`;
+}
+
+function cancellationProof(order) {
+  return { requestId: String(order.id), cancelled: true, receipt: order.status, refundStatus: "confirmed", refundEvidence: `daxigua:${order.id}:${order.status}` };
+}
+
+function retryAfterMilliseconds(value) {
+  if (value == null || !String(value).trim()) return 0;
+  const seconds = Number(value);
+  return Number.isFinite(seconds) && seconds > 0 ? Math.ceil(seconds * 1000) : 0;
 }
 
 function responseError(payload, status, retryAfter, apiKey) {
@@ -255,12 +324,11 @@ function responseError(payload, status, retryAfter, apiKey) {
   };
   const terminalCodes = new Set(["unauthorized", "api_disabled", "invalid_service", "invalid_idempotency_key", "idempotency_conflict", "insufficient_uses", "order_not_found", "order_rejected", "order_not_cancellable"]);
   const message = descriptions[code] || supplied || `大西瓜接码返回 HTTP ${status}`;
-  const seconds = Number(retryAfter);
   return new DaXiGuaSmsError(supplied && descriptions[code] && supplied !== descriptions[code] ? `${message}：${supplied}` : message, {
     code: code.toUpperCase(),
     status,
     terminal: terminalCodes.has(code) || status >= 400 && status < 500 && ![408, 429].includes(status) && code !== "cancel_not_confirmed" && code !== "service_unavailable",
-    retryAfterMs: Number.isFinite(seconds) && seconds > 0 ? Math.ceil(seconds * 1000) : 0,
+    retryAfterMs: retryAfterMilliseconds(retryAfter),
   });
 }
 

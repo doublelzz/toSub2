@@ -725,7 +725,7 @@ try {
   const mailApiUrl = `${baseUrl}/api/bootstrap`;
   const sourceLines = [
     `password-mail@example.com---test-password----${mailApiUrl}`,
-    `password-mail-totp@example.com----test-password-2----${mailApiUrl}----JBSWY3DPEHPK3PXP`,
+    `password-mail-totp@example.com----test-password-2----JBSWY3DPEHPK3PXP----${mailApiUrl}`,
     `${mailApiUrl}|JBSWY3DPEHPK3PXP|unordered-password|smart.user-name@sub.example.co.uk`,
     `pipe-password@example.dev|part-one|part-two|${mailApiUrl}|NB2W45DFOIZAQWER`,
     `MFRGGZDFMZTWQ2LK::colon-password::name+tag@sub-domain.example.cloud`,
@@ -786,11 +786,11 @@ try {
   assert.deepEqual(sourceExport, [
     `manual-totp@example.net--------ONSWG4TFOQXXXXXX`,
     `name+tag@sub-domain.example.cloud----colon-password----MFRGGZDFMZTWQ2LK`,
-    `password-mail-totp@example.com----test-password-2----${mailApiUrl}----JBSWY3DPEHPK3PXP`,
+    `password-mail-totp@example.com----test-password-2----JBSWY3DPEHPK3PXP----${mailApiUrl}`,
     `password-mail@example.com----test-password----${mailApiUrl}`,
-    `pipe-password@example.dev----part-one|part-two----${mailApiUrl}----NB2W45DFOIZAQWER`,
+    `pipe-password@example.dev----part-one|part-two----NB2W45DFOIZAQWER----${mailApiUrl}`,
     `reverse.api-order@example.xyz----${mailApiUrl}`,
-    `smart.user-name@sub.example.co.uk----unordered-password----${mailApiUrl}----JBSWY3DPEHPK3PXP`,
+    `smart.user-name@sub.example.co.uk----unordered-password----JBSWY3DPEHPK3PXP----${mailApiUrl}`,
     `space-group@example.org----grouped-password----JBSWY3DPEHPK3PXP`,
     `password-empty-field@example.org----plain-password----GEZDGNBVGY3TQOJQ`,
     `user---tag@example.com----hyphen-email-password`,
@@ -829,7 +829,7 @@ try {
   assert.equal(preservedSourceResponse.status, 200);
   assert.match(
     (await preservedSourceResponse.text()).replace(/^\uFEFF/, ""),
-    new RegExp(`password-mail-totp@example\\.com----test-password-2----.*----JBSWY3DPEHPK3PXP`),
+    new RegExp(`password-mail-totp@example\\.com----test-password-2----JBSWY3DPEHPK3PXP----.*`),
   );
 
   const manualPhoneResponse = await fetch(`${baseUrl}/api/jobs`, {

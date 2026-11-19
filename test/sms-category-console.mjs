@@ -36,7 +36,8 @@ try {
   await assert.rejects(call("/api/jobs", { email: "missing-category@example.invalid", phoneBindingMode: "automatic", smsProvider: { id: "pool", config: { quotedFee: 2 } } }), /分类/);
   const created = JSON.parse((await call("/api/jobs", { email: "category-console@example.invalid", phoneBindingMode: "automatic", smsProvider: { id: "pool", config: { categoryId: "us", quotedFee: 5, feeVersion: 2 } } })).body.toString()).job;
   workspace.resume();
-  const active = await wait(() => workspace.publicJobs().find((row) => row.id === created.id && row.status === "phone" && row.smsNumberAttempt === 1));
+  const active = await wait(() => workspace.publicJobs().find((row) => row.id === created.id && row.status === "phone" && row.smsNumberAttempt === 1
+    && !row.smsAutoRetrying && row.smsSummary?.historyCount === 1));
   assert.equal(active.smsPoolBilling.categoryId, "us"); assert.equal(active.smsPoolBilling.categoryName, "美区"); assert.equal(active.smsPoolBilling.fee, 5);
   const before = purchases;
   await assert.rejects(call(`/api/jobs/${created.id}/sms-number`, { providerId: "pool", config: { categoryId: "other", quotedFee: 2, feeVersion: 1 } }), (error) => error.status === 409 && /分类/.test(error.message));

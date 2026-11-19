@@ -15,6 +15,7 @@ const smsActions = [];
 let smsChecks = 0;
 let autoRotateNumberCalls = 0;
 let customInboxChecks = 0;
+let daxiguaReview = false;
 const smsServer = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", "http://127.0.0.1");
   if (url.pathname === "/custom-inbox") {
@@ -43,12 +44,12 @@ const smsServer = http.createServer(async (req, res) => {
       let body = ""; for await (const chunk of req) body += chunk;
       assert.deepEqual(JSON.parse(body), { country: "kh", project: "chatgpt" });
       res.writeHead(202, { "content-type": "application/json; charset=utf-8" });
-      res.end(JSON.stringify({ success: true, data: daxiguaOrder("assigned") }));
+      res.end(JSON.stringify({ success: true, data: daxiguaOrder(daxiguaReview === "create" ? "review" : "assigned") }));
       return;
     }
     if (req.method === "GET" && route === "orders/987") {
       res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
-      res.end(JSON.stringify({ success: true, data: daxiguaOrder("received", { sms_content: "Your ChatGPT verification code is 654321" }) }));
+      res.end(JSON.stringify({ success: true, data: daxiguaReview ? daxiguaOrder("review", { failure_reason: "Fixture review required" }) : daxiguaOrder("received", { sms_content: "Your ChatGPT verification code is 654321" }) }));
       return;
     }
     if (req.method === "POST" && route === "orders/987/cancel") {
@@ -447,6 +448,46 @@ try {
   const daxiguaMetadata = await storedFiles(outputRoot).readFile(path.join(outputRoot, daxigua.job.id, "job-meta.json"), "utf8");
   assert.equal(daxiguaMetadata.includes("test-daxigua-key"), false);
   assert.equal(logs.includes("test-daxigua-key"), false);
+
+  daxiguaReview = true;
+  const reviewResponse = await fetch(`${baseUrl}/api/jobs`, {
+    method: "POST", headers, body: JSON.stringify({ email: "daxigua-review@example.com" }),
+  });
+  assert.equal(reviewResponse.status, 201);
+  const reviewJob = (await reviewResponse.json()).job;
+  await waitForJob(headers, reviewJob.id, (job) => job.status === "phone");
+  const reviewNumber = await fetch(`${baseUrl}/api/jobs/${reviewJob.id}/sms-number`, {
+    method: "POST", headers, body: JSON.stringify({ providerId: "daxigua", config: {
+      apiKey: "test-daxigua-key", country: "kh", project: "chatgpt", maxRotationAttempts: "3", rotationIntervalSeconds: "0.02",
+    } }),
+  });
+  assert.equal(reviewNumber.status, 200);
+  const reviewed = await waitForJob(headers, reviewJob.id, (job) => job.status === "phone_otp" && job.smsStatus === "error");
+  assert.match(reviewed.smsError, /待人工核查.*次数仍冻结/);
+  assert.match(reviewed.smsError, /停止自动收码和换号/);
+  const reviewedActions = smsActions.filter((item) => item.provider === "daxigua").length;
+  await delay(150);
+  assert.equal(smsActions.filter((item) => item.provider === "daxigua").length, reviewedActions, "review stops automatic polling, cancellation and new purchases");
+  const reviewState = await fetch(`${baseUrl}/api/jobs?search=daxigua-review`, { headers }).then((response) => response.json());
+  assert.equal(reviewState.jobs[0].smsNumberAttempt, 1);
+  daxiguaReview = "create";
+  const reviewCreateResponse = await fetch(`${baseUrl}/api/jobs`, {
+    method: "POST", headers, body: JSON.stringify({ email: "daxigua-review-create@example.com" }),
+  });
+  assert.equal(reviewCreateResponse.status, 201);
+  const reviewCreateJob = (await reviewCreateResponse.json()).job;
+  await waitForJob(headers, reviewCreateJob.id, (job) => job.status === "phone");
+  const reviewedCreate = await fetch(`${baseUrl}/api/jobs/${reviewCreateJob.id}/sms-number`, {
+    method: "POST", headers, body: JSON.stringify({ providerId: "daxigua", config: {
+      apiKey: "test-daxigua-key", country: "kh", project: "chatgpt", maxRotationAttempts: "3", rotationIntervalSeconds: "0.02",
+    } }),
+  });
+  assert.equal(reviewedCreate.status, 200);
+  const reviewCreation = await waitForJob(headers, reviewCreateJob.id, (job) => job.status === "phone" && job.smsStatus === "error");
+  assert.match(reviewCreation.smsError, /停止自动取号/);
+  const createsAfterReview = smsActions.filter((item) => item.provider === "daxigua" && item.action === "POST orders").length;
+  await delay(150);
+  assert.equal(smsActions.filter((item) => item.provider === "daxigua" && item.action === "POST orders").length, createsAfterReview);
 
   const cancelResponse = await fetch(`${baseUrl}/api/jobs`, {
     method: "POST", headers, body: JSON.stringify({ email: "hero-cancel@example.com" }),
