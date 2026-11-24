@@ -17,20 +17,35 @@ let addPasswordMode = false;
 const phoneRequests = { send: 0, validate: 0 };
 const oauthRequests = [];
 let tokenEmail = "add-phone-page@example.com";
-const emailGate = { enabled: true, logins: 0, selections: 0, rebind: [] };
+const emailGate = { enabled: true, logins: 0, selections: 0, sent: 0, validations: 0, pending: false,
+  pageType: "email_otp_send", nextStep: "phone", rebind: [] };
+const isEmailGateAccount = () => /^codex-email-gate(?:-auto|-verification|-password)?@example\.com$/.test(lastLoginHint);
+let latestMail = { code: "111111", received_at: "2000-01-01T00:00:00Z" };
+function issueCodexMail() {
+  emailGate.pending = true;
+  emailGate.sent++;
+  latestMail = { code: "222222", received_at: new Date().toISOString() };
+}
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", base);
   const body = await readBody(req);
   if (url.pathname === "/__email-gate") {
-    if (req.method === "POST") emailGate.enabled = parseJson(body)?.enabled !== false;
+    if (req.method === "POST") {
+      const config = parseJson(body);
+      emailGate.enabled = config?.enabled !== false;
+      if (config.pageType) emailGate.pageType = config.pageType;
+      if (config.nextStep) emailGate.nextStep = config.nextStep;
+      if (config.email) lastLoginHint = config.email;
+    }
     return sendJson(res, 200, emailGate);
   }
+  if (url.pathname === "/__email-gate/mail") return sendJson(res, 200, latestMail);
   if (req.method === "GET" && url.pathname === "/__oauth-requests") return sendJson(res, 200, oauthRequests);
   if (url.pathname === "/__phone-requests") return sendJson(res, 200, phoneRequests);
   if (req.method === "GET" && url.pathname === "/api/auth/session") return sendJson(res, 200, {
-    user: { email: lastLoginHint === "codex-email-gate@example.com" ? lastLoginHint : "add-phone-page@example.com" },
-    accessToken: `e30.${Buffer.from(JSON.stringify({ email: lastLoginHint === "codex-email-gate@example.com" ? lastLoginHint : "add-phone-page@example.com", exp: Math.floor(Date.now() / 1000) + 3600, "https://api.openai.com/auth": { chatgpt_account_id: "mock-personal-account", chatgpt_plan_type: "plus" } })).toString("base64url")}.synthetic-session-signature`,
+    user: { email: isEmailGateAccount() ? lastLoginHint : "add-phone-page@example.com" },
+    accessToken: `e30.${Buffer.from(JSON.stringify({ email: isEmailGateAccount() ? lastLoginHint : "add-phone-page@example.com", exp: Math.floor(Date.now() / 1000) + 3600, "https://api.openai.com/auth": { chatgpt_account_id: "mock-personal-account", chatgpt_plan_type: "plus" } })).toString("base64url")}.synthetic-session-signature`,
   });
 
   if (req.method === "GET" && url.pathname === "/") {
@@ -44,11 +59,15 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && url.pathname === "/api/auth/csrf") return sendJson(res, 200, { csrfToken: "mock-csrf" });
   if (req.method === "POST" && url.pathname === "/api/auth/signin/openai") {
     lastLoginHint = url.searchParams.get("login_hint") || "";
-    if (lastLoginHint === "codex-email-gate@example.com") emailGate.logins++;
+    if (isEmailGateAccount()) {
+      emailGate.logins++;
+      emailGate.pending = false;
+    }
     addPasswordMode = url.searchParams.get("post_login_add_password") === "true";
     return sendJson(res, 200, { url: `${publicBase}/api/accounts/authorize` });
   }
   if (req.method === "GET" && url.pathname === "/api/accounts/authorize") {
+    if (isEmailGateAccount()) latestMail = { code: "123456", received_at: new Date().toISOString() };
     if (lastLoginHint === "risk-control@example.com") {
       return sendText(res, 403, "<html><title>Just a moment...</title><div id=\"challenge-platform\"></div></html>", "text/html");
     }
@@ -89,6 +108,14 @@ const server = http.createServer(async (req, res) => {
     ) {
       return sendJson(res, 400, { error: { message: "missing email OTP sentinel headers" } });
     }
+    if (isEmailGateAccount() && emailGate.pending) {
+      if (payload.code !== "222222") return sendJson(res, 401, { error: { code: "wrong_email_otp_code" } });
+      emailGate.pending = false;
+      emailGate.validations++;
+      return sendJson(res, 200, emailGate.nextStep === "phone"
+        ? { page: { type: "add_phone" }, continue_url: `${publicBase}/add-phone` }
+        : { continue_url: "http://localhost:1455/auth/callback?code=mock-code&state=mock-state" });
+    }
     if (lastLoginHint === "account-profile@example.com") {
       return sendJson(res, 200, {
         continue_url: `${publicBase}/about-you`,
@@ -113,15 +140,33 @@ const server = http.createServer(async (req, res) => {
       "oai-client-auth-session": { email_verified: true },
     });
   }
+  if (req.method === "POST" && url.pathname === "/api/accounts/password/verify" && isEmailGateAccount()) {
+    if (parseJson(body).password !== "fixture-password") return sendJson(res, 401, { error: { code: "invalid_password" } });
+    return sendJson(res, 200, { page: { type: "mfa_challenge" }, continue_url: `${publicBase}/mfa-challenge/email-gate-factor`,
+      "oai-client-auth-session": { mfa_factors: [{ factor_type: "totp", id: "email-gate-factor" }] } });
+  }
+  if (req.method === "POST" && url.pathname === "/api/accounts/mfa/issue_challenge" && isEmailGateAccount()) {
+    return sendJson(res, 200, {});
+  }
+  if (req.method === "POST" && url.pathname === "/api/accounts/mfa/verify" && isEmailGateAccount()) {
+    const payload = parseJson(body);
+    if (payload.id !== "email-gate-factor" || !/^\d{6}$/.test(payload.code)) return sendJson(res, 401, { error: { code: "invalid_totp" } });
+    return sendJson(res, 200, { page: { type: "external_url" }, continue_url: `${publicBase}/web-callback` });
+  }
   if (req.method === "POST" && url.pathname === "/api/accounts/email-otp/resend") {
     if (!/^application\/json\b/i.test(String(req.headers["content-type"] || "")) || JSON.stringify(parseJson(body)) !== "{}") {
       return sendJson(res, 400, { error: { message: "resend must use an empty JSON body" } });
     }
+    if (isEmailGateAccount() && emailGate.pending) issueCodexMail();
     return sendJson(res, 200, { success: true });
+  }
+  if (req.method === "GET" && url.pathname === "/api/accounts/email-otp/send") {
+    issueCodexMail();
+    return redirect(res, `${publicBase}/email-verification`);
   }
   if (req.method === "POST" && url.pathname === "/backend-api/sentinel/req") {
     const payload = JSON.parse(body || "{}");
-    if (!["oauth_create_account", "email_otp_validate", "password_reset"].includes(payload.flow) || typeof payload.id !== "string" || !payload.id) {
+    if (!["oauth_create_account", "email_otp_validate", "password_reset", "password_verify"].includes(payload.flow) || typeof payload.id !== "string" || !payload.id) {
       return sendJson(res, 400, { error: { message: "invalid sentinel request" } });
     }
     return sendJson(res, 200, {
@@ -186,10 +231,11 @@ const server = http.createServer(async (req, res) => {
     return sendText(res, 200, '<html><input name="session_id" value="us_1234567890abcdef"></html>', "text/html");
   }
   if (req.method === "POST" && url.pathname === "/api/accounts/session/select") {
-    if (lastLoginHint === "codex-email-gate@example.com") {
+    if (isEmailGateAccount()) {
       emailGate.selections++;
+      if (emailGate.enabled && emailGate.pageType === "email_otp_verification") issueCodexMail();
       return sendJson(res, 200, emailGate.enabled
-        ? { page: { type: "email_otp_send" }, continue_url: `${publicBase}/api/accounts/email-otp/send` }
+        ? { page: { type: emailGate.pageType }, continue_url: `${publicBase}${emailGate.pageType === "email_otp_send" ? "/api/accounts/email-otp/send" : "/email-verification"}` }
         : { continue_url: "http://localhost:1455/auth/callback?code=mock-code&state=mock-state" });
     }
     res.setHeader("set-cookie", "oai-client-auth-session=mock-auth-session; Path=/");

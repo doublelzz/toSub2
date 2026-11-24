@@ -18,7 +18,7 @@ import { matchesTaskQuery, normalizeTaskQuery, summarizeTasks } from "./task-que
 import { ACCOUNT_SESSION_FILENAME, loadAccountInsights, publicAccountInsights } from "./account-insights.mjs";
 import { exportAccountAccessTokens } from "./account-token-export.mjs";
 import { withSub2ApiExpiry, validateSub2ApiData, summarizeSub2ApiTokens, mergeSub2ApiCredentials } from "./sub2api-export.mjs";
-import { CODEX_EMAIL_VERIFICATION_REQUIRED, LOGIN_READY_PROMPT, sub2ApiAuthorizationError, sub2ApiExportError } from "./sub2api-authorization.mjs";
+import { CODEX_EMAIL_VERIFICATION_REQUIRED, CODEX_EMAIL_VERIFICATION_PROMPT, sub2ApiAuthorizationError, sub2ApiExportError } from "./sub2api-authorization.mjs";
 import { createSub2ApiLinker, publicSub2ApiAccount } from "./sub2api-linking.mjs";
 import { phoneVerificationStatus, recordSmsOrder, publicSmsSummary } from "./sms-orders.mjs";
 import { readPhoneEvidence, writePhoneEvidence } from "./phone-verification-evidence.mjs";
@@ -1639,8 +1639,8 @@ async function handleChildClose(job, { code, signal, mode, runId }) {
     return;
   }
   if (code === 0 && job.sub2ApiAuthorizationError) {
-    job.status = job.resultSaved ? "completed" : "login_ready";
-    job.prompt = LOGIN_READY_PROMPT;
+    job.status = job.resultSaved ? "completed" : "resume_available";
+    job.prompt = CODEX_EMAIL_VERIFICATION_PROMPT;
     job.accountInsights = await loadJobInsights(job);
     job.loginCheckpointAvailable = await fileExists(job.checkpointPath);
     job.lastError = null;
@@ -2019,7 +2019,7 @@ async function finishPasswordAdd(job, code, signal) {
     await removePrivateFile(job.passwordAddResultPath);
   }
 
-  job.status = job.passwordAddResumesAuthorization ? (job.sub2ApiAuthorizationError ? "login_ready" : "resume_available") : "completed";
+  job.status = job.passwordAddResumesAuthorization ? "resume_available" : "completed";
   job.lastError = job.passwordAddResumesAuthorization && !job.sub2ApiAuthorizationError
     ? "ChatGPT 登录状态已保留，点击继续流程即可重新开始 Codex 授权"
     : null;
@@ -2033,7 +2033,7 @@ async function finishPasswordAdd(job, code, signal) {
 
 function restorePasswordAddFailure(job, message) {
   const resumeAuthorization = Boolean(job.passwordAddResumesAuthorization);
-  job.status = resumeAuthorization ? (job.sub2ApiAuthorizationError ? "login_ready" : "resume_available") : "completed";
+  job.status = resumeAuthorization ? "resume_available" : "completed";
   job.prompt = resumeAuthorization
     ? "本次添加密码未完成，原登录检查点仍可继续"
     : "原授权文件仍可使用，本次添加密码未完成";
@@ -2117,7 +2117,7 @@ async function finishTotpSetup(job, code, signal) {
       : `2FA 设置进程退出，代码 ${code ?? "未知"}`;
   }
 
-  job.status = resumeAuthorization ? (job.sub2ApiAuthorizationError ? "login_ready" : "resume_available") : "completed";
+  job.status = resumeAuthorization ? "resume_available" : "completed";
   job.lastError = resumeAuthorization && !job.sub2ApiAuthorizationError
     ? "ChatGPT 登录状态已保留，点击继续流程即可重新开始 Codex 授权"
     : null;
@@ -2144,7 +2144,7 @@ async function removePrivateFile(filePath) {
 
 function restoreTotpSetupFailure(job, message) {
   const resumeAuthorization = Boolean(job.totpSetupResumesAuthorization);
-  job.status = resumeAuthorization ? (job.sub2ApiAuthorizationError ? "login_ready" : "resume_available") : "completed";
+  job.status = resumeAuthorization ? "resume_available" : "completed";
   job.prompt = resumeAuthorization
     ? "本次 2FA 设置未完成，原登录检查点仍可继续"
     : "授权文件仍然可用，本次 2FA 设置未完成";
@@ -2342,9 +2342,13 @@ function consumeOutput(job, rawText) {
     setStage(job, "starting", "新登录状态被服务端拒绝，正在自动重新获取邮箱验证码");
   }
 
-  if (scan.includes("Email OTP (r=resend, q=quit):")) {
+  // Codex can ask for another email code after password/MFA login. Earlier
+  // prompts in the parser tail must not override this new authentication phase.
+  const codexEmailIndex = scan.lastIndexOf("[codex-email-verification] Codex authorization requires an additional email code.");
+  const promptScan = codexEmailIndex >= 0 ? scan.slice(codexEmailIndex) : scan;
+  if (promptScan.includes("Email OTP (r=resend, q=quit):")) {
     markAuthorizationRequirement(job, "emailOtp");
-    const rejected = scan.includes("[email-otp-rejected]");
+    const rejected = promptScan.includes("[email-otp-rejected]");
     setStage(
       job,
       "email_otp",
@@ -2356,16 +2360,16 @@ function consumeOutput(job, rawText) {
     );
     if (job.mailApiUrl) void beginMailPolling(job);
   }
-  if (scan.includes("Password (q=quit):")) {
+  if (promptScan.includes("Password (q=quit):")) {
     markAuthorizationRequirement(job, "password");
     stopMailPolling(job);
     setStage(job, "password", "请输入账号密码");
   }
-  if (scan.includes("2FA setup OTP (6 digits, q=quit):")) {
+  if (promptScan.includes("2FA setup OTP (6 digits, q=quit):")) {
     setStage(job, "totp_setup_otp", "请将密钥添加到验证器后输入当前 6 位验证码");
   }
-  const mfaReachedIndex = scan.lastIndexOf("[mfa] TOTP 2FA challenge reached.");
-  const mfaPromptIndex = scan.lastIndexOf("2FA OTP (6 digits, q=quit):");
+  const mfaReachedIndex = promptScan.lastIndexOf("[mfa] TOTP 2FA challenge reached.");
+  const mfaPromptIndex = promptScan.lastIndexOf("2FA OTP (6 digits, q=quit):");
   if (mfaReachedIndex > mfaPromptIndex) {
     markAuthorizationRequirement(job, "mfa");
     setStage(job, "working", job.totpSecret ? "正在自动完成 2FA 验证" : "正在准备 2FA 验证");
@@ -2373,11 +2377,11 @@ function consumeOutput(job, rawText) {
     markAuthorizationRequirement(job, "mfa");
     setStage(job, "mfa_otp", "请输入 6 位 2FA 验证码");
   }
-  if (scan.includes("[mfa] Generated a 6-digit code from the configured 2FA key.")) {
+  if (promptScan.includes("[mfa] Generated a 6-digit code from the configured 2FA key.")) {
     markAuthorizationAutomatic(job, "mfa");
   }
-  const phoneNumberPromptIndex = scan.lastIndexOf("Phone number, E.164 format");
-  const phoneOtpPromptIndex = scan.lastIndexOf("Phone OTP (r=resend, p=change phone, q=quit):");
+  const phoneNumberPromptIndex = promptScan.lastIndexOf("Phone number, E.164 format");
+  const phoneOtpPromptIndex = promptScan.lastIndexOf("Phone OTP (r=resend, p=change phone, q=quit):");
   if (phoneNumberPromptIndex > phoneOtpPromptIndex) {
     stopMailPolling(job);
     setStage(job, "phone", "请输入需要绑定的手机号");
@@ -5047,19 +5051,19 @@ async function syncCompletedOutputs(force = false) {
           recoveredWebSession = true;
         } catch {}
       }
-      const loginReady = !resultSaved && authorizationError && ["failed", "login_ready", "resume_available"].includes(metadata.status);
+      const emailVerificationPending = !resultSaved && authorizationError && ["failed", "login_ready", "resume_available"].includes(metadata.status);
       const savedStatus = restoredTaskStatus(metadata);
       const restartable = !resultSaved && !checkpoint && ["queued", "starting"].includes(savedStatus);
       const interrupted = Boolean(savedStatus) && !isTerminalStatus(savedStatus) && !restartable;
       const completedAt = metadata.completed_at || metadata.result_file_mtime;
       const emptyRecovery = { recovered: false, error: null };
       const operation = resultSaved ? restoredOutputOperationState(metadata, completedAt, emptyRecovery, emptyRecovery) : null;
-      const status = loginReady ? "login_ready" : operation?.status || (checkpoint ? isTerminalStatus(savedStatus) ? savedStatus : "resume_available"
+      const status = emailVerificationPending ? "resume_available" : operation?.status || (checkpoint ? isTerminalStatus(savedStatus) ? savedStatus : "resume_available"
         : restartable ? "queued" : interrupted || !savedStatus ? "failed" : savedStatus);
       const stamp = metadata.updated_at || metadata.created_at || new Date().toISOString();
       const mailApiUrl = validateMailApiUrl(metadata.mail_api_url) ? metadata.mail_api_url : null;
       const pendingRecovery = metadata.pending_password_recovery || metadata.pending_totp_recovery;
-      const prompt = status === "login_ready" ? LOGIN_READY_PROMPT : operation?.prompt || (status === "phone_skipped" ? "已跳过接码，可查看账号信息；新的 OAuth 授权尚未完成"
+      const prompt = emailVerificationPending ? CODEX_EMAIL_VERIFICATION_PROMPT : operation?.prompt || (status === "phone_skipped" ? "已跳过接码，可查看账号信息；新的 OAuth 授权尚未完成"
         : pendingRecovery ? "上次账号操作结果已保留，将在执行操作时恢复凭据"
         : restartable ? "服务重启后已恢复，等待任务槽位"
         : checkpoint ? metadata.prompt || "检测到邮箱登录检查点，可以继续流程"
@@ -5077,7 +5081,7 @@ async function syncCompletedOutputs(force = false) {
         totpResultPath: path.join(outputDir, TOTP_SETUP_RESULT_FILENAME),
         passwordAddResultPath: path.join(outputDir, PASSWORD_ADD_RESULT_FILENAME),
         logs: operation?.log || (interrupted && !checkpoint ? "[restore] 上次任务在生成授权文件前中断，已恢复为可重试状态。\n" : "[restore] 已加载任务元数据，账号凭据将在操作时读取。\n"),
-        lastError: loginReady ? null : operation ? operation.lastError : metadata.last_error || (interrupted && !checkpoint ? `上次 ${savedStatus} 阶段未完成` : null),
+        lastError: emailVerificationPending ? null : operation ? operation.lastError : metadata.last_error || (interrupted && !checkpoint ? `上次 ${savedStatus} 阶段未完成` : null),
         sub2ApiAuthorizationError: authorizationError,
         child: null, parserTail: "", resultSaved,
         accountInsights: metadata.account_insights_snapshot || null,

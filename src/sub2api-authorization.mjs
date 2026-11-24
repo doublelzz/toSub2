@@ -1,5 +1,5 @@
 export const CODEX_EMAIL_VERIFICATION_REQUIRED = "CODEX_EMAIL_VERIFICATION_REQUIRED";
-export const LOGIN_READY_PROMPT = "登录成功，可以管理账号";
+export const CODEX_EMAIL_VERIFICATION_PROMPT = "待邮箱验证，点击继续流程发送验证码；已填邮箱链接时自动取码，也可手动填写";
 export const SUB2API_EMAIL_VERIFICATION_MESSAGE = "Sub2API 授权尚未完成：需要邮箱验证码验证后才能生成 JSON。已保存的网页登录仍可用于修改 2FA、邮箱换绑等操作。";
 
 export function isCodexEmailVerificationRequired(message) {

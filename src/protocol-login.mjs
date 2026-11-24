@@ -8,7 +8,7 @@ import { createInterface as createLineReader } from "node:readline";
 import { stdin as input, stdout as output } from "node:process";
 import { ACCOUNT_SESSION_FILENAME, checkAccountInsights, sessionIdentity } from "./account-insights.mjs";
 import { normalizeOAuthCredentials, withSub2ApiExpiry, validateSub2ApiData } from "./sub2api-export.mjs";
-import { CODEX_EMAIL_VERIFICATION_REQUIRED, isCodexEmailVerificationRequired } from "./sub2api-authorization.mjs";
+import { isCodexEmailVerificationRequired } from "./sub2api-authorization.mjs";
 import { readMfaSession, writeMfaSession } from "./mfa-session.mjs";
 import { emailRebindStep } from "./email-rebind-protocol.mjs";
 import { describeRebindError, formatRebindDiagnostic, traceRebindTransport } from "./email-rebind-logs.mjs";
@@ -599,6 +599,7 @@ async function run() {
       rl,
       phone: args.phone,
       skipPhoneBinding: Boolean(args.skipPhoneBinding),
+      totpSecret: process.env.CHATGPT_TOTP_SECRET || "",
       codexClientId: args.codexClientId || DEFAULT_CODEX_CLIENT_ID,
       codexRedirectUri: args.codexRedirectUri || DEFAULT_CODEX_REDIRECT_URI,
       debugAuth: Boolean(args.debugAuth),
@@ -628,7 +629,7 @@ async function run() {
       });
       console.log(`[resume] Continue saved login flow from ${checkpoint.stage}.`);
       try {
-        codex = await resumeCodexOauth(client, { ...codexOptions, saveCheckpoint }, checkpoint);
+        codex = await resumeCodexOauth(client, { ...codexOptions, deviceId: checkpoint.web?.deviceId, saveCheckpoint }, checkpoint);
         web = checkpoint.web || null;
       } catch (error) {
         if (isSecurityCheckRequiredError(error)) throw error;
@@ -677,7 +678,7 @@ async function run() {
       if (!args.webOnly) {
         console.log("[2/5] Start Codex OAuth flow");
         try {
-          codex = await runCodexOauth(client, { ...codexOptions, saveCheckpoint });
+          codex = await runCodexOauth(client, { ...codexOptions, deviceId: web.deviceId, saveCheckpoint });
         } catch (error) {
           if (isSecurityCheckRequiredError(error)) throw error;
           if (!isExpiredCheckpointError(error)) throw error;
@@ -743,12 +744,6 @@ async function run() {
       await removeProtocolCheckpoint(checkpointPath);
     }
     } catch (error) {
-      if (isCodexEmailVerificationRequired(error.message)) {
-        // The Codex challenge does not invalidate the earlier ChatGPT login.
-        await readMfaSession(path.join(path.dirname(sub2apiOutPath), ACCOUNT_SESSION_FILENAME), email);
-        console.log(`[sub2api-authorization-pending] ${CODEX_EMAIL_VERIFICATION_REQUIRED}`);
-        return;
-      }
       if (error.message !== "PHONE_BINDING_DISABLED") throw error;
       console.log("[phone-skipped] 等待手动开始接码；登录检查点与额度检测结果已保留，OAuth 授权尚未完成。");
     } finally {
@@ -1943,11 +1938,15 @@ async function runCodexOauth(client, options) {
     console.log(`[debug] selected account session_id: ${maskSessionId(sessionId)}`);
   }
 
+  const selectedAt = new Date().toISOString();
   const { data: selected } = await authJsonStep(client, options.authBase, "POST", "/api/accounts/session/select", {
     session_id: sessionId,
   }, { referer: `${options.authBase}/choose-an-account` });
   let current = selected;
-  const addPhoneUrl = getContinueUrl(selected);
+  if (isCodexEmailVerificationPayload(current)) {
+    current = await completeCodexEmailVerification(client, options, current, selectedAt);
+  }
+  const addPhoneUrl = getContinueUrl(current);
   const oauth = { codeVerifier, state, sessionId, addPhoneUrl };
   if (options.debugAuth) {
     logAuthSnapshot(client, "session/select", `${options.authBase}/api/accounts/session/select`, HAR_ADD_PHONE_COOKIE_NAMES);
@@ -1967,6 +1966,43 @@ async function runCodexOauth(client, options) {
 
   await options.saveCheckpoint?.("oauth_continue", { oauth: { ...oauth, current } });
   return finishCodexOauth(client, options, current, oauth);
+}
+
+function isCodexEmailVerificationPayload(payload) {
+  if (["email_otp_send", "email_otp_verification", "email_verification"].includes(payload?.page?.type)) return true;
+  try {
+    return ["/api/accounts/email-otp/send", "/email-verification"].includes(new URL(getContinueUrl(payload)).pathname);
+  } catch {
+    return false;
+  }
+}
+
+async function completeCodexEmailVerification(client, options, payload, requestedAt) {
+  const target = new URL(getContinueUrl(payload)
+    || (payload?.page?.type === "email_otp_send" ? "/api/accounts/email-otp/send" : "/email-verification"), options.authBase);
+  if (target.origin !== new URL(options.authBase).origin) {
+    throw new Error("CODEX_EMAIL_VERIFICATION_PAGE_INVALID: email verification must remain on the authentication origin");
+  }
+  console.log("[codex-email-verification] Codex authorization requires an additional email code.");
+  if (target.pathname === "/api/accounts/email-otp/send") requestedAt = new Date().toISOString();
+  const opened = await client.follow(target.toString(), { referer: `${options.authBase}/choose-an-account` });
+  if (!isEmailVerificationPage(opened.finalUrl)) {
+    throw new Error("CODEX_EMAIL_VERIFICATION_PAGE_INVALID: expected the email verification page");
+  }
+  console.log(`[email-otp-requested-at] ${requestedAt}`);
+  const deviceId = options.deviceId || client.jar.value("oai-did", `${options.authBase}/`) || crypto.randomUUID();
+  let verified = await verifyEmailOtp(client, {
+    authBase: options.authBase, rl: options.rl, deviceId, referer: opened.finalUrl,
+  });
+  verified = await completeTotpMfaIfNeeded(client, {
+    authBase: options.authBase, rl: options.rl, deviceId,
+    payload: verified, totpSecret: options.totpSecret, referer: opened.finalUrl,
+  });
+  if (isCodexEmailVerificationPayload(verified)) {
+    throw new Error("CODEX_EMAIL_VERIFICATION_INCOMPLETE: email verification did not advance the authorization flow");
+  }
+  console.log("[codex-email-verification] Additional email verification accepted; continuing authorization.");
+  return verified;
 }
 
 async function resumeCodexOauth(client, options, checkpoint) {

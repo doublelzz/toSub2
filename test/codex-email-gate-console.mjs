@@ -17,8 +17,6 @@ const email = "codex-email-gate@example.com";
 const upstream = `http://127.0.0.1:${await availablePort()}`;
 const base = `http://127.0.0.1:${await availablePort()}`;
 const wrapper = path.join(root, "protocol.mjs");
-// Exercise the actual login/export and rebind protocols. MFA rotation uses a
-// bounded fixture to verify session reuse without changing a real account.
 await fs.writeFile(wrapper, `
 import fs from ${JSON.stringify(new URL("../src/workspace-storage.mjs", import.meta.url).href)};
 const arg = name => process.argv[process.argv.indexOf(name) + 1];
@@ -39,6 +37,7 @@ if (process.argv.includes('--setup-totp')) {
   console.log('[mfa-stage] authenticated');
   console.log('[mfa-stage] confirmed');
 } else {
+  if (arg('--email').includes('-password@')) process.argv = process.argv.filter(value => value !== '--verbose');
   process.argv.push('--native-http');
   await import(${JSON.stringify(new URL("../src/protocol-login.mjs", import.meta.url).href)});
 }
@@ -55,6 +54,9 @@ const request = async (route, method = "GET", body) => {
   const response = await fetch(`${base}${route}`, { method, headers, ...(body ? { body: JSON.stringify(body) } : {}) });
   return { status: response.status, data: await response.json() };
 };
+const gate = async config => (await fetch(`${upstream}/__email-gate`, config ? {
+  method: "POST", body: JSON.stringify(config),
+} : undefined)).json();
 async function until(operation) {
   for (let i = 0; i < 250; i++) {
     const value = await operation();
@@ -62,7 +64,8 @@ async function until(operation) {
     await delay(80);
   }
   const logs = id ? await request(`/api/jobs/${id}/logs`) : {};
-  throw new Error(`email gate fixture timed out: ${JSON.stringify(logs)}\n${processLogs}`);
+  const state = await request("/api/jobs");
+  throw new Error(`email gate fixture timed out: ${JSON.stringify(state.data.jobs?.find(job => job.id === id))}\n${JSON.stringify(logs)}\n${processLogs}`);
 }
 async function currentJob(predicate = () => true) {
   return until(async () => {
@@ -82,10 +85,8 @@ async function start() {
   child.stdout.on("data", chunk => { processLogs += chunk; });
   child.stderr.on("data", chunk => { processLogs += chunk; });
   const token = await until(async () => {
-    try {
-      const response = await fetch(`${base}/api/bootstrap`);
-      return response.ok && (await response.json()).token;
-    } catch { return null; }
+    try { const response = await fetch(`${base}/api/bootstrap`); return response.ok && (await response.json()).token; }
+    catch { return null; }
   });
   headers = { "x-console-token": token, "content-type": "application/json" };
 }
@@ -104,118 +105,117 @@ try {
   id = created.data.job.id;
   await currentJob(job => job.status === "email_otp");
   assert.equal((await request(`/api/jobs/${id}/input`, "POST", { action: "email_otp", value: "123456" })).status, 200);
-  let job = await currentJob(job => job.status === "login_ready");
-  assert.equal(job.lastError, null);
-  assert.equal(job.canDownload, false, "a web AT must never produce an OAuth file");
-  assert.equal(job.canExportSub2Api, true, "export must remain available to explain its own prerequisite");
-  assert.equal(job.canChangeMfa, true);
-  assert.equal(job.canSetupTotp, true);
-  assert.equal(job.canAddPassword, true);
-  assert.equal(job.canCheckAccountInsights, true);
-  assert.equal(job.canStartPhoneBinding, true, "the export error does not disable other existing account actions");
+  let job = await currentJob(job => job.status === "email_otp" && job.canSetupTotp === false && !job.autoEmailOtp);
+  await until(async () => (await gate()).sent === 1);
+  assert.equal(job.mailStatus, "manual");
+  assert.equal(job.canDownload, false);
+  assert.equal(job.canStartPhoneBinding, false, "phone binding cannot start before the additional email verification");
   const folder = path.join(outputRoot, id);
   const checkpoint = await files.readFile(path.join(folder, "login-checkpoint.json"), "utf8");
   const session = await files.readFile(path.join(folder, "account-session.json"), "utf8");
   assert.equal(JSON.parse(checkpoint).stage, "email_verified");
   assert.ok(JSON.parse(session).accessToken);
-  const gate = await (await fetch(`${upstream}/__email-gate`)).json();
-  assert.equal(gate.logins, 1, "Codex email verification must not restart web login");
-  assert.equal(gate.selections, 1);
+  assert.equal((await gate()).logins, 1);
+  assert.deepEqual(await (await fetch(`${upstream}/__phone-requests`)).json(), { send: 0, validate: 0 });
+  assert.equal((await request(`/api/jobs/${id}/input`, "POST", { action: "email_otp", value: "000000" })).status, 200);
+  await currentJob(job => job.status === "email_otp" && /验证码错误/.test(job.prompt));
+  assert.equal((await request(`/api/jobs/${id}/input`, "POST", { action: "resend_email" })).status, 200);
+  await until(async () => (await gate()).sent === 2);
+  await currentJob(job => job.status === "email_otp");
+  assert.equal((await request(`/api/jobs/${id}/input`, "POST", { action: "email_otp", value: "222222" })).status, 200);
+  await currentJob(job => job.status === "phone");
+  assert.equal((await gate()).validations, 1);
+  assert.equal((await request(`/api/jobs/${id}/input`, "POST", { action: "phone", value: "+60123456789" })).status, 200);
+  await currentJob(job => job.status === "phone_otp");
+  assert.equal((await request(`/api/jobs/${id}/input`, "POST", { action: "phone_otp", value: "654321" })).status, 200);
+  job = await currentJob(job => job.status === "completed");
+  assert.equal(job.canDownload, true);
+  assert.equal((await gate()).logins, 1, "the extra email challenge must reuse the web login");
 
-  const preview = await request("/api/jobs/export-preview", "POST", { ids: [id] });
-  assert.equal(preview.status, 200);
-  assert.equal(preview.data.exportable, 0);
-  assert.equal(preview.data.failed, 1);
-  assert.match(preview.data.rows[0].message, /邮箱验证码/);
-  for (const result of [await request(`/api/jobs/${id}/download`), await request("/api/jobs/download-batch", "POST", { ids: [id] })]) {
-    assert.equal(result.status, 409);
-    assert.match(result.data.error, /Sub2API.*邮箱验证码/);
+  await gate({ nextStep: "callback" });
+  for (const [account, pageType, credentials] of [["codex-email-gate-auto@example.com", "email_otp_send", {}],
+    ["codex-email-gate-verification@example.com", "email_otp_verification", {}],
+    ["codex-email-gate-password@example.com", "email_otp_send", { password: "fixture-password", totpSecret: "NB2W45DFOIZAQWER" }]]) {
+    await gate({ pageType });
+    const before = await gate();
+    const result = await request("/api/jobs", "POST", { email: account, mailApiUrl: `${upstream}/__email-gate/mail`, ...credentials });
+    assert.equal(result.status, 201);
+    id = result.data.job.id;
+    job = await currentJob(job => job.status === "completed");
+    assert.equal(job.autoEmailOtp, true);
+    assert.equal(job.canDownload, true);
+    const after = await gate();
+    assert.equal(after.sent, before.sent + 1, "an already issued verification challenge must not send a duplicate email");
+    assert.equal(after.validations, before.validations + 1);
+    const logs = (await request(`/api/jobs/${id}/logs`)).data.logs;
+    assert.equal((logs.match(/已从收码接口自动取得新验证码并提交/g) || []).length, credentials.password ? 1 : 2,
+      "both the web login and the Codex challenge must automatically read their own fresh code");
+    assert.doesNotMatch(logs, /synthetic-session-signature/);
   }
-  assert.equal((await currentJob()).status, "login_ready", "export errors cannot fail account operations");
-  assert.equal((await request(`/api/jobs/${id}/retry`, "POST", {})).status, 200);
-  await currentJob(item => item.status === "login_ready");
-  assert.equal((await (await fetch(`${upstream}/__email-gate`)).json()).logins, 1, "a repeated Codex challenge preserves the restored web login too");
-  const atExport = await request("/api/jobs/export-at", "POST", { ids: [id] });
-  assert.equal(atExport.status, 200);
-  assert.equal(atExport.data.exported, 1, "web AT export is independent of Codex JSON export");
 
-  const sources = await request("/api/rebind/state");
-  const source = sources.data.sources.find(item => item.email === email);
-  assert.equal(source.busy, false);
-  const body = { ids: [source.id], text: "target-email-gate@example.com", concurrency: 1 };
-  const rebindPreview = await request("/api/rebind/preview", "POST", body);
-  assert.equal(rebindPreview.status, 200);
-  assert.equal((await request("/api/rebind/start", "POST", { ...body, digest: rebindPreview.data.digest })).status, 200);
-  const rebound = await until(async () => {
-    const state = await request("/api/rebind/state");
-    return state.data.items.find(item => item.status === "waiting_manual");
-  });
-  assert.equal((await request(`/api/rebind/${rebound.id}/code`, "POST", { code: "123456", version: rebound.challengeVersion })).status, 200);
-  await until(async () => (await request("/api/rebind/state")).data.items.find(item => item.status === "success"));
-  assert.deepEqual((await (await fetch(`${upstream}/__email-gate`)).json()).rebind, ["eligibility", "begin", "verify"]);
-  assert.equal((await files.readFile(path.join(folder, "account-session.json"), "utf8")), session, "rebind does not replace authorization credentials");
-
-  assert.equal((await request(`/api/jobs/${id}/setup-2fa`, "POST", {})).status, 200);
-  job = await currentJob(item => item.status === "login_ready" && item.hasTotpKey);
-  assert.equal(job.lastError, null);
-  assert.equal(job.canSetupTotp, false);
-  assert.equal(job.canDownload, false);
-
-  assert.equal((await request(`/api/jobs/${id}/change-mfa`, "POST", {})).status, 200);
-  await until(async () => (await request("/api/mfa/accounts")).data.accounts.find(item => item.email === email && item.status === "success"));
-  job = await currentJob(item => item.canChangeMfa);
-  assert.equal(job.status, "login_ready");
-  assert.equal(job.lastError, null);
-
+  assert.equal((await request("/api/jobs/delete-batch", "POST", { ids: [created.data.job.id] })).status, 200);
   await stop(child);
+  const legacyError = "SESSION_SELECTION_INVALID: session/select returned page=email_otp_send, continue_path=/api/accounts/email-otp/send; the selected account session is not ready for Codex authorization";
   const legacyId = crypto.randomUUID();
   const invalidId = crypto.randomUUID();
-  const legacyError = "SESSION_SELECTION_INVALID: session/select returned page=email_otp_send, continue_path=/api/accounts/email-otp/send; the selected account session is not ready for Codex authorization";
-  for (const [target, valid] of [[legacyId, true], [invalidId, false]]) {
-    const restoredEmail = `${target}@example.com`;
-    await fs.mkdir(path.join(outputRoot, target), { recursive: true });
-    const metadata = { version: 1, task_metadata_version: 2, email: restoredEmail, status: "failed", prompt: "流程失败",
-      last_error: legacyError, result_saved: false, account_session_available: valid,
+  for (const [target, valid] of [[created.data.job.id, true], [legacyId, true], [invalidId, false]]) {
+    const restoredEmail = target === created.data.job.id ? email : `${target}@example.com`;
+    const targetFolder = path.join(outputRoot, target);
+    await fs.mkdir(targetFolder, { recursive: true });
+    const metadata = { version: 1, task_metadata_version: 2, email: restoredEmail,
+      status: target === created.data.job.id ? "login_ready" : "failed", prompt: "old status",
+      last_error: target === created.data.job.id ? null : legacyError, result_saved: false,
+      account_session_available: valid, sub2api_authorization_error: target === created.data.job.id ? "CODEX_EMAIL_VERIFICATION_REQUIRED" : null,
       created_at: new Date().toISOString(), updated_at: new Date().toISOString() };
-    await files.writeFile(path.join(outputRoot, target, "job-meta.json"), JSON.stringify(metadata));
+    await files.writeFile(path.join(targetFolder, "job-meta.json"), JSON.stringify(metadata));
     if (valid) {
       const data = { ...JSON.parse(session), email: restoredEmail };
       const claims = { email: restoredEmail, exp: Math.floor(Date.now() / 1000) + 3600,
         "https://api.openai.com/auth": { chatgpt_account_id: data.accountId } };
       data.accessToken = `e30.${Buffer.from(JSON.stringify(claims)).toString("base64url")}.fixture`;
-      await files.writeFile(path.join(outputRoot, target, "account-session.json"), JSON.stringify(data));
+      await files.writeFile(path.join(targetFolder, "account-session.json"), JSON.stringify(data));
+      await files.writeFile(path.join(targetFolder, "login-checkpoint.json"), JSON.stringify({ ...JSON.parse(checkpoint), email: restoredEmail }));
     }
   }
+  id = created.data.job.id;
   await start();
-  const restored = await request("/api/jobs");
-  const legacy = restored.data.jobs.find(item => item.id === legacyId);
-  assert.equal(legacy.status, "login_ready");
-  assert.equal(legacy.lastError, null);
-  assert.equal(legacy.canChangeMfa, true);
-  assert.equal(restored.data.jobs.find(item => item.id === invalidId).status, "failed", "missing web credentials cannot be promoted to login success");
-  assert.equal((await currentJob()).status, "login_ready");
+  const restored = (await request("/api/jobs")).data.jobs;
+  for (const target of [id, legacyId]) {
+    const item = restored.find(job => job.id === target);
+    assert.equal(item.status, "resume_available");
+    assert.match(item.prompt, /待邮箱验证/);
+    assert.equal(item.canResume, true);
+    assert.equal(item.canChangeMfa, true);
+    assert.equal(item.canDownload, false);
+  }
+  assert.equal(restored.find(job => job.id === invalidId).status, "failed");
   assert.equal((await request(`/api/jobs/${id}/download`)).status, 409);
-  await request(`/api/jobs/${id}/account-insights`, "POST", {});
-  await currentJob(item => item.status === "login_ready" && !item.accountInsightsChecking);
-
-  await fetch(`${upstream}/__email-gate`, { method: "POST", body: JSON.stringify({ enabled: false }) });
+  assert.equal((await request("/api/jobs/export-at", "POST", { ids: [id] })).data.exported, 1);
+  const sources = (await request("/api/rebind/state")).data.sources;
+  const source = sources.find(item => item.email === email);
+  assert.equal(source.busy, false);
+  const body = { ids: [source.id], text: "target-email-gate@example.com", concurrency: 1 };
+  const preview = await request("/api/rebind/preview", "POST", body);
+  assert.equal(preview.status, 200);
+  assert.equal((await request("/api/rebind/start", "POST", { ...body, digest: preview.data.digest })).status, 200);
+  const rebind = await until(async () => (await request("/api/rebind/state")).data.items.find(item => item.status === "waiting_manual"));
+  assert.equal((await request(`/api/rebind/${rebind.id}/code`, "POST", { code: "123456", version: rebind.challengeVersion })).status, 200);
+  await until(async () => (await request("/api/rebind/state")).data.items.find(item => item.status === "success"));
+  assert.deepEqual((await gate()).rebind, ["eligibility", "begin", "verify"]);
+  assert.equal((await request(`/api/jobs/${id}/setup-2fa`, "POST", {})).status, 200);
+  await currentJob(job => job.status === "resume_available" && job.hasTotpKey);
+  assert.equal((await request(`/api/jobs/${id}/change-mfa`, "POST", {})).status, 200);
+  await until(async () => (await request("/api/mfa/accounts")).data.accounts.find(item => item.email === email && item.status === "success"));
+  await currentJob(job => job.status === "resume_available" && job.canChangeMfa);
+  await gate({ email });
   assert.equal((await request(`/api/jobs/${id}/retry`, "POST", {})).status, 200);
-  job = await currentJob(item => item.status === "completed");
+  await currentJob(job => job.status === "email_otp");
+  assert.equal((await gate()).logins, 4, "a legacy retry must preserve the saved web login");
+  assert.equal((await request(`/api/jobs/${id}/input`, "POST", { action: "email_otp", value: "222222" })).status, 200);
+  job = await currentJob(job => job.status === "completed");
   assert.equal(job.canDownload, true);
-  assert.equal(job.lastError, null);
-  assert.equal((await (await fetch(`${upstream}/__email-gate`)).json()).logins, 1, "retry must reuse the retained web checkpoint");
-  assert.equal((await request(`/api/jobs/${id}/download`)).status, 200);
-  const mixed = await request("/api/jobs/export-preview", "POST", { ids: [id, legacyId] });
-  assert.equal(mixed.data.exportable, 1);
-  assert.equal(mixed.data.failed, 1);
-  const mixedDownload = await request("/api/jobs/download-batch", "POST", { ids: [id, legacyId] });
-  assert.equal(mixedDownload.status, 200);
-  assert.equal(mixedDownload.data.accounts.length, 1);
-  assert.equal(mixedDownload.data.accounts[0].credentials.email, email);
-  const metadata = JSON.parse(await files.readFile(path.join(folder, "job-meta.json"), "utf8"));
-  assert.equal(metadata.sub2api_authorization_error, null, "successful authorization clears the export error");
   assert.doesNotMatch(JSON.stringify(job), /accessToken|refresh_token|synthetic-session-signature/);
-  console.log("Codex email gate: retained login/checkpoint, export-only errors, MFA/rebind, restart, legacy recovery and successful retry passed (local fixtures).");
+  console.log("Codex email verification: manual/automatic codes, resend, existing challenge, phone continuation, saved web login and legacy recovery passed (local fixtures).");
 } finally {
   await stop(child);
   await stop(backend);
