@@ -55,5 +55,13 @@ try {
   await assert.rejects(emailRebindStep({ operation: "begin", email: session.email, newEmail: "new@example.com", session }, async () => ({ status: 403, body: {
     error: { code: "sensitive_action_cooldown", message: "为保护账户安全，本次电子邮箱更改将暂缓 24 小时", param: "1793034703872" },
   } })), (failure) => failure.status === 409 && failure.rebindCode === "SENSITIVE_ACTION_COOLDOWN" && failure.diagnostic.retryAfter === 1793034703872);
+  const cooldown = { code: "sensitive_action_cooldown", message: "为保护账户安全，本次电子邮箱更改将暂缓 24 小时。", param: "1795667002908" };
+  for (const body of [JSON.stringify(cooldown), JSON.stringify({ error: cooldown }), JSON.stringify({ detail: cooldown }),
+    JSON.stringify({ error: JSON.stringify(cooldown) }), JSON.stringify({ detail: JSON.stringify(cooldown) }), JSON.stringify(JSON.stringify(cooldown))]) {
+    await assert.rejects(emailRebindStep({ operation: "begin", email: session.email, newEmail: "new@example.com", session }, async () => ({ status: 403, body })),
+      failure => failure.rebindCode === "SENSITIVE_ACTION_COOLDOWN"
+        && failure.diagnostic.httpStatus === 403 && failure.diagnostic.upstreamMessage === cooldown.message
+        && failure.diagnostic.retryAfter === 1795667002908);
+  }
   console.log("email rebind logs passed (complete original responses, request IDs, causes, append history, encrypted persistence and cursor paging)");
 } finally { await fs.rm(root, { recursive: true, force: true }); }

@@ -26,6 +26,11 @@ const options = { root, vault, proxyPool, listSources: () => structuredClone(sou
   pollMailbox: async (url) => begun.has(url) ? [{ code: "001234", key: "fresh-code-fingerprint", receivedAt: clock + 1 }] : [{ code: "999999", key: "historical-code-fingerprint", receivedAt: clock - 60000 }],
   runStep: async (operation, payload) => {
     calls.push({ operation, email: payload.email, newEmail: payload.newEmail, code: payload.code, proxyUrl: payload.proxyUrl });
+    if (operation === "begin" && payload.newEmail.startsWith("cooldown")) {
+      await emailRebindStep({ ...payload, operation }, async () => ({ status: 403, body: JSON.stringify({ detail: {
+        code: "sensitive_action_cooldown", message: "为保护账户安全，本次电子邮箱更改将暂缓 24 小时。", param: String(clock + 86400000),
+      } }) }));
+    }
     if (operation === "begin") begun.add("https://mail.example.com/private-retrieval-key");
     if (operation === "verify" && payload.newEmail.startsWith("uncertain")) throw rebindError("UNCERTAIN");
     if (operation === "verify" && payload.code !== "001234") throw rebindError("CODE_INVALID");
@@ -160,5 +165,25 @@ try {
   await waitFor(() => instance.list().items.find((row) => row.id === legacyItem.id && row.status === "waiting_manual"));
   assert.ok(calls.filter((row) => row.email === "legacy@example.com").every((row) => row.proxyUrl === legacyProxy), "upgrading a legacy snapshot retains its saved single proxy");
   assert.deepEqual(poolState, beforeLegacy, "legacy checkpoint recovery does not take from the newly configured pool");
+  await instance.shutdown();
+  sources.push({ id: "cooldown", email: "cooldown@example.com", sources: ["mfa"] });
+  instance = await createEmailRebindWorkspace(options);
+  const cooldownBody = { ids: ["cooldown"], text: "cooldown-new@example.com" };
+  await instance.start({ ...cooldownBody, digest: instance.preview(cooldownBody).digest });
+  const cooldown = await waitFor(() => instance.list().items.find(row => row.oldEmail === "cooldown@example.com" && row.status === "failed"));
+  const cooldownMessage = "为保护账户安全，本次电子邮箱更改将暂缓 24 小时";
+  assert.equal(cooldown.message, cooldownMessage, "the public page message must not append HTTP status or generic rejection text");
+  assert.equal(cooldown.retryAfter, clock + 86400000);
+  assert.equal(cooldown.canRetry, false);
+  assert.match((await instance.logs(cooldown.id)).logs, /HTTP|httpStatus/);
+  await instance.shutdown();
+  const statePath = path.join(root, "email-rebind/state.enc");
+  const savedState = vault.open(await fs.readFile(statePath, "utf8"), "email-rebind-state");
+  const legacyCooldown = savedState.items.find(row => row.id === cooldown.id);
+  delete legacyCooldown.errorCode;
+  legacyCooldown.message += "。（HTTP 403）";
+  await fs.writeFile(statePath, vault.seal(savedState, "email-rebind-state"));
+  instance = await createEmailRebindWorkspace(options);
+  assert.equal(instance.list().items.find(row => row.id === cooldown.id).message, cooldownMessage);
   console.log("email rebind workspace passed (exact mapping, mixed OTP, resend, uncertainty, encrypted storage and recovery)");
 } finally { await instance?.shutdown(); await fs.rm(root, { recursive: true, force: true }); }

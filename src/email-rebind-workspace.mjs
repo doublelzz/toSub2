@@ -119,8 +119,11 @@ export async function createEmailRebindWorkspace({ root, vault, listSources, res
   async function update(item, status, message = "") { await serialize(async () => { transition(item, status, message); await persist(); }); }
   function publicItem(item) {
     const sync = lookupSync(item);
+    const cooldown = item.status === "failed" && (item.errorCode === "SENSITIVE_ACTION_COOLDOWN"
+      || !item.errorCode && (item.retryAfter || item.message?.includes(REBIND_ERRORS.SENSITIVE_ACTION_COOLDOWN)));
     return { id: item.id, batchId: item.batchId, sourceRef: item.sourceRef, oldEmail: item.oldEmail, newEmail: item.newEmail,
-      mode: item.mode, hasMailboxUrl: Boolean(item.mailboxUrl), status: item.status, message: item.message || "", createdAt: item.createdAt,
+      mode: item.mode, hasMailboxUrl: Boolean(item.mailboxUrl), status: item.status,
+      message: cooldown ? REBIND_ERRORS.SENSITIVE_ACTION_COOLDOWN : item.message || "", createdAt: item.createdAt,
       updatedAt: item.updatedAt, confirmedAt: item.confirmedAt || null, requestedAt: item.requestedAt || null,
       challengeVersion: item.challengeVersion || 0, nextSendAt: item.nextSendAt || null,
       syncedJobId: sync?.id || null, credentialStatus: item.status === "success" ? "needs_login" : "unchanged",
@@ -216,11 +219,12 @@ export async function createEmailRebindWorkspace({ root, vault, listSources, res
     await journal.append(item, `[error:${failure.rebindCode || "REQUEST_FAILED"}] ${operation}\n${describeRebindError(failure)}`);
     if (stopping && operation !== "verify") { await update(item, "interrupted", "服务已停止，可重试恢复当前映射"); return; }
     const code = failure.rebindCode || "REQUEST_FAILED";
+    item.errorCode = code;
     const uncertain = code === "UNCERTAIN" || (operation === "verify" && !failure.rebindCode);
     const httpStatus = failure.diagnostic?.httpStatus;
     if (code === "SENSITIVE_ACTION_COOLDOWN") item.retryAfter = Number.isFinite(failure.diagnostic?.retryAfter) ? failure.diagnostic.retryAfter : null;
     const upstreamMessage = failure.diagnostic?.upstreamMessage;
-    const message = upstreamMessage
+    const message = code === "SENSITIVE_ACTION_COOLDOWN" ? REBIND_ERRORS.SENSITIVE_ACTION_COOLDOWN : upstreamMessage
       ? `${upstreamMessage}${Number.isInteger(httpStatus) ? `（HTTP ${httpStatus}）` : ""}`
       : `${REBIND_ERRORS[code] || "请求未完成，请稍后重试"}${Number.isInteger(httpStatus) ? `（HTTP ${httpStatus}）` : ""}`;
     await update(item, uncertain ? "uncertain" : "failed", message);

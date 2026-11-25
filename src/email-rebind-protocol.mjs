@@ -14,6 +14,13 @@ export const REBIND_ERRORS = {
 };
 export const rebindError = (code, diagnostic, message) => Object.assign(new Error(message || REBIND_ERRORS[code] || REBIND_ERRORS.REQUEST_FAILED), { rebindCode: code, status: 409, ...(diagnostic ? { diagnostic } : {}) });
 
+function parseResponseJson(value) {
+  for (let depth = 0; depth < 3 && typeof value === "string"; depth++) {
+    try { value = JSON.parse(value); } catch { return null; }
+  }
+  return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+}
+
 export async function emailRebindStep({ operation, email, newEmail, session: source, code }, request) {
   let session;
   try { session = reusableMfaSession(source, email); }
@@ -34,13 +41,13 @@ export async function emailRebindStep({ operation, email, newEmail, session: sou
   let response = await send(operation === "begin" ? { email: newEmail } : operation === "verify" ? { email: newEmail, code } : null);
   if (operation === "verify" && response.status === 422) response = await send({ code });
   if (response.status === 401) throw fail("SESSION_EXPIRED");
-  let data;
-  try { data = typeof response.body === "string" ? JSON.parse(response.body) : response.body; } catch {}
-  const upstreamCode = String(data?.error?.code || data?.code || data?.error?.type || "");
+  const data = parseResponseJson(response.body);
+  const upstreamError = parseResponseJson(data?.error) || parseResponseJson(data?.detail) || data;
+  const upstreamCode = String(upstreamError?.code || data?.code || upstreamError?.type || "");
   if (upstreamCode) diagnostic.upstreamCode = upstreamCode;
-  const upstreamMessage = String(data?.error?.message || data?.message || "");
+  const upstreamMessage = String(upstreamError?.message || data?.message || "");
   if (upstreamMessage) diagnostic.upstreamMessage = upstreamMessage;
-  const cooldownParam = Number(data?.error?.param || data?.param);
+  const cooldownParam = Number(upstreamError?.param || data?.param);
   if (upstreamCode === "sensitive_action_cooldown") {
     diagnostic.retryAfter = Number.isFinite(cooldownParam) && cooldownParam > 0 ? cooldownParam : null;
     throw fail("SENSITIVE_ACTION_COOLDOWN", upstreamMessage || REBIND_ERRORS.SENSITIVE_ACTION_COOLDOWN);
