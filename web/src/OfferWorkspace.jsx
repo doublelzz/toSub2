@@ -5,7 +5,7 @@ import { cdkFetch, prepareProxyNetworkOptions, readWorkspaceProxyPoolText } from
 import { ProxyNetworkOptions } from "./ProxyPoolInput.jsx";
 import "./offers.css";
 
-export const OFFER_LABELS = { trial_1m: "Plus 免费试用 1 个月", half_1m: "Plus 半价 1 个月", half_2m: "Plus 半价 2 个月", half_3m: "Plus 半价 3 个月", subscribed: "已订阅", none: "无优惠", other: "其他优惠／待识别", banned: "账号已停用" };
+export const OFFER_LABELS = { trial_1m: "Plus 免费试用 1 个月", team_trial_1m: "Team 免费试用 1 个月", half_1m: "Plus 半价 1 个月", half_2m: "Plus 半价 2 个月", half_3m: "Plus 半价 3 个月", subscribed: "已订阅", none: "无优惠", other: "其他优惠／待识别", banned: "账号已停用" };
 const STATES = { queued: "排队中", running: "检测中", waiting_input: "待输入", completed: "已完成", failed: "失败", cancelled: "已停止", interrupted: "已中断", paused: "余额不足，已暂停", stopped: "已停止" };
 const RETRYABLE = new Set(["failed", "cancelled", "interrupted", "queued"]);
 const time = (value) => value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "—";

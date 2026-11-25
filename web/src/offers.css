@@ -51,7 +51,7 @@
 .offer-table small { display: block; font-size: 12px; font-weight: 400; color: var(--muted); margin-top: 5px; }
 .offer-email { font-weight: 500; }
 .offer-result { font-weight: 500; }
-.offer-result-trial_1m, .offer-result-half_1m, .offer-result-half_2m, .offer-result-half_3m { color: var(--success); }
+.offer-result-trial_1m, .offer-result-team_trial_1m, .offer-result-half_1m, .offer-result-half_2m, .offer-result-half_3m { color: var(--success); }
 .offer-result-other { color: var(--amber); }
 .offer-result-banned, .offer-state-failed { color: var(--danger); }
 .offer-state { display: inline-flex; gap: 6px; align-items: center; }

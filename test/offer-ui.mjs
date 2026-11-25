@@ -14,7 +14,8 @@ const allRows = Array.from({ length: 25 }, (_, index) => ({ id: `row-${index}`, 
   result: { kind: "half_2m", label: "Plus 半价 2 个月", checkedAt: "2026-10-24T02:00:00Z" }, history: [] }));
 Object.assign(allRows[0], { status: "failed", result: null, message: "优惠响应未返回目标账号，已停止检测", errorStageLabel: "解析优惠响应", history: [{ at: "2026-10-24T02:00:00Z", status: "failed", code: "identity_mismatch", stage: "offer_response" }] });
 Object.assign(allRows[1], { status: "failed", result: null, message: "登录身份与账号不一致，请核对资料", history: [{ at: "2026-10-24T02:00:00Z", status: "failed", code: "identity_mismatch" }] });
-const batch = (id) => ({ id, name: id, status: "completed", total: 25, processed: 25, counts: { completed: 23, failed: 2 }, categories: { half_2m: 23 }, offers: 23, hitRate: 1 });
+allRows[2].result = { kind: "team_trial_1m", label: "Team 免费试用 1 个月", campaignId: "team-1-month-free", checkedAt: "2026-10-24T02:00:00Z" };
+const batch = (id) => ({ id, name: id, status: "completed", total: 25, processed: 25, counts: { completed: 23, failed: 2 }, categories: { half_2m: 22, team_trial_1m: 1 }, offers: 23, hitRate: 1 });
 const calls = []; let access = true;
 const workspaceProxy = "socks5://fixture-user:fixture-password@proxy.example.invalid:1080";
 const cdkFetch = async (url, options = {}) => {
@@ -23,7 +24,8 @@ const cdkFetch = async (url, options = {}) => {
   if (url.endsWith("/batches")) return Response.json({ batches: [batch("recent"), batch("older")] });
   if (url.endsWith("/query")) {
     const body = JSON.parse(options.body); const page = body.page || 1;
-    return Response.json({ batch: batch(url.split("/").at(-2)), total: 25, page, pages: 2, items: allRows.slice((page - 1) * 20, page * 20), selection: allRows.map((row) => row.id) });
+    const rows = body.kinds?.length ? allRows.filter((row) => body.kinds.includes(row.result?.kind)) : allRows;
+    return Response.json({ batch: batch(url.split("/").at(-2)), total: rows.length, page, pages: Math.max(1, Math.ceil(rows.length / 20)), items: rows.slice((page - 1) * 20, page * 20), selection: rows.map((row) => row.id) });
   }
   if (url.endsWith("/export")) { const body = JSON.parse(options.body); return Response.json({ content: "fixture export", count: body.ids?.length || 25, filename: "fixture.txt" }); }
   if (url.endsWith("/retry")) return Response.json(batch(url.split("/").at(-2)));
@@ -70,6 +72,17 @@ try {
   await act(() => root.render(React.createElement(OfferInput, { row: { email: "first@example.com", promptKind: "email" }, onSubmit: (value) => inputs.push(value) })));
   await fill(container.querySelector("input"), "001234"); await click("继续"); assert.deepEqual(inputs, ["001234"]);
   await act(async () => root.render(React.createElement(OfferWorkspace, { token: "fixture", balance: 1 })));
+  assert.equal(container.querySelectorAll("tbody tr").length, 20);
+  assert.equal(container.querySelector(".offer-result-team_trial_1m").textContent, "Team 免费试用 1 个月");
+  const teamFilter = button("Team 免费试用 1 个月1");
+  assert.ok(teamFilter); await act(async () => teamFilter.click());
+  assert.equal(teamFilter.getAttribute("aria-pressed"), "true");
+  assert.deepEqual(calls.findLast((value) => value.url.endsWith("/query")).body.kinds, ["team_trial_1m"]);
+  assert.equal(container.querySelectorAll("tbody tr").length, 1); assert.match(container.querySelector("tbody").textContent, /fixture-2@example.com/);
+  await click("导出筛选结果");
+  assert.deepEqual(calls.findLast((value) => value.url.endsWith("/export")).body.filters.kinds, ["team_trial_1m"]);
+  await act(async () => container.querySelector('[aria-label="关闭优惠导出"]').click());
+  await act(async () => teamFilter.click());
   assert.equal(container.querySelectorAll("tbody tr").length, 20);
   const failedRows = container.querySelectorAll("tbody tr");
   assert.match(failedRows[0].querySelector('[data-label="执行状态"]').textContent, /失败阶段：解析优惠响应/);

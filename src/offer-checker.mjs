@@ -1,12 +1,13 @@
 import { authorizationIdentity, sessionIdentity } from "./account-insights.mjs";
 
 export const OFFER_LABELS = {
-  trial_1m: "Plus 免费试用 1 个月", half_1m: "Plus 半价 1 个月", half_2m: "Plus 半价 2 个月",
+  trial_1m: "Plus 免费试用 1 个月", team_trial_1m: "Team 免费试用 1 个月", half_1m: "Plus 半价 1 个月", half_2m: "Plus 半价 2 个月",
   half_3m: "Plus 半价 3 个月", subscribed: "已订阅", none: "无优惠", other: "其他优惠／待识别", banned: "账号已停用",
 };
 export const OFFER_CAMPAIGNS = {
   "plus-1-month-free": "trial_1m", "plus-1-month-50-pct-off": "half_1m",
   "plus-2-months-50-pct-off": "half_2m", "plus-3-months-50-pct-off": "half_3m",
+  "team-1-month-free": "team_trial_1m",
 };
 export const OFFER_ERRORS = {
   unauthorized: "登录信息已失效，请恢复登录后重试", identity_mismatch: "未能确认登录身份与目标账号一致，已停止检测",
@@ -47,13 +48,22 @@ function classifyAccount(info) {
   const account = info?.account;
   if (!account || typeof account !== "object" || Array.isArray(account)) throw offerError("invalid_response");
   const planType = typeof account.plan_type === "string" ? account.plan_type.toLowerCase() : "";
-  const campaign = info.eligible_promo_campaigns?.plus;
-  const campaignId = typeof campaign?.id === "string" && /^[a-zA-Z0-9_.:-]{1,160}$/.test(campaign.id) ? campaign.id : "";
+  const campaigns = ["plus", "team"].flatMap((product) => {
+    const offers = info.eligible_promo_campaigns?.[product];
+    return (Array.isArray(offers) ? offers : [offers]).filter((offer) => offer && Object.keys(offer).length).map((offer) => {
+      const id = typeof offer.id === "string" && /^[a-zA-Z0-9_.:-]{1,160}$/.test(offer.id) ? offer.id : "";
+      const kind = Object.hasOwn(OFFER_CAMPAIGNS, id) && (product === "plus" || id === "team-1-month-free") ? OFFER_CAMPAIGNS[id] : "other";
+      return { id, kind };
+    });
+  });
+  // Preserve the existing Plus result when both products have a known offer.
+  const campaign = campaigns.find((value) => value.kind !== "other" && value.kind !== "team_trial_1m")
+    || campaigns.find((value) => value.kind === "team_trial_1m") || campaigns.find((value) => value.id) || campaigns[0];
+  const campaignId = campaign?.id || "";
   let kind;
   if (account.is_deactivated === true) kind = "banned";
   else if (["plus", "pro", "go", "team", "business", "enterprise"].includes(planType) || info.entitlement?.has_active_subscription === true) kind = "subscribed";
-  else if (campaignId) kind = OFFER_CAMPAIGNS[campaignId] || "other";
-  else if (campaign && Object.keys(campaign).length) kind = "other";
+  else if (campaign) kind = campaign.kind;
   else if (["free", "basic", "xbasic"].includes(planType) && Object.hasOwn(info, "eligible_promo_campaigns")
     && info.eligible_promo_campaigns !== null && typeof info.eligible_promo_campaigns === "object" && !Array.isArray(info.eligible_promo_campaigns)) kind = "none";
   else throw offerError("invalid_response");

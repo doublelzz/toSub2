@@ -100,7 +100,7 @@ export async function createOfferWorkspace({ root, vault, parseText, resolveSour
       counts[value.status] = (counts[value.status] || 0) + value.n; total += value.n;
       if (value.status === "completed" && value.kind) categories[value.kind] = (categories[value.kind] || 0) + value.n;
     }
-    const offers = ["trial_1m", "half_1m", "half_2m", "half_3m", "other"].reduce((sum, key) => sum + (categories[key] || 0), 0);
+    const offers = ["trial_1m", "team_trial_1m", "half_1m", "half_2m", "half_3m", "other"].reduce((sum, key) => sum + (categories[key] || 0), 0);
     return { id: row.id, name: row.name, createdAt: row.created_at, status: row.status, total, counts, categories, offers,
       processed: (counts.completed || 0) + (counts.failed || 0), options: JSON.parse(row.options),
       hitRate: offers + (categories.none || 0) ? offers / (offers + (categories.none || 0)) : null };

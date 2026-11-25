@@ -41,6 +41,9 @@ async function upstreamRequest(req, res) {
     if (url.pathname.endsWith("resend")) { issued.set(email, Date.now()); send({}); return; }
     if (url.pathname.includes("email-otp") && body.code !== "001234") { send({ error: { code: "wrong_email_otp_code" } }, 400); return; }
     if (url.pathname.includes("password") && body.password !== "fixture-private-password") { send({ error: { code: "incorrect_password" } }, 400); return; }
+    if (url.pathname.includes("password") && email === "manual@example.com") {
+      send({ page: { type: "email_otp_verification" }, continue_url: `${upstream}/email-verification` }); return;
+    }
     if (email === "password-alias@example.com") { send({ page: { type: "mfa_challenge" }, continue_url: `${upstream}/mfa-challenge/fixture-totp`,
       "oai-client-auth-session": { mfa_challenge_factors: [{ factor_type: "totp", id: "fixture-totp" }] } }); return; }
     send({ continue_url: `${upstream}/login-callback` }); return;
@@ -58,6 +61,11 @@ async function upstreamRequest(req, res) {
     const id = `personal-${claims.email}`;
     checkedEmails.push(claims.email); deviceHeaders.push(req.headers["oai-device-id"]);
     if (req.headers["chatgpt-account-id"] !== id) { send({}, 403); return; }
+    if (claims.email.startsWith("existing-team")) {
+      const offer = { id: "team-1-month-free" }; const product = claims.email.includes("plus") ? "plus" : "team";
+      const personal = { account: { account_id: id, plan_type: "free" }, eligible_promo_campaigns: { [product]: claims.email.includes("list") ? [offer] : offer } };
+      send({ accounts: { default: personal, [id]: personal } }); return;
+    }
     const personal = { account: { account_id: id, plan_type: "free" }, eligible_promo_campaigns: { plus: { id: "plus-2-months-50-pct-off" } } };
     if (claims.email === "password-alias@example.com") {
       send({ accounts: { default: personal, [id]: aliasBroken ? { ...personal, eligible_promo_campaigns: { plus: { id: "plus-1-month-free" } } } : personal } }); return;
@@ -122,6 +130,16 @@ try {
   const reused = await begin(JSON.stringify({ type: "chatgpt-session", version: 1, email: "existing@example.com", accessToken: accessToken("existing@example.com"), chatgptBase: upstream }));
   await waitFor(async () => (await call(`/api/offers/${reused.batch.id}/query`, "POST", {})).data.batch?.counts.completed === 1);
   assert.equal(requests.filter((route) => route === "/api/auth/signin/openai").length, signins, "valid imported sessions must not log in again");
+  const teamBatch = await begin(JSON.stringify(["existing-team-plus@example.com", "existing-team@example.com", "existing-team-list@example.com"].map((email) => ({
+    type: "chatgpt-session", version: 1, email, accessToken: accessToken(email), chatgptBase: upstream,
+  }))));
+  await waitFor(async () => (await call(`/api/offers/${teamBatch.batch.id}/query`, "POST", {})).data.batch?.counts.completed === 3);
+  const teams = await call(`/api/offers/${teamBatch.batch.id}/query`, "POST", { kinds: ["team_trial_1m"] });
+  assert.equal(teams.status, 200); assert.equal(teams.data.total, 3); assert.equal(teams.data.batch.offers, 3);
+  assert.equal(teams.data.batch.categories.team_trial_1m, 3); assert.equal(teams.data.batch.hitRate, 1);
+  assert.ok(teams.data.items.every((row) => row.result.kind === "team_trial_1m" && row.result.campaignId === "team-1-month-free" && row.result.label === "Team 免费试用 1 个月"));
+  const teamExport = await call(`/api/offers/${teamBatch.batch.id}/export`, "POST", { format: "report", filters: { kinds: ["team_trial_1m"] } });
+  assert.equal(teamExport.data.count, 3); assert.match(teamExport.data.content, /Team 免费试用 1 个月/);
   const aliasBatch = await begin("password-alias@example.com----fixture-private-password----JBSWY3DPEHPK3PXP");
   const aliasQuery = () => call(`/api/offers/${aliasBatch.batch.id}/query`, "POST", {});
   const failedAlias = await waitFor(async () => (await aliasQuery()).data.items?.find((row) => row.status === "failed"));
@@ -159,6 +177,7 @@ try {
   cookie = savedCookie; token = savedToken;
   await app.close(); await startServer(); await login(owner.secret);
   assert.equal((await call(`/api/offers/${batch.id}/query`, "POST", {})).data.batch.counts.completed, 3);
+  assert.equal((await call(`/api/offers/${teamBatch.batch.id}/query`, "POST", { kinds: ["team_trial_1m"] })).data.total, 3);
   assert.equal(app.store.get(owner.id).balance, 1);
   // Explicit normal import consumes the sole credit; detection never does.
   const consumed = app.store.prepareImport(owner.id, "single", ["charged@example.com"], { email: "charged@example.com" }, crypto.randomUUID());
