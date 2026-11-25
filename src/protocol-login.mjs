@@ -599,6 +599,7 @@ async function run() {
       rl,
       phone: args.phone,
       skipPhoneBinding: Boolean(args.skipPhoneBinding),
+      deferCodexEmailVerification: Boolean(args.deferCodexEmailVerification),
       totpSecret: process.env.CHATGPT_TOTP_SECRET || "",
       codexClientId: args.codexClientId || DEFAULT_CODEX_CLIENT_ID,
       codexRedirectUri: args.codexRedirectUri || DEFAULT_CODEX_REDIRECT_URI,
@@ -1944,6 +1945,10 @@ async function runCodexOauth(client, options) {
   }, { referer: `${options.authBase}/choose-an-account` });
   let current = selected;
   if (isCodexEmailVerificationPayload(current)) {
+    if (options.skipPhoneBinding && options.deferCodexEmailVerification) {
+      console.log("[codex-email-verification-deferred] Additional email verification will be handled when phone binding starts.");
+      throw new Error("PHONE_BINDING_DISABLED");
+    }
     current = await completeCodexEmailVerification(client, options, current, selectedAt);
   }
   const addPhoneUrl = getContinueUrl(current);
@@ -2772,6 +2777,7 @@ function parseArgs(argv) {
     else if (item.startsWith("--phone=")) args.phone = item.slice("--phone=".length);
     else if (item === "--phone") args.phone = argv[++i];
     else if (item === "--skip-phone-binding") args.skipPhoneBinding = true;
+    else if (item === "--defer-codex-email-verification") args.deferCodexEmailVerification = true;
     else if (item.startsWith("--out=")) args.out = item.slice("--out=".length);
     else if (item === "--out") args.out = argv[++i];
     else if (item.startsWith("--sub2api-out=")) args.sub2apiOut = item.slice("--sub2api-out=".length);
@@ -2911,6 +2917,7 @@ Options:
   --email <email>                 Email address. If omitted, prompt manually.
   --phone <phone>                 Phone number in E.164 format. If omitted, prompt when needed.
   --skip-phone-binding           Stop when phone binding is required; detect account info from the verified web session.
+  --defer-codex-email-verification With --skip-phone-binding, also defer an additional Codex email challenge until phone binding starts.
   --web-only                      Only complete ChatGPT web login, skip Codex OAuth.
   --setup-totp                    Sign in and set up TOTP 2FA; skip Codex OAuth.
   --rotate-totp                   Replace existing TOTP or set it up, with resumable private state.

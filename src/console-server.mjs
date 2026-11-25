@@ -1563,7 +1563,10 @@ function launchJob(job, options = {}) {
         job.checkpointPath,
         "--verbose",
       ];
-  if (mode === "full" && job.phoneBindingEnabled === false) args.push("--skip-phone-binding");
+  if (mode === "full" && job.phoneBindingEnabled === false) {
+    args.push("--skip-phone-binding");
+    if (!job.mailApiUrl) args.push("--defer-codex-email-verification");
+  }
   const child = spawn(process.execPath, args, {
     cwd: WORKSPACE_ROOT,
     env: {
@@ -4782,14 +4785,14 @@ function canSetupTotp(job) {
   if (job.totpSecret || job.hasTotpCredential || job.totpKnownEnabled || job.pendingTotpRecovery) return false;
   if (job.status === "completed" && job.resultSaved) return true;
   return Boolean(job.loginCheckpointAvailable)
-    && ["phone", "phone_otp", "resume_available", "failed", "canceled", "reauth_required", "login_ready"].includes(job.status);
+    && ["phone", "phone_otp", "phone_skipped", "resume_available", "failed", "canceled", "reauth_required", "login_ready"].includes(job.status);
 }
 
 function canAddPassword(job) {
   if (job.password || job.hasPasswordCredential || job.pendingPasswordRecovery) return false;
   if (job.status === "completed" && job.resultSaved) return true;
   return Boolean(job.loginCheckpointAvailable)
-    && ["phone", "phone_otp", "resume_available", "failed", "canceled", "reauth_required", "login_ready"].includes(job.status);
+    && ["phone", "phone_otp", "phone_skipped", "resume_available", "failed", "canceled", "reauth_required", "login_ready"].includes(job.status);
 }
 
 function setStage(job, status, prompt) {
@@ -5058,18 +5061,20 @@ async function syncCompletedOutputs(force = false) {
       const completedAt = metadata.completed_at || metadata.result_file_mtime;
       const emptyRecovery = { recovered: false, error: null };
       const operation = resultSaved ? restoredOutputOperationState(metadata, completedAt, emptyRecovery, emptyRecovery) : null;
-      const status = emailVerificationPending ? "resume_available" : operation?.status || (checkpoint ? isTerminalStatus(savedStatus) ? savedStatus : "resume_available"
+      const mailApiUrl = validateMailApiUrl(metadata.mail_api_url) ? metadata.mail_api_url : null;
+      const flags = restoredCredentialFlags(metadata);
+      const emailVerificationDeferred = emailVerificationPending && !mailApiUrl && !flags.phoneBindingEnabled;
+      const status = emailVerificationDeferred ? "phone_skipped" : emailVerificationPending ? "resume_available" : operation?.status || (checkpoint ? isTerminalStatus(savedStatus) ? savedStatus : "resume_available"
         : restartable ? "queued" : interrupted || !savedStatus ? "failed" : savedStatus);
       const stamp = metadata.updated_at || metadata.created_at || new Date().toISOString();
-      const mailApiUrl = validateMailApiUrl(metadata.mail_api_url) ? metadata.mail_api_url : null;
       const pendingRecovery = metadata.pending_password_recovery || metadata.pending_totp_recovery;
-      const prompt = emailVerificationPending ? CODEX_EMAIL_VERIFICATION_PROMPT : operation?.prompt || (status === "phone_skipped" ? "已跳过接码，可查看账号信息；新的 OAuth 授权尚未完成"
+      const prompt = emailVerificationDeferred ? "待接码；点击开始接码后，如需补充邮箱验证再填写验证码"
+        : emailVerificationPending ? CODEX_EMAIL_VERIFICATION_PROMPT : operation?.prompt || (status === "phone_skipped" ? "已跳过接码，可查看账号信息；新的 OAuth 授权尚未完成"
         : pendingRecovery ? "上次账号操作结果已保留，将在执行操作时恢复凭据"
         : restartable ? "服务重启后已恢复，等待任务槽位"
         : checkpoint ? metadata.prompt || "检测到邮箱登录检查点，可以继续流程"
         : interrupted || !savedStatus ? "上次流程因服务重启中断，可以重新授权"
         : metadata.prompt || "已恢复上次任务状态");
-      const flags = restoredCredentialFlags(metadata);
       jobs.set(id, {
         id, email: metadata.email, status, prompt,
         createdAt: metadata.created_at || stamp, updatedAt: stamp,

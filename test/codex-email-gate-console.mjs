@@ -57,6 +57,7 @@ const request = async (route, method = "GET", body) => {
 const gate = async config => (await fetch(`${upstream}/__email-gate`, config ? {
   method: "POST", body: JSON.stringify(config),
 } : undefined)).json();
+const phoneSetup = { id: "custom", config: { entries: `+60123456789----${upstream}/__phone-requests` } };
 async function until(operation) {
   for (let i = 0; i < 250; i++) {
     const value = await operation();
@@ -100,12 +101,18 @@ async function stop(proc) {
 try {
   await until(async () => { try { return (await fetch(upstream)).ok; } catch { return false; } });
   await start();
-  const created = await request("/api/jobs", "POST", { email });
+  const created = await request("/api/jobs", "POST", { email, phoneBindingEnabled: false });
   assert.equal(created.status, 201);
   id = created.data.job.id;
   await currentJob(job => job.status === "email_otp");
   assert.equal((await request(`/api/jobs/${id}/input`, "POST", { action: "email_otp", value: "123456" })).status, 200);
-  let job = await currentJob(job => job.status === "email_otp" && job.canSetupTotp === false && !job.autoEmailOtp);
+  let job = await currentJob(job => job.status === "phone_skipped");
+  assert.equal(job.autoEmailOtp, false);
+  assert.equal(job.canStartPhoneBinding, true, "a missing mail link must not block starting phone binding");
+  assert.equal((await gate()).sent, 0, "no extra email should be sent before phone binding starts");
+  assert.equal((await request(`/api/jobs/${id}/input`, "POST", { action: "email_otp", value: "222222" })).status, 409);
+  assert.equal((await request(`/api/jobs/${id}/start-phone`, "POST", { smsProvider: phoneSetup })).status, 200);
+  job = await currentJob(job => job.status === "email_otp" && job.canSetupTotp === false && !job.autoEmailOtp);
   await until(async () => (await gate()).sent === 1);
   assert.equal(job.mailStatus, "manual");
   assert.equal(job.canDownload, false);
@@ -123,14 +130,27 @@ try {
   await until(async () => (await gate()).sent === 2);
   await currentJob(job => job.status === "email_otp");
   assert.equal((await request(`/api/jobs/${id}/input`, "POST", { action: "email_otp", value: "222222" })).status, 200);
-  await currentJob(job => job.status === "phone");
-  assert.equal((await gate()).validations, 1);
-  assert.equal((await request(`/api/jobs/${id}/input`, "POST", { action: "phone", value: "+60123456789" })).status, 200);
   await currentJob(job => job.status === "phone_otp");
+  assert.equal((await gate()).validations, 1);
   assert.equal((await request(`/api/jobs/${id}/input`, "POST", { action: "phone_otp", value: "654321" })).status, 200);
   job = await currentJob(job => job.status === "completed");
   assert.equal(job.canDownload, true);
   assert.equal((await gate()).logins, 1, "the extra email challenge must reuse the web login");
+
+  const noChallenge = await request("/api/jobs", "POST", { email: "codex-email-gate-deferred@example.com",
+    password: "fixture-password", totpSecret: "NB2W45DFOIZAQWER", phoneBindingEnabled: false });
+  assert.equal(noChallenge.status, 201);
+  id = noChallenge.data.job.id;
+  await currentJob(job => job.status === "phone_skipped");
+  const sentBeforeStart = (await gate()).sent;
+  const deferredLogs = (await request(`/api/jobs/${id}/logs`)).data.logs;
+  assert.doesNotMatch(deferredLogs, /Email OTP \(r=resend/,
+    "password login without a mail link must not show a manual email prompt before phone binding starts");
+  await gate({ enabled: false });
+  assert.equal((await request("/api/jobs/start-phone-batch", "POST", { ids: [id], smsProvider: phoneSetup })).status, 200);
+  await currentJob(job => job.status === "completed");
+  assert.equal((await gate()).sent, sentBeforeStart, "no email is sent when Codex no longer requires the challenge");
+  assert.doesNotMatch((await request(`/api/jobs/${id}/logs`)).data.logs, /Email OTP \(r=resend/);
 
   await gate({ nextStep: "callback" });
   for (const [account, pageType, credentials] of [["codex-email-gate-auto@example.com", "email_otp_send", {}],
@@ -138,7 +158,7 @@ try {
     ["codex-email-gate-password@example.com", "email_otp_send", { password: "fixture-password", totpSecret: "NB2W45DFOIZAQWER" }]]) {
     await gate({ pageType });
     const before = await gate();
-    const result = await request("/api/jobs", "POST", { email: account, mailApiUrl: `${upstream}/__email-gate/mail`, ...credentials });
+    const result = await request("/api/jobs", "POST", { email: account, mailApiUrl: `${upstream}/__email-gate/mail`, phoneBindingEnabled: false, ...credentials });
     assert.equal(result.status, 201);
     id = result.data.job.id;
     job = await currentJob(job => job.status === "completed");
@@ -167,6 +187,7 @@ try {
       last_error: target === created.data.job.id ? null : legacyError, result_saved: false,
       account_session_available: valid, sub2api_authorization_error: target === created.data.job.id ? "CODEX_EMAIL_VERIFICATION_REQUIRED" : null,
       created_at: new Date().toISOString(), updated_at: new Date().toISOString() };
+    if (target === created.data.job.id) metadata.phone_binding_enabled = false;
     await files.writeFile(path.join(targetFolder, "job-meta.json"), JSON.stringify(metadata));
     if (valid) {
       const data = { ...JSON.parse(session), email: restoredEmail };
@@ -182,15 +203,21 @@ try {
   const restored = (await request("/api/jobs")).data.jobs;
   for (const target of [id, legacyId]) {
     const item = restored.find(job => job.id === target);
-    assert.equal(item.status, "resume_available");
-    assert.match(item.prompt, /待邮箱验证/);
-    assert.equal(item.canResume, true);
+    assert.equal(item.status, target === id ? "phone_skipped" : "resume_available");
+    assert.match(item.prompt, target === id ? /待接码/ : /待邮箱验证/);
+    assert.equal(item.canResume, target !== id);
+    assert.equal(item.canStartPhoneBinding, true);
     assert.equal(item.canChangeMfa, true);
     assert.equal(item.canDownload, false);
   }
   assert.equal(restored.find(job => job.id === invalidId).status, "failed");
   assert.equal((await request(`/api/jobs/${id}/download`)).status, 409);
   assert.equal((await request("/api/jobs/export-at", "POST", { ids: [id] })).data.exported, 1);
+  await gate({ email });
+  const beforeDeferredRetry = await gate();
+  assert.equal((await request(`/api/jobs/${id}/retry`, "POST", {})).status, 200);
+  await currentJob(job => job.status === "phone_skipped");
+  assert.equal((await gate()).sent, beforeDeferredRetry.sent);
   const sources = (await request("/api/rebind/state")).data.sources;
   const source = sources.find(item => item.email === email);
   assert.equal(source.busy, false);
@@ -208,9 +235,10 @@ try {
   await until(async () => (await request("/api/mfa/accounts")).data.accounts.find(item => item.email === email && item.status === "success"));
   await currentJob(job => job.status === "resume_available" && job.canChangeMfa);
   await gate({ email });
-  assert.equal((await request(`/api/jobs/${id}/retry`, "POST", {})).status, 200);
+  const loginsBeforeStart = (await gate()).logins;
+  assert.equal((await request(`/api/jobs/${id}/start-phone`, "POST", { smsProvider: phoneSetup })).status, 200);
   await currentJob(job => job.status === "email_otp");
-  assert.equal((await gate()).logins, 4, "a legacy retry must preserve the saved web login");
+  assert.equal((await gate()).logins, loginsBeforeStart, "starting phone binding must preserve the saved web login");
   assert.equal((await request(`/api/jobs/${id}/input`, "POST", { action: "email_otp", value: "222222" })).status, 200);
   job = await currentJob(job => job.status === "completed");
   assert.equal(job.canDownload, true);

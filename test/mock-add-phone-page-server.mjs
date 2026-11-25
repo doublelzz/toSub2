@@ -19,7 +19,7 @@ const oauthRequests = [];
 let tokenEmail = "add-phone-page@example.com";
 const emailGate = { enabled: true, logins: 0, selections: 0, sent: 0, validations: 0, pending: false,
   pageType: "email_otp_send", nextStep: "phone", rebind: [] };
-const isEmailGateAccount = () => /^codex-email-gate(?:-auto|-verification|-password)?@example\.com$/.test(lastLoginHint);
+const isEmailGateAccount = () => /^codex-email-gate(?:-auto|-verification|-password|-deferred)?@example\.com$/.test(lastLoginHint);
 let latestMail = { code: "111111", received_at: "2000-01-01T00:00:00Z" };
 function issueCodexMail() {
   emailGate.pending = true;
