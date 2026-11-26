@@ -23,7 +23,7 @@ const options = { root, vault, proxyPool, listSources: () => structuredClone(sou
   now: () => clock, pollIntervalMs: 10,
   resolveSource: async (id, email) => ({ session: sourceSession(email), credentials: { ...credentials } }),
   lookupSync: (row) => imported.get(row.id),
-  pollMailbox: async (url) => begun.has(url) ? [{ code: "001234", key: "fresh-code-fingerprint", receivedAt: clock + 1 }] : [{ code: "999999", key: "historical-code-fingerprint", receivedAt: clock - 60000 }],
+  pollMailbox: async (url) => begun.has(url) ? [{ code: "001234", key: "fresh-code-fingerprint", receivedAt: clock }] : [{ code: "999999", key: "historical-code-fingerprint", receivedAt: clock - 60000 }],
   runStep: async (operation, payload) => {
     calls.push({ operation, email: payload.email, newEmail: payload.newEmail, code: payload.code, proxyUrl: payload.proxyUrl });
     if (operation === "begin" && payload.newEmail.startsWith("cooldown")) {

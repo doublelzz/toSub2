@@ -59,6 +59,15 @@ export function filterMailboxOtpCandidatesByRequestTime(candidates, requestedAt)
   return candidates.filter((candidate) => !candidate.receivedAt || candidate.receivedAt >= cutoff);
 }
 
+export function selectLatestMailboxOtpCandidate(candidates, requestedAt, now = Date.now()) {
+  const cutoff = Number(requestedAt);
+  const current = Number(now);
+  if (!Number.isFinite(cutoff) || cutoff <= 0 || !Number.isFinite(current) || current < cutoff) return null;
+  return candidates.filter(candidate => /^\d{6}$/.test(candidate.code)
+    && Number.isFinite(candidate.receivedAt) && candidate.receivedAt >= cutoff && candidate.receivedAt <= current)
+    .sort((a, b) => b.receivedAt - a.receivedAt || (Number(b.score) || 0) - (Number(a.score) || 0))[0] || null;
+}
+
 export function extractMailboxOtpCandidates(raw) {
   const input = String(raw || "");
   let sources;
@@ -147,10 +156,17 @@ function collectTextSources(value, currentPath, output, seen, inheritedMetadata)
 function extractMessageMetadata(value) {
   let messageId = null;
   let receivedAt = null;
+  let timePriority = Infinity;
   Object.entries(value).forEach(([key, item]) => {
     if (item == null || !["string", "number", "bigint"].includes(typeof item)) return;
     if (!messageId && MESSAGE_ID_KEY_PATTERN.test(key)) messageId = String(item).trim() || null;
-    if (!receivedAt && MESSAGE_TIME_KEY_PATTERN.test(key)) receivedAt = parseTimestamp(item);
+    if (MESSAGE_TIME_KEY_PATTERN.test(key) && !/expir|deadline|valid_?until|reset/i.test(key)) {
+      const timestamp = parseTimestamp(item);
+      const priority = /received|delivered|arrival/i.test(key) ? 0
+        : /sent|timestamp|date|(?:code|otp)_?time/i.test(key) && !/updated/i.test(key) ? 1
+          : /created/i.test(key) ? 2 : /updated/i.test(key) ? 4 : 3;
+      if (timestamp && priority < timePriority) { receivedAt = timestamp; timePriority = priority; }
+    }
   });
   return {
     ...(messageId ? { messageId } : {}),

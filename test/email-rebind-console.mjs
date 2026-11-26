@@ -198,7 +198,8 @@ async function handle(req, res) {
   requests.push({ method: req.method, path: url.pathname });
   const send = (status, value) => { res.writeHead(status, { "content-type": "application/json" }); res.end(JSON.stringify(value)); };
   if (url.pathname.startsWith("/mail/")) return send(200, begun.has("target-a@example.com")
-    ? { code: "001234", received_at: new Date().toISOString(), message_id: "new-message" }
+    ? { messages: [{ code: "001234", received_at: new Date().toISOString(), message_id: "new-message" },
+      { code: "654321", received_at: new Date(Date.now() - 1000).toISOString(), message_id: "earlier-message" }] }
     : { code: "999999", received_at: "2000-01-01T00:00:00Z", message_id: "old-message" });
   let claims;
   try { claims = JSON.parse(Buffer.from(String(req.headers.authorization).split(".")[1], "base64url").toString("utf8")); } catch {}

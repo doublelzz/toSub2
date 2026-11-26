@@ -3,7 +3,7 @@ import fs, { attachWorkspaceStorage, workspaceChildOptions } from "./workspace-s
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { protocolEnvironment } from "./cdk-security.mjs";
-import { fetchMailboxOtpCandidates, filterMailboxOtpCandidatesByRequestTime, validateMailApiUrl } from "./mail-otp.mjs";
+import { fetchMailboxOtpCandidates, selectLatestMailboxOtpCandidate, validateMailApiUrl } from "./mail-otp.mjs";
 import { REBIND_ERRORS, rebindError } from "./email-rebind-protocol.mjs";
 import { createRebindLogStore, describeRebindError } from "./email-rebind-logs.mjs";
 
@@ -263,13 +263,19 @@ export async function createEmailRebindWorkspace({ root, vault, listSources, res
       if (now() >= item.requestedAt + item.timeout * 1000) { await update(item, "waiting_manual", "自动取码超时，可手动输入或重新发送"); return; }
       try {
         await journal.append(item, `[mail] 检查本次发码后的新邮件 ${item.mailboxUrl}`);
-        const candidates = filterMailboxOtpCandidatesByRequestTime(await pollMailbox(item.mailboxUrl, { timeoutMs: 10_000 }), item.requestedAt)
-          .filter((candidate) => !item.baseline.includes(candidate.key) && (candidate.receivedAt || item.baselineKnown));
+        const candidates = (await pollMailbox(item.mailboxUrl, { timeoutMs: 10_000 }))
+          .filter(candidate => !item.baseline.includes(candidate.key));
         if (item.status !== "waiting_auto") return;
-        const codes = [...new Set(candidates.map((candidate) => candidate.code))];
-        await journal.append(item, `[mail] 新候选 ${candidates.length} 条，不同验证码 ${codes.length} 个`);
-        if (codes.length > 1) { await update(item, "waiting_manual", "收到多个验证码，请手动确认后输入"); return; }
-        if (codes.length === 1) { await verify(item, codes[0], item.challengeVersion, run); return; }
+        const checkedAt = now();
+        const selected = selectLatestMailboxOtpCandidate(candidates, item.requestedAt, checkedAt);
+        const untimed = candidates.filter(candidate => !Number.isFinite(candidate.receivedAt)).length;
+        const expired = candidates.filter(candidate => Number.isFinite(candidate.receivedAt) && candidate.receivedAt < item.requestedAt).length;
+        const future = candidates.filter(candidate => Number.isFinite(candidate.receivedAt) && candidate.receivedAt > checkedAt).length;
+        await journal.append(item, `[mail] 候选 ${candidates.length} 条；发码时间=${new Date(item.requestedAt).toISOString()}；检查时间=${new Date(checkedAt).toISOString()}；忽略无效时间 ${untimed} 条、旧邮件 ${expired} 条、未来时间 ${future} 条`);
+        if (selected) {
+          await journal.append(item, `[mail] 已核对邮件时间，选取最新一条验证码：邮件时间=${new Date(selected.receivedAt).toISOString()}；候选评分=${Number(selected.score) || 0}`);
+          await verify(item, selected.code, item.challengeVersion, run); return;
+        }
       } catch (failure) { await journal.append(item, `[mail:error]\n${describeRebindError(failure)}`); if (item.status === "waiting_auto") await update(item, "waiting_manual", "取件接口不可用，可手动输入验证码"); return; }
       await new Promise((resolve) => {
         const finish = () => { clearTimeout(timer); run.controller.signal.removeEventListener("abort", finish); resolve(); };
