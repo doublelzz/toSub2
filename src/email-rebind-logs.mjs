@@ -65,5 +65,9 @@ export function createRebindLogStore({ directory, vault, now = Date.now }) {
     const nextOffset = Math.min(content.length, start + limit);
     return { logs: content.slice(start, nextOffset), offset: start, nextOffset, total: content.length, hasMore: nextOffset < content.length, reset };
   }
-  return { append, read, async flush() { await Promise.all([...writes.values()]); } };
+  return { append, read, async remove(id) {
+    await writes.get(id);
+    await fs.unlink(filename(id)).catch(error => { if (error.code !== "ENOENT") throw error; });
+    writes.delete(id); initialized.delete(id);
+  }, async flush() { await Promise.all([...writes.values()]); } };
 }

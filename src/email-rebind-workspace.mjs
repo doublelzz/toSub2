@@ -7,8 +7,8 @@ import { fetchMailboxOtpCandidates, selectLatestMailboxOtpCandidate, validateMai
 import { REBIND_ERRORS, rebindError } from "./email-rebind-protocol.mjs";
 import { createRebindLogStore, describeRebindError } from "./email-rebind-logs.mjs";
 
-const ACTIVE = new Set(["queued", "checking", "beginning", "waiting_auto", "waiting_manual", "verifying", "uncertain"]);
-const STATES = new Set([...ACTIVE, "success", "failed", "cancelled", "interrupted"]);
+const ACTIVE = new Set(["queued", "checking", "beginning", "waiting_auto", "waiting_manual", "verifying"]);
+const STATES = new Set([...ACTIVE, "success", "failed", "cancelled", "interrupted", "uncertain"]);
 const text = (value) => typeof value === "string" ? value.trim() : "";
 const email = (value) => text(value).toLowerCase();
 const validEmail = (value) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
@@ -87,15 +87,15 @@ export async function createEmailRebindWorkspace({ root, vault, listSources, res
   pollMailbox = fetchMailboxOtpCandidates, pollIntervalMs = 2000, now = Date.now, proxyPool = null }) {
   const directory = path.join(root, "email-rebind");
   const statePath = path.join(directory, "state.enc");
-  const items = new Map(); const active = new Map();
+  const items = new Map(); const active = new Map(); const deleting = new Set();
   let serial = Promise.resolve(); let stopping = false; let initializationError = ""; let concurrency = 1;
   const scope = "email-rebind-state";
   const journal = createRebindLogStore({ directory, vault, now });
   const serialize = (callback) => { const result = serial.then(callback); serial = result.catch(() => {}); return result; };
   const available = () => { if (initializationError) throw error(initializationError); if (stopping) throw error("邮箱换绑工作区正在关闭"); };
-  const privateItem = (id) => { const item = items.get(id); if (!item) throw error("换绑记录不存在", 404); return item; };
+  const privateItem = (id) => { const item = items.get(id); if (!item) throw error("换绑记录不存在", 404); if (deleting.has(id)) throw error("换绑记录正在删除"); return item; };
   const isBusy = (value) => [...items.values()].some((item) => ACTIVE.has(item.status)
-    && (item.oldEmail === email(value) || (item.status !== "uncertain" && item.newEmail === email(value))));
+    && (item.oldEmail === email(value) || item.newEmail === email(value)));
   const selected = (ids) => {
     if (!Array.isArray(ids) || !ids.length || ids.length > 500 || new Set(ids).size !== ids.length) throw error("请选择 1 至 500 条不重复的记录", 400);
     return ids.map(privateItem);
@@ -128,11 +128,11 @@ export async function createEmailRebindWorkspace({ root, vault, listSources, res
       challengeVersion: item.challengeVersion || 0, nextSendAt: item.nextSendAt || null,
       syncedJobId: sync?.id || null, credentialStatus: item.status === "success" ? "needs_login" : "unchanged",
       retryAfter: item.retryAfter || null,
-      canRetry: ["failed", "cancelled", "interrupted"].includes(item.status) && (!item.retryAfter || now() >= item.retryAfter), events: item.events || [] };
+      canRetry: !active.has(item.id) && !deleting.has(item.id) && ["success", "failed", "cancelled", "interrupted"].includes(item.status),
+      canDelete: !deleting.has(item.id), events: item.events || [] };
   }
   function sources() {
-    return listSources().map((source) => ({ ...source, busy: source.busy || isBusy(source.email),
-      rebound: [...items.values()].some((item) => item.oldEmail === source.email && item.status === "success") }));
+    return listSources().map((source) => ({ ...source, busy: source.busy || isBusy(source.email), rebound: false }));
   }
   function preview(body) {
     available();
@@ -143,10 +143,9 @@ export async function createEmailRebindWorkspace({ root, vault, listSources, res
     const rows = ids.map((id, index) => {
       const source = candidates.get(id);
       if (!source) throw error("部分原账号不存在或不属于当前工作区", 400);
-      if (source.busy || source.rebound || isAccountBusy(source.email)) throw error("部分原账号正在执行任务或已完成换绑，请重新选择");
+      if (source.busy || isAccountBusy(source.email)) throw error("部分原账号正在执行任务，请先停止当前任务");
       const target = targets[index];
-      if ([...candidates.values()].some((candidate) => candidate.email === target.newEmail)) throw error(`第 ${index + 1} 行目标邮箱已在当前工作区存在`, 400);
-      if ([...items.values()].some((item) => item.newEmail === target.newEmail && (ACTIVE.has(item.status) || item.status === "success"))) throw error(`第 ${index + 1} 行目标邮箱已被换绑任务占用`);
+      if ([...items.values()].some(item => item.newEmail === target.newEmail && ACTIVE.has(item.status))) throw error(`第 ${index + 1} 行目标邮箱正在执行换绑，请先停止当前任务`);
       return { sourceRef: source.id, oldEmail: source.email, ...target };
     });
     const digest = crypto.createHash("sha256").update(JSON.stringify(rows)).digest("hex");
@@ -217,17 +216,16 @@ export async function createEmailRebindWorkspace({ root, vault, listSources, res
   }
   async function fail(item, failure, operation = "") {
     await journal.append(item, `[error:${failure.rebindCode || "REQUEST_FAILED"}] ${operation}\n${describeRebindError(failure)}`);
-    if (stopping && operation !== "verify") { await update(item, "interrupted", "服务已停止，可重试恢复当前映射"); return; }
+    if (stopping && operation !== "verify") { await update(item, "failed", "服务已停止，本次换绑未完成，请重新发起"); return; }
     const code = failure.rebindCode || "REQUEST_FAILED";
     item.errorCode = code;
-    const uncertain = code === "UNCERTAIN" || (operation === "verify" && !failure.rebindCode);
     const httpStatus = failure.diagnostic?.httpStatus;
     if (code === "SENSITIVE_ACTION_COOLDOWN") item.retryAfter = Number.isFinite(failure.diagnostic?.retryAfter) ? failure.diagnostic.retryAfter : null;
     const upstreamMessage = failure.diagnostic?.upstreamMessage;
     const message = code === "SENSITIVE_ACTION_COOLDOWN" ? REBIND_ERRORS.SENSITIVE_ACTION_COOLDOWN : upstreamMessage
       ? `${upstreamMessage}${Number.isInteger(httpStatus) ? `（HTTP ${httpStatus}）` : ""}`
       : `${REBIND_ERRORS[code] || "请求未完成，请稍后重试"}${Number.isInteger(httpStatus) ? `（HTTP ${httpStatus}）` : ""}`;
-    await update(item, uncertain ? "uncertain" : "failed", message);
+    await update(item, "failed", message);
   }
   async function begin(item, run) {
     try {
@@ -260,7 +258,7 @@ export async function createEmailRebindWorkspace({ root, vault, listSources, res
   }
   async function poll(item, run) {
     while (!stopping && !item.cancelRequested && item.status === "waiting_auto") {
-      if (now() >= item.requestedAt + item.timeout * 1000) { await update(item, "waiting_manual", "自动取码超时，可手动输入或重新发送"); return; }
+      if (now() >= item.requestedAt + item.timeout * 1000) { await update(item, "failed", "自动取码超时，本次换绑未完成，请重新发起"); return; }
       try {
         await journal.append(item, `[mail] 检查本次发码后的新邮件 ${item.mailboxUrl}`);
         const candidates = (await pollMailbox(item.mailboxUrl, { timeoutMs: 10_000 }))
@@ -276,7 +274,7 @@ export async function createEmailRebindWorkspace({ root, vault, listSources, res
           await journal.append(item, `[mail] 已核对邮件时间，选取最新一条验证码：邮件时间=${new Date(selected.receivedAt).toISOString()}；候选评分=${Number(selected.score) || 0}`);
           await verify(item, selected.code, item.challengeVersion, run); return;
         }
-      } catch (failure) { await journal.append(item, `[mail:error]\n${describeRebindError(failure)}`); if (item.status === "waiting_auto") await update(item, "waiting_manual", "取件接口不可用，可手动输入验证码"); return; }
+      } catch (failure) { await journal.append(item, `[mail:error]\n${describeRebindError(failure)}`); if (item.status === "waiting_auto") await update(item, "failed", "取件接口不可用，本次换绑未完成，请重新发起"); return; }
       await new Promise((resolve) => {
         const finish = () => { clearTimeout(timer); run.controller.signal.removeEventListener("abort", finish); resolve(); };
         const timer = setTimeout(finish, pollIntervalMs);
@@ -299,17 +297,14 @@ export async function createEmailRebindWorkspace({ root, vault, listSources, res
         await persist();
       });
     } catch (failure) {
-      if (failure.rebindCode === "CODE_INVALID") { await journal.append(item, `[verify:rejected]\n${describeRebindError(failure)}`); await update(item, "waiting_manual", REBIND_ERRORS.CODE_INVALID); }
-      else await fail(item, failure, "verify");
+      await fail(item, failure, "verify");
     }
   }
   function track(item, callback) {
     const run = { controller: new AbortController(), done: null };
     active.set(item.id, run);
     run.done = Promise.resolve().then(() => callback(run)).catch(async () => {
-      // A save failure after verification cannot be downgraded to a definite failure.
-      if (["verifying", "success", "uncertain"].includes(item.status)) { item.status = "uncertain"; item.message = REBIND_ERRORS.UNCERTAIN; }
-      else { item.status = "interrupted"; item.message = "任务保存未完成，请重试恢复"; }
+      item.status = "failed"; item.message = "本次换绑流程未完成，请重新发起";
       await serialize(persist).catch(() => {});
     }).finally(async () => {
       if (item.cancelRequested && ["queued", "checking", "beginning", "waiting_auto", "waiting_manual"].includes(item.status)) {
@@ -323,7 +318,7 @@ export async function createEmailRebindWorkspace({ root, vault, listSources, res
     if (stopping) return;
     for (const item of items.values()) {
       if (active.size >= concurrency) break;
-      if (item.status === "queued" && !active.has(item.id)) track(item, (run) => begin(item, run));
+      if (item.status === "queued" && !active.has(item.id) && !deleting.has(item.id)) track(item, (run) => begin(item, run));
     }
   }
   async function submit(id, body) {
@@ -331,6 +326,7 @@ export async function createEmailRebindWorkspace({ root, vault, listSources, res
     if (!/^\d{6}$/.test(body.code || "")) throw error("请输入六位数字验证码", 400);
     if (body.version !== item.challengeVersion) throw error("验证码已重新发送，请输入最新验证码");
     await manual(id);
+    privateItem(id);
     if (active.size >= concurrency) throw error("正在执行其他请求，请稍后提交验证码");
     if (body.version !== item.challengeVersion) throw error("验证码已重新发送，请输入最新验证码");
     await track(item, (run) => verify(item, body.code, body.version, run));
@@ -340,6 +336,7 @@ export async function createEmailRebindWorkspace({ root, vault, listSources, res
     available(); const item = privateItem(id);
     if (!["waiting_auto", "waiting_manual"].includes(item.status)) throw error("当前任务不在等待验证码阶段");
     await serialize(async () => {
+      privateItem(id);
       if (!["waiting_auto", "waiting_manual"].includes(item.status)) throw error("当前任务不在等待验证码阶段");
       item.mode = "manual"; transition(item, "waiting_manual", "等待手动验证码"); await persist();
     });
@@ -348,24 +345,47 @@ export async function createEmailRebindWorkspace({ root, vault, listSources, res
   }
   async function retry(id, resend = false) {
     available(); const item = privateItem(id);
-    if (!resend && item.retryAfter && now() < item.retryAfter) throw error(`安全冷却中，暂时不能重试；开放时间：${new Date(item.retryAfter).toLocaleString("zh-CN", { hour12: false })}`);
     if (resend) { if (now() < (item.nextSendAt || 0)) throw error("请等待重新发送倒计时结束"); await manual(id); }
-    else if (!["failed", "cancelled", "interrupted"].includes(item.status)) throw error("该结果不能重新换绑，请先核对结果");
+    else if (!["success", "failed", "cancelled", "interrupted"].includes(item.status)) throw error("请先停止当前换绑任务后再发起");
     if (active.has(id) || isAccountBusy(item.oldEmail)) throw error("账号正在执行其他任务");
-    if ([...items.values()].some((other) => other.id !== id && (ACTIVE.has(other.status) || other.status === "success") && [other.oldEmail, other.newEmail].some((value) => [item.oldEmail, item.newEmail].includes(value)))) throw error("账号或新邮箱已被其他任务占用");
-    await serialize(async () => { item.cancelRequested = false; transition(item, "queued", "等待按原映射重试"); await persist(); }); pump();
+    if ([...items.values()].some(other => other.id !== id && ACTIVE.has(other.status) && [other.oldEmail, other.newEmail].some(value => [item.oldEmail, item.newEmail].includes(value)))) throw error("账号正在执行其他换绑，请先停止当前任务");
+    await serialize(async () => { privateItem(id); item.cancelRequested = false; item.retryAfter = null; item.errorCode = null; item.confirmedAt = null;
+      if (!resend) item.mode = item.mailboxUrl ? "auto" : "manual";
+      transition(item, "queued", "等待重新发起换绑"); await persist(); }); pump();
     return publicItem(item);
   }
   async function cancel(ids) {
     available(); let finishing = 0;
     await serialize(async () => {
       for (const item of selected(ids)) {
-        if (item.status === "uncertain") continue;
         if (active.has(item.id)) { item.cancelRequested = true; finishing++; }
         else if (ACTIVE.has(item.status)) transition(item, "cancelled", "已停止，未确认换绑");
       }
       await persist();
     }); return { finishing };
+  }
+  async function remove(ids) {
+    available();
+    let records;
+    const runs = [];
+    await serialize(async () => {
+      records = selected(ids);
+      for (const item of records) {
+        deleting.add(item.id); item.cancelRequested = true;
+        const run = active.get(item.id);
+        if (run) { runs.push(run); run.controller.abort(); }
+      }
+    });
+    try {
+      await Promise.allSettled(runs.map(run => run.done));
+      await serialize(async () => {
+        for (const item of records) items.delete(item.id);
+        try { await persist(); }
+        catch (failure) { for (const item of records) items.set(item.id, item); throw failure; }
+      });
+      await Promise.all(records.map(item => journal.remove(item.id)));
+      return { deleted: records.length };
+    } finally { records.forEach(item => deleting.delete(item.id)); pump(); }
   }
   function importRecords(ids) {
     available();
@@ -374,27 +394,12 @@ export async function createEmailRebindWorkspace({ root, vault, listSources, res
       return { id: item.id, oldEmail: item.oldEmail, newEmail: item.newEmail, mailboxUrl: item.mailboxUrl, credentials: { ...accountSnapshot(item)?.credentials } };
     });
   }
-  async function reconcile(id) {
-    available(); const item = privateItem(id);
-    if (item.status !== "uncertain") throw error("当前记录无需核对");
-    const candidate = listSources().find((source) => source.email === item.newEmail);
-    if (!candidate) throw error("请先使用新邮箱登录到账号授权页，再核对换绑结果");
-    const snapshot = await resolveSource(candidate.id, item.newEmail);
-    if (snapshot.session.accountId !== accountSnapshot(item)?.session?.accountId) throw error("新邮箱登录的账号 ID 与原账号不一致");
-    await journal.append(item, `[reconcile] 使用新邮箱会话核对换绑结果 ${item.newEmail}`);
-    let result;
-    try { result = await runStep("inspect", { email: item.newEmail, session: snapshot.session, cookies: snapshot.cookies || [], proxyUrl: snapshot.credentials?.proxyUrl || "" }, undefined, (message) => journal.append(item, message)); }
-    catch (failure) { await journal.append(item, `[reconcile:error]\n${describeRebindError(failure)}`); throw failure; }
-    if (result.data.email !== item.newEmail) throw error("尚未确认新邮箱身份");
-    await serialize(async () => { item.confirmedAt = new Date(now()).toISOString(); transition(item, "success", "已通过新邮箱会话核对换绑成功"); await persist(); });
-    return publicItem(item);
-  }
   async function shutdown() {
     stopping = true;
     if (initializationError) return;
     for (const run of active.values()) run.controller.abort();
     await Promise.allSettled([...active.values()].map((run) => run.done));
-    await serialize(async () => { for (const item of items.values()) if (ACTIVE.has(item.status) && item.status !== "uncertain") transition(item, "interrupted", "服务已停止，可重试恢复原映射"); await persist(); });
+    await serialize(async () => { for (const item of items.values()) if (ACTIVE.has(item.status)) transition(item, "failed", "服务已停止，本次换绑未完成，请重新发起"); await persist(); });
     await journal.flush();
   }
   await fs.mkdir(directory, { recursive: true, mode: 0o700 });
@@ -407,12 +412,12 @@ export async function createEmailRebindWorkspace({ root, vault, listSources, res
       for (const item of stored.items) {
         if (item.snapshot) { item.snapshotSealed = vault.seal(item.snapshot, `email-rebind-snapshot:${item.id}`); delete item.snapshot; }
         if (!/^[a-f0-9-]{36}$/.test(item.id) || !validEmail(item.oldEmail) || !validEmail(item.newEmail) || !STATES.has(item.status)) throw error("换绑数据无效");
-        if (["verifying", "beginning"].includes(item.status)) transition(item, "uncertain", REBIND_ERRORS.UNCERTAIN);
-        else if (ACTIVE.has(item.status) && item.status !== "uncertain") transition(item, "interrupted", "服务重启，保留原映射，请手动重试或核对");
+        if (item.status === "uncertain") transition(item, "failed", REBIND_ERRORS.UNCERTAIN);
+        else if (ACTIVE.has(item.status)) transition(item, "failed", "上次换绑流程未完成，请重新发起");
         items.set(item.id, item);
       }
     }
     await persist();
   } catch { initializationError = "换绑工作区无法读取或保存，请检查本地存储"; }
-  return { list, logs: (id, options) => journal.read(privateItem(id), options), preview: publicPreview, start, submit, manual, retry, cancel, reconcile, importRecords, isBusy, shutdown };
+  return { list, logs: (id, options) => journal.read(privateItem(id), options), preview: publicPreview, start, submit, manual, retry, cancel, remove, importRecords, isBusy, shutdown };
 }

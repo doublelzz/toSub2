@@ -1066,13 +1066,13 @@ async function handleRebindApi(req, res, url) {
   if (action === "preview") { sendJson(res, 200, rebindWorkspace.preview(body)); return; }
   if (action === "start") { sendJson(res, 200, await rebindWorkspace.start(body)); return; }
   if (action === "stop") { sendJson(res, 200, await rebindWorkspace.cancel(body.ids)); return; }
+  if (action === "delete") { sendJson(res, 200, await rebindWorkspace.remove(body.ids)); return; }
   if (action === "sync") { sendJson(res, 200, await importReboundAccounts(body)); return; }
-  const match = /^([a-f0-9-]{36})\/(code|manual|resend|retry|reconcile)$/.exec(action);
+  const match = /^([a-f0-9-]{36})\/(code|manual|resend|retry)$/.exec(action);
   if (!match) throw httpError(404, "换绑接口不存在");
   const [ , id, operation] = match;
   const result = operation === "code" ? await rebindWorkspace.submit(id, body)
     : operation === "manual" ? await rebindWorkspace.manual(id)
-    : operation === "reconcile" ? await rebindWorkspace.reconcile(id)
     : await rebindWorkspace.retry(id, operation === "resend");
   sendJson(res, 200, { item: result });
 }

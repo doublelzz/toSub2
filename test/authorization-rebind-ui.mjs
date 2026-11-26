@@ -98,7 +98,7 @@ try {
   assert.equal(button("邮箱换绑", unavailable).disabled, true);
   busySource = true;
   await click("邮箱换绑", container.querySelector(".authorization-table"));
-  assert.match(container.textContent, /正在执行其他操作或已完成换绑/);
+  assert.match(container.textContent, /正在执行其他操作，请先停止当前任务/);
   await close(); busySource = false;
 
   holdState = true;

@@ -75,7 +75,8 @@ try {
   instance = await createEmailRebindWorkspace(options);
   const body = { ids: ["one", "two"], text: "new-one@example.com----https://mail.example.com/private-retrieval-key\nnew-two@example.com", concurrency: 1 };
   assert.throws(() => instance.preview({ ...body, text: "new-one@example.com" }), /必须输入/);
-  assert.throws(() => instance.preview({ ...body, text: "two@example.com\nnew-two@example.com" }), /已经|已在/);
+  assert.equal(instance.preview({ ...body, text: "two@example.com\nnew-two@example.com" }).rows[0].newEmail, "two@example.com",
+    "an existing workspace email is validated by the upstream, not permanently reserved locally");
   assert.throws(() => instance.preview({ ...body, ids: ["missing"] }), /不存在|必须输入/);
   assert.equal(calls.length, 0, "configuration errors cannot send requests");
   const preview = instance.preview(body);
@@ -94,11 +95,11 @@ try {
   await assert.rejects(instance.submit(manual.id, { code: "001234", version: manual.challengeVersion - 1 }), /最新/);
   await instance.submit(manual.id, { code: "000000", version: manual.challengeVersion });
   manual = instance.list().items.find((row) => row.id === manual.id);
-  assert.equal(manual.status, "waiting_manual");
+  assert.equal(manual.status, "failed");
   assert.match(manual.message, /验证码不正确/);
   await assert.rejects(instance.retry(manual.id, true), /倒计时/);
   clock += 31000;
-  await instance.retry(manual.id, true);
+  await instance.retry(manual.id);
   manual = await waitFor(() => instance.list().items.find((row) => row.id === manual.id && row.status === "waiting_manual"));
   assert.equal(manual.challengeVersion, 2);
   await instance.submit(manual.id, { code: "001234", version: 2 });
@@ -119,15 +120,17 @@ try {
   let unknown = await waitFor(() => instance.list().items.find((row) => row.oldEmail === "uncertain@example.com" && row.status === "waiting_manual"));
   await instance.submit(unknown.id, { code: "001234", version: unknown.challengeVersion });
   unknown = instance.list().items.find((row) => row.id === unknown.id);
-  assert.equal(unknown.status, "uncertain");
-  await assert.rejects(instance.retry(unknown.id), /核对/);
+  assert.equal(unknown.status, "failed");
+  assert.equal(unknown.canRetry, true);
+  assert.equal(instance.isBusy(unknown.oldEmail), false);
   assert.throws(() => instance.importRecords([unknown.id]), /确认换绑成功/);
   await instance.shutdown();
   instance = await createEmailRebindWorkspace(options);
-  assert.equal(instance.list().items.find((row) => row.id === unknown.id).status, "uncertain");
+  assert.equal(instance.list().items.find((row) => row.id === unknown.id).status, "failed");
   sources.push({ id: "new-session", email: unknown.newEmail, sources: ["authorization"] });
-  await instance.reconcile(unknown.id);
-  assert.equal(instance.list().items.find((row) => row.id === unknown.id).status, "success");
+  assert.equal(instance.preview(unknownBody).rows[0].newEmail, unknown.newEmail);
+  await instance.remove([unknown.id]);
+  assert.equal(instance.list().items.some(row => row.id === unknown.id), false);
 
   const cancelBody = { ids: ["cancel"], text: "cancel-new@example.com" };
   await instance.start({ ...cancelBody, digest: instance.preview(cancelBody).digest });
@@ -174,7 +177,7 @@ try {
   const cooldownMessage = "为保护账户安全，本次电子邮箱更改将暂缓 24 小时";
   assert.equal(cooldown.message, cooldownMessage, "the public page message must not append HTTP status or generic rejection text");
   assert.equal(cooldown.retryAfter, clock + 86400000);
-  assert.equal(cooldown.canRetry, false);
+  assert.equal(cooldown.canRetry, true, "cooldown is an upstream error, not a persistent local rebind lock");
   assert.match((await instance.logs(cooldown.id)).logs, /HTTP|httpStatus/);
   await instance.shutdown();
   const statePath = path.join(root, "email-rebind/state.enc");

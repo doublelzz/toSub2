@@ -9,7 +9,7 @@ export const REBIND_ERRORS = {
   SENSITIVE_ACTION_COOLDOWN: "为保护账户安全，本次电子邮箱更改将暂缓 24 小时",
   REQUEST_FAILED: "服务拒绝请求，请稍后重试",
   NETWORK: "网络请求未完成，请稍后重试",
-  UNCERTAIN: "尚不能确认换绑结果，请核对新邮箱登录状态，不要重新换绑",
+  UNCERTAIN: "本次换绑未收到成功确认，请重新发起换绑",
   RESPONSE_INVALID: "服务响应异常，请核对结果后重试",
 };
 export const rebindError = (code, diagnostic, message) => Object.assign(new Error(message || REBIND_ERRORS[code] || REBIND_ERRORS.REQUEST_FAILED), { rebindCode: code, status: 409, ...(diagnostic ? { diagnostic } : {}) });

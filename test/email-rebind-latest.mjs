@@ -90,17 +90,15 @@ async function scenario(name, mode) {
   });
   const body = { ids: ["source"], text: `${name}-new@example.com----https://mail.fixture.invalid/inbox`, timeout: 30 };
   await workspace.start({ ...body, digest: workspace.preview(body).digest });
-  let item = await until(() => workspace.list().items.find(row => ["success", "waiting_manual"].includes(row.status)));
+  let item = await until(() => workspace.list().items.find(row => ["success", "failed"].includes(row.status) && row.canRetry));
   if (mode === "untimed") {
-    assert.equal(item.status, "waiting_manual");
+    assert.equal(item.status, "failed");
     assert.match(item.message, /超时/);
     assert.deepEqual(verified, [], "a baseline alone cannot prove the time of an undated code");
   } else {
     if (mode === "resend") {
-      assert.equal(item.status, "waiting_manual");
+      assert.equal(item.status, "failed");
       clock = item.nextSendAt + 1;
-      await workspace.cancel([item.id]);
-      await until(() => workspace.list().items.find(row => row.status === "cancelled"));
       await workspace.retry(item.id);
       item = await until(() => workspace.list().items.find(row => row.status === "success"));
       assert.equal(item.challengeVersion, 2);

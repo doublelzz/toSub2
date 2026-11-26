@@ -86,8 +86,9 @@ try {
   const state = () => workspace.dispatch("GET", "/api/rebind/state").then(parsed);
   const auto = await waitFor(async () => (await state()).items.find((row) => row.newEmail === "target-a@example.com" && row.status === "success"));
   let manual = await waitFor(async () => (await state()).items.find((row) => row.newEmail === "target-b@example.com" && row.status === "waiting_manual"));
-  assert.equal((await call(`/api/rebind/${manual.id}/code`, "POST", { code: "999999", version: manual.challengeVersion })).data.item.status, "waiting_manual");
-  manual = (await state()).items.find((row) => row.id === manual.id);
+  assert.equal((await call(`/api/rebind/${manual.id}/code`, "POST", { code: "999999", version: manual.challengeVersion })).data.item.status, "failed");
+  assert.equal((await call(`/api/rebind/${manual.id}/retry`, "POST", {})).status, 200);
+  manual = await waitFor(async () => (await state()).items.find(row => row.id === manual.id && row.status === "waiting_manual"));
   assert.equal((await call(`/api/rebind/${manual.id}/code`, "POST", { code: "001234", version: manual.challengeVersion })).data.item.status, "success");
   const logResult = await call(`/api/rebind/${manual.id}/logs`);
   assert.equal(logResult.status, 200);
@@ -114,6 +115,7 @@ try {
   assert.equal((await call("/api/rebind/state")).data.items.length, 0);
   assert.equal((await call(`/api/rebind/${manual.id}/retry`, "POST", {})).status, 404);
   assert.equal((await call(`/api/rebind/${manual.id}/logs`)).status, 404, "execution logs remain isolated by CDK");
+  assert.equal((await call("/api/rebind/delete", "POST", { ids: [manual.id] })).status, 404, "deletion remains isolated by CDK");
   assert.equal((await call("/api/imports/preview", "POST", { mode: "rebind", payload: { ids: [auto.id] } })).status, 404);
   cookie = currentCookie; token = currentToken;
   const payload = { ids: [auto.id, manual.id] };
@@ -187,6 +189,10 @@ try {
   const retryLogs = (await call(`/api/rebind/${limitedItem.id}/logs`)).data.logs;
   assert.match(retryLogs, /attempt:1/); assert.match(retryLogs, /attempt:2/); assert.match(retryLogs, /original begin rejection detail/);
   assert.equal(app.store.get(limited.id).balance, 0);
+  assert.equal((await call("/api/rebind/delete", "POST", { ids: [limitedItem.id] })).data.deleted, 1);
+  assert.equal((await limitedState()).items.some(row => row.id === limitedItem.id), false);
+  assert.equal((await call(`/api/rebind/${limitedItem.id}/logs`)).status, 404);
+  assert.equal(limitedWorkspace.publicJobs().length, 1, "deleting a rebind record preserves the account it previously synchronized");
   console.log("email rebind console passed (real protocol fixture, mixed OTP, cookie context, original-data preservation, free CDK sync/isolation, idempotency and restart)");
 } finally {
   await app?.close(); backend.closeAllConnections(); await new Promise((resolve) => backend.close(resolve));

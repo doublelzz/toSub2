@@ -1,11 +1,11 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowRight, Ban, Check, CheckCheck, ChevronLeft, ChevronRight, CircleAlert, Clock3, Copy, FileText, Inbox, LoaderCircle, Mail, RefreshCw, Search, Send, X } from "lucide-react";
+import { ArrowRight, Ban, Check, CheckCheck, ChevronLeft, ChevronRight, CircleAlert, Clock3, Copy, FileText, Inbox, LoaderCircle, Mail, RefreshCw, Search, Send, Trash2, X } from "lucide-react";
 import { Drawer, useDialogFocus } from "./WorkspaceUi.jsx";
 import { cdkFetch, prepareProxyNetworkOptions } from "./cdk-api.mjs";
 import "./email-rebind.css";
 
 const PAGE_SIZE = 20;
-const LABELS = { queued: "排队中", checking: "检查登录信息", beginning: "正在发码", waiting_auto: "自动收码中", waiting_manual: "待手动验证码", verifying: "正在确认换绑", uncertain: "结果待核实", success: "换绑成功", failed: "失败", cancelled: "已停止", interrupted: "已中断" };
+const LABELS = { queued: "排队中", checking: "检查登录信息", beginning: "正在发码", waiting_auto: "自动收码中", waiting_manual: "待手动验证码", verifying: "正在确认换绑", success: "换绑成功", failed: "失败", cancelled: "已停止", interrupted: "已中断" };
 const WAITING = new Set(["waiting_manual", "waiting_auto"]);
 const STOPPABLE = new Set(["queued", "checking", "beginning", "waiting_auto", "waiting_manual", "verifying"]);
 const time = (value) => value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "—";
@@ -69,7 +69,7 @@ export default function EmailRebindWorkspace({ token, onOpenAuthorization, initi
   const rows = filtered.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
   const selection = tab === "sources" ? sourceIds : recordIds;
   const setSelection = tab === "sources" ? setSourceIds : setRecordIds;
-  const selectable = (row) => tab !== "sources" || (!row.busy && !row.rebound);
+  const selectable = (row) => tab !== "sources" || !row.busy;
   const pageIds = rows.filter(selectable).map((row) => row.id);
   const allSelected = pageIds.length > 0 && pageIds.every((id) => selection.has(id));
   const selectedSources = [...sourceIds].map((id) => data.sources.find((row) => row.id === id)).filter(Boolean);
@@ -83,6 +83,13 @@ export default function EmailRebindWorkspace({ token, onOpenAuthorization, initi
   const switchTab = (value) => { setTab(value); setPage(1); setSearch(""); setStatus("all"); };
   const toggle = (id) => setSelection((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; });
   const itemAction = (row, route, body = {}) => perform(row.id, async () => { await post(`${row.id}/${route}`, body); await refresh(); });
+  const deleteRecords = (records) => perform("delete", async () => {
+    const value = await post("delete", { ids: records.map(row => row.id) });
+    setRecordIds(new Set());
+    if (records.some(row => row.id === detailId)) setDetailId(null);
+    setNotice(`已删除 ${value.deleted} 条换绑记录，可以重新发起换绑。`);
+    await refresh();
+  });
   const sync = (items) => perform("sync", async () => {
     setDetailId(null);
     const value = await post("sync", { ids: items.map((row) => row.id) });
@@ -91,7 +98,7 @@ export default function EmailRebindWorkspace({ token, onOpenAuthorization, initi
   });
 
   return <section className="workspace rebind-workspace" aria-labelledby="rebind-title">
-    <header className="rebind-heading"><div><h2 id="rebind-title">邮箱换绑</h2><p>先核对每一组邮箱，再开始换绑。原授权与 MFA 资料独立保留。</p></div>
+    <header className="rebind-heading"><div><h2 id="rebind-title">邮箱换绑</h2><p>每次换绑独立执行，可重复发起。记录可删除，原账号资料保留。</p></div>
       <button type="button" className="secondary-button" onClick={() => void perform("refresh", refresh)} disabled={busy.has("refresh")}><RefreshCw size={15} />刷新</button></header>
     <nav className="rebind-tabs" aria-label="换绑视图">{[["sources", "可换绑账号", data.sources.length], ["records", "换绑记录", data.items.length]].map(([key, label, count]) =>
       <button type="button" key={key} aria-pressed={tab === key} className={tab === key ? "active" : ""} onClick={() => switchTab(key)}>{label}<span>{count}</span></button>)}</nav>
@@ -102,11 +109,12 @@ export default function EmailRebindWorkspace({ token, onOpenAuthorization, initi
       {tab === "records" && waiting > 0 && <button type="button" className="text-action" onClick={() => { setStatus("waiting_manual"); setPage(1); }}><Inbox size={15} />待手动输码 {waiting}</button>}
     </div>
     <div className="rebind-actionbar"><div><strong>已选 {selection.size} 个{tab === "sources" ? "账号" : "记录"}</strong><button type="button" className="selection-text-button" onClick={() => setSelection(new Set())} disabled={!selection.size}>清除选择</button></div>
-      {tab === "sources" ? <button type="button" className="primary-button" disabled={!selectedSources.length || selectedSources.some((row) => row.busy || row.rebound)} onClick={() => setMapping([...selectedSources])}><Mail size={16} />配置换绑（{selectedSources.length}）</button>
+      {tab === "sources" ? <button type="button" className="primary-button" disabled={!selectedSources.length || selectedSources.some((row) => row.busy)} onClick={() => setMapping([...selectedSources])}><Mail size={16} />配置换绑（{selectedSources.length}）</button>
         : <div className="rebind-record-actions"><button type="button" className="secondary-button" disabled={!syncable.length || busy.has("sync")} onClick={() => void sync(syncable)}><Send size={15} />同步到账号授权（{syncable.length}）</button>
-          <button type="button" className="secondary-button" disabled={!stoppable.length || busy.has("stop")} onClick={() => void perform("stop", async () => { const result = await post("stop", { ids: stoppable.map((row) => row.id) }); setNotice(result.finishing ? "已请求停止；正在提交的请求会先确认结果。" : "所选任务已停止。"); await refresh(); })}><Ban size={15} />停止所选</button></div>}
+          <button type="button" className="secondary-button" disabled={!stoppable.length || busy.has("stop")} onClick={() => void perform("stop", async () => { const result = await post("stop", { ids: stoppable.map((row) => row.id) }); setNotice(result.finishing ? "正在停止当前请求。" : "所选任务已停止。"); await refresh(); })}><Ban size={15} />停止所选</button>
+          <button type="button" className="secondary-button danger" disabled={!selectedRecords.length || busy.has("delete")} onClick={() => void deleteRecords(selectedRecords)}><Trash2 size={15} />删除所选（{selectedRecords.length}）</button></div>}
     </div>
-    {tab === "records" && recentBatch.length > 0 && <p className="rebind-batch-progress" role="status">最近批次已处理 <strong>{processed} / {recentBatch.length}</strong><span>成功 {recentBatch.filter((row) => row.status === "success").length}</span><span>失败 {recentBatch.filter((row) => row.status === "failed").length}</span><span>待验证码 {recentBatch.filter((row) => WAITING.has(row.status)).length}</span><span>待核实 {recentBatch.filter((row) => row.status === "uncertain").length}</span></p>}
+    {tab === "records" && recentBatch.length > 0 && <p className="rebind-batch-progress" role="status">最近批次已处理 <strong>{processed} / {recentBatch.length}</strong><span>成功 {recentBatch.filter((row) => row.status === "success").length}</span><span>失败 {recentBatch.filter((row) => row.status === "failed").length}</span><span>待验证码 {recentBatch.filter((row) => WAITING.has(row.status)).length}</span></p>}
     <div className="table-frame rebind-table-frame"><table className={`rebind-table ${tab === "records" ? "rebind-results" : ""}`}><thead><tr>
       <th className="select-heading"><input type="checkbox" checked={allSelected} disabled={!pageIds.length} aria-label="选择当前页全部换绑账号" onChange={() => setSelection((current) => { const next = new Set(current); pageIds.forEach((id) => allSelected ? next.delete(id) : next.add(id)); return next; })} /></th>
       {tab === "sources" ? <><th>原账号</th><th>来源</th><th>账号资料</th><th>当前状态</th><th>操作</th></> : <><th>邮箱对应关系</th><th>收码与进度</th><th>同步状态</th><th>更新时间</th><th>操作</th></>}
@@ -114,9 +122,12 @@ export default function EmailRebindWorkspace({ token, onOpenAuthorization, initi
       {rows.map((row) => <tr key={row.id} className={selection.has(row.id) ? "selected-row" : ""}><td className="select-cell"><input type="checkbox" checked={selection.has(row.id)} disabled={!selectable(row)} onChange={() => toggle(row.id)} aria-label={`选择 ${row.email || row.oldEmail}`} /></td>
         {tab === "sources" ? <><td data-label="原账号"><strong className="rebind-email">{row.email}</strong></td><td data-label="来源">{row.sources.map((source) => source === "mfa" ? "MFA" : "账号授权").join(" / ")}</td>
           <td data-label="账号资料"><span>{row.hasPassword ? "已有密码" : "未提供密码"}</span><small className="rebind-secondary">{row.hasTotpKey ? "已有 MFA 密钥" : "未记录 MFA 密钥"}</small></td>
-          <td data-label="状态">{row.rebound ? "已完成换绑" : row.busy ? "其他任务处理中" : "执行时核验登录状态"}</td><td data-label="操作"><button type="button" className="text-action" disabled={row.busy || row.rebound} onClick={() => setMapping([row])}>换绑邮箱</button></td></>
+          <td data-label="状态">{row.busy ? "其他任务处理中" : "可以发起换绑"}</td><td data-label="操作"><button type="button" className="text-action" disabled={row.busy} onClick={() => setMapping([row])}>换绑邮箱</button></td></>
           : <><td data-label="邮箱对应关系"><EmailPair oldEmail={row.oldEmail} newEmail={row.newEmail} /></td><td data-label="收码与进度"><RebindStatus item={row} /><small className="rebind-secondary">{row.mode === "auto" ? "自动收码" : "手动验证码"}</small><p className="rebind-row-message">{row.message}</p>{WAITING.has(row.status) && <CodeForm item={row} busy={busy.has(row.id)} onSubmit={(code) => itemAction(row, "code", { code, version: row.challengeVersion })} />}</td>
-            <td data-label="同步状态">{row.syncedJobId ? "已在账号授权中" : row.status === "success" ? "未同步；新邮箱登录待恢复" : "等待换绑确认"}</td><td data-label="更新时间" className="rebind-time">{time(row.updatedAt)}</td><td data-label="操作"><div className="rebind-row-actions"><button type="button" className="text-action" onClick={() => { setDetailTab("details"); setDetailId(row.id); }}>查看详情</button><button type="button" className="text-action" aria-label={`查看 ${row.oldEmail} 的换绑执行日志`} onClick={() => { setDetailTab("logs"); setDetailId(row.id); }}><FileText size={14} />执行日志</button></div></td></>}
+            <td data-label="同步状态">{row.syncedJobId ? "已在账号授权中" : row.status === "success" ? "未同步；新邮箱登录待恢复" : "未同步"}</td><td data-label="更新时间" className="rebind-time">{time(row.updatedAt)}</td><td data-label="操作"><div className="rebind-row-actions"><button type="button" className="text-action" onClick={() => { setDetailTab("details"); setDetailId(row.id); }}>查看详情</button>
+              {row.canRetry && <button type="button" className="text-action" disabled={busy.has(row.id) || busy.has("delete")} aria-label={`重新发起 ${row.oldEmail} 的换绑`} onClick={() => void itemAction(row, "retry")}>再次发起</button>}
+              <button type="button" className="text-action danger" disabled={busy.has("delete") || busy.has(row.id) || row.canDelete === false} aria-label={`删除 ${row.oldEmail} 的换绑记录`} onClick={() => void deleteRecords([row])}><Trash2 size={14} />删除</button>
+              <button type="button" className="text-action" aria-label={`查看 ${row.oldEmail} 的换绑执行日志`} onClick={() => { setDetailTab("logs"); setDetailId(row.id); }}><FileText size={14} />执行日志</button></div></td></>}
       </tr>)}
     </tbody></table></div>
     <div className="rebind-pagination"><span>匹配 {filtered.length} 条 · 每页 {PAGE_SIZE} 条</span><div><button type="button" className="icon-button" aria-label="换绑上一页" disabled={currentPage <= 1} onClick={() => setPage(currentPage - 1)}><ChevronLeft size={17} /></button><span>{currentPage} / {totalPages}</span><button type="button" className="icon-button" aria-label="换绑下一页" disabled={currentPage >= totalPages} onClick={() => setPage(currentPage + 1)}><ChevronRight size={17} /></button></div></div>
@@ -128,12 +139,12 @@ export default function EmailRebindWorkspace({ token, onOpenAuthorization, initi
         <div className="rebind-detail-actions">{detail.status === "waiting_auto" && <button type="button" className="secondary-button" disabled={busy.has(detail.id)} onClick={() => void itemAction(detail, "manual")}>改为手动收码</button>}
           <ResendButton item={detail} busy={busy.has(detail.id)} onClick={() => void itemAction(detail, "resend")} /></div></section>}
       <section className="detail-section"><h3>后续操作</h3><div className="rebind-detail-actions">
-        {detail.canRetry && <button type="button" className="secondary-button" disabled={busy.has(detail.id)} onClick={() => void itemAction(detail, "retry")}>按原映射重试</button>}
-        {detail.status === "uncertain" && <button type="button" className="secondary-button" disabled={busy.has(detail.id)} onClick={() => void itemAction(detail, "reconcile")}>核对新邮箱登录状态</button>}
+        {detail.canRetry && <button type="button" className="secondary-button" disabled={busy.has(detail.id) || busy.has("delete")} onClick={() => void itemAction(detail, "retry")}>再次发起换绑</button>}
+        <button type="button" className="secondary-button danger" disabled={busy.has("delete") || busy.has(detail.id) || detail.canDelete === false} onClick={() => void deleteRecords([detail])}><Trash2 size={15} />删除记录</button>
         {detail.status === "success" && !detail.syncedJobId && <button type="button" className="primary-button" disabled={busy.has("sync")} onClick={() => void sync([detail])}><Send size={15} />同步到账号授权</button>}
         {detail.syncedJobId && onOpenAuthorization && <button type="button" className="secondary-button" onClick={onOpenAuthorization}>查看账号授权</button>}
       </div><p className="rebind-secondary">换绑成功后同步回账号授权不扣 CDK 次数，保留原账号资料。旧登录信息不能作为新邮箱授权。</p></section>
-      <section className="detail-section"><h3>执行历史</h3><ol className="rebind-events">{detail.events.map((event, index) => <li key={index}><time>{time(event.at)}</time><strong>{LABELS[event.status]}</strong><span>{event.message}</span></li>)}</ol></section></>}
+      <section className="detail-section"><h3>执行历史</h3><ol className="rebind-events">{detail.events.map((event, index) => <li key={index}><time>{time(event.at)}</time><strong>{LABELS[event.status] || "失败"}</strong><span>{event.message}</span></li>)}</ol></section></>}
     </Drawer>}
   </section>;
 }
@@ -231,7 +242,7 @@ export function AuthorizationRebindDialog({ token, jobIds, onClose, onStarted })
       const byId = new Map(state.sources.map((source) => [source.id, source]));
       const selected = jobIds.map((id) => byId.get(`authorization:${id}`));
       if (selected.some((source) => !source)) throw new Error("部分账号已不存在，请刷新账号列表后重试");
-      if (selected.some((source) => source.busy || source.rebound)) throw new Error("所选账号正在执行其他操作或已完成换绑，请重新选择");
+      if (selected.some((source) => source.busy)) throw new Error("所选账号正在执行其他操作，请先停止当前任务");
       if (!controller.signal.aborted) setSources(selected);
     })().catch((failure) => { if (!controller.signal.aborted) setError(failure.message); });
     return () => { mounted.current = false; controller.abort(); };

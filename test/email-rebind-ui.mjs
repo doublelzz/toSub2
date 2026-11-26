@@ -120,5 +120,44 @@ try {
   await act(async () => button("确认并开始换绑").click());
   assert.equal(workflowCalls.filter((call) => call.url.endsWith("/start")).length, 1);
   proxyPoolUi.setWorkspaceProxyPoolDraft("");
-  console.log("email rebind UI passed (mapping, OTP, free synchronization, complete paged logs, safe text rendering, copy and record isolation)");
+  await act(() => root.render(null));
+  const fixtureItems = ["failed", "cancelled", "success"].map((status, index) => ({ id: `disposable-${index}`, batchId: "disposable-batch",
+    oldEmail: `${status}@example.com`, newEmail: `new-${status}@example.com`, status, mode: "manual", message: "本次执行结果",
+    updatedAt: "2026-11-26T08:00:00Z", events: [], canRetry: true, canDelete: true }));
+  let currentItems = [...fixtureItems]; let failDelete = false;
+  workspaceFetch = async (url, options = {}) => {
+    const body = options.body ? JSON.parse(options.body) : null; workflowCalls.push({ url, body });
+    if (url.endsWith("/state")) return Response.json({ sources: [{ ...selected[0], rebound: true, sources: ["authorization"] }], items: currentItems });
+    if (url.endsWith("/retry")) return Response.json({ item: currentItems.find(item => url.includes(item.id)) });
+    if (url.endsWith("/delete")) {
+      if (failDelete) return Response.json({ error: "删除记录失败，请重试" }, { status: 500 });
+      currentItems = currentItems.filter(item => !body.ids.includes(item.id));
+      return Response.json({ deleted: body.ids.length });
+    }
+    throw new Error(`Unexpected disposable workflow route: ${url}`);
+  };
+  await act(async () => root.render(React.createElement(EmailRebindWorkspace, { token: "fixture", initialTab: "records" })));
+  assert.equal(container.querySelectorAll('[aria-label^="重新发起 "]').length, 3, "all terminal outcomes allow another attempt");
+  await act(async () => container.querySelector('[aria-label="重新发起 failed@example.com 的换绑"]').click());
+  assert.equal(workflowCalls.at(-2).url, "/api/rebind/disposable-0/retry");
+  await act(() => button("查看详情").click());
+  assert.ok(button("删除记录"));
+  failDelete = true;
+  await act(async () => button("删除记录").click());
+  assert.match(container.querySelector('[role="alert"]').textContent, /删除记录失败/);
+  assert.ok(button("删除记录"), "failed deletion keeps the record and detail open");
+  failDelete = false;
+  await act(async () => button("删除记录").click());
+  assert.equal(button("删除记录"), undefined, "deleting the open record closes its detail");
+  assert.equal(container.querySelector('[aria-label="删除 failed@example.com 的换绑记录"]'), null);
+  assert.match(container.textContent, /已删除 1 条换绑记录/);
+  await act(() => container.querySelector('[aria-label="选择当前页全部换绑账号"]').click());
+  await act(async () => button("删除所选（2）").click());
+  assert.deepEqual(workflowCalls.filter(call => call.url.endsWith("/delete")).at(-1).body.ids, ["disposable-1", "disposable-2"]);
+  assert.match(container.textContent, /暂无换绑记录/);
+  await act(() => button("可换绑账号").click());
+  assert.equal(button("换绑邮箱").disabled, false, "legacy successful mappings do not disable a source");
+  await act(() => button("换绑邮箱").click());
+  assert.ok(container.querySelector('[role="dialog"]'), "the original account can start a new mapping");
+  console.log("email rebind UI passed (mapping, OTP, synchronization, logs, repeat attempts, record and batch deletion, error recovery and source reuse)");
 } finally { await act(() => root.unmount()); dom.window.close(); }
