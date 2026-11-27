@@ -28,7 +28,8 @@ export async function createTeamWorkspace({ root, vault, parseText, listSources 
   let state;
   try { state = JSON.parse(await fs.readFile(filename, "utf8")); }
   catch (error) { if (error.code !== "ENOENT") throw error; state = { version: 1, accounts: [], teams: [], requests: [], imports: [] }; }
-  if (state.version !== 1 || !["accounts", "teams", "requests", "imports"].every((key) => Array.isArray(state[key]))) throw new Error("Team workspace data is invalid");
+  state.deletedTeams ??= [];
+  if (state.version !== 1 || !["accounts", "teams", "requests", "imports", "deletedTeams"].every((key) => Array.isArray(state[key]))) throw new Error("Team workspace data is invalid");
   const active = new Map(), network = new Map(), teamLocks = new Set();
   let closing = false, writes = Promise.resolve();
   const stamp = () => new Date(now()).toISOString();
@@ -38,8 +39,9 @@ export async function createTeamWorkspace({ root, vault, parseText, listSources 
   const teamOf = (id) => { const team = state.teams.find((row) => row.id === id); if (!team) throw fail("团队记录不存在", 404); return team; };
   const secret = (account) => vault.open(account.secret, `account:${account.id}`);
   const putSecret = (account, value) => { account.secret = vault.seal(value, `account:${account.id}`); };
+  const deleteBlocked = (accounts, teamId) => teamLocks.has(teamId) || accounts.some((account) => LIVE.has(account.status) || isBusy(account.email));
   function save() {
-    if (!state.accounts.length && !state.teams.length && !state.requests.length && !state.imports.length) return writes;
+    if (!state.accounts.length && !state.teams.length && !state.requests.length && !state.imports.length && !state.deletedTeams.length) return writes;
     const raw = `${JSON.stringify(state)}\n`;
     const next = writes.catch(() => {}).then(async () => {
       const temporary = `${filename}.${crypto.randomUUID()}.tmp`;
@@ -55,7 +57,7 @@ export async function createTeamWorkspace({ root, vault, parseText, listSources 
   function publicAccount(account) {
     return { id: account.id, email: account.email, status: account.status, message: account.message || "", errorCode: account.errorCode || "",
       prompt: account.prompt || null, updatedAt: account.updatedAt, source: account.source || "import", hasCredentials: account.hasCredentials,
-      busy: isBusy(account.email), teamCount: state.teams.filter((row) => row.accountIds.includes(account.id)).length };
+      busy: isBusy(account.email), canDelete: !deleteBlocked([account]), teamCount: state.teams.filter((row) => row.accountIds.includes(account.id)).length };
   }
   function publicTeam(team, requestedAccountId) {
     const accountId = requestedAccountId || team.selectedAccountId;
@@ -70,7 +72,8 @@ export async function createTeamWorkspace({ root, vault, parseText, listSources 
       capabilities: snapshot?.capabilities || { canInvite: false, canRemove: false, roleLabel: "身份待确认" },
       subscription: data, subscriptionStale: !snapshot?.subscription || Boolean(snapshot?.errors?.subscription),
       membersTotal: snapshot?.members?.total ?? null, pendingInvites: snapshot?.invites?.total ?? null,
-      checkedAt: snapshot?.checkedAt || null, errors: snapshot?.errors || {}, logs: (team.logs || []).slice(0, 100), busy: teamLocks.has(team.id) || isBusy(account.email) };
+      checkedAt: snapshot?.checkedAt || null, errors: snapshot?.errors || {}, logs: (team.logs || []).slice(0, 100), busy: teamLocks.has(team.id) || isBusy(account.email),
+      canDelete: !deleteBlocked(team.accountIds.map(accountOf), team.id) };
   }
   function overview() {
     const teams = state.teams.map((row) => publicTeam(row));
@@ -84,16 +87,16 @@ export async function createTeamWorkspace({ root, vault, parseText, listSources 
       const event = team.subscription?.event;
       if (["expiry", "trial"].includes(event?.kind) && Date.parse(event.at) >= now() && Date.parse(event.at) <= now() + 7 * 86400_000) expiring += 1;
     }
-    return { accounts: state.accounts.length, teams: teams.length, used, purchased, seatsKnown, pending, pendingKnown, expiring,
-      expired: state.accounts.filter((row) => row.status === "auth_expired").length,
-      active: state.accounts.filter((row) => LIVE.has(row.status)).length };
+    return { accounts: state.accounts.filter((row) => !row.hidden).length, teams: teams.length, used, purchased, seatsKnown, pending, pendingKnown, expiring,
+      expired: state.accounts.filter((row) => !row.hidden && row.status === "auth_expired").length,
+      active: state.accounts.filter((row) => !row.hidden && LIVE.has(row.status)).length };
   }
   function query(body = {}) {
     access();
     const search = text(body.search).toLowerCase();
     const linked = new Set(state.teams.flatMap((row) => row.accountIds));
     let rows = [...state.teams.map((row) => ({ kind: "team", ...publicTeam(row) })),
-      ...state.accounts.filter((row) => !linked.has(row.id)).map((row) => ({ kind: "account", ...publicAccount(row), name: "待识别团队", accountId: row.id }))];
+      ...state.accounts.filter((row) => !row.hidden && !linked.has(row.id)).map((row) => ({ kind: "account", ...publicAccount(row), name: "待识别团队", accountId: row.id }))];
     rows = rows.filter((row) => (!search || `${row.name} ${row.email} ${(row.accounts || []).map((item) => item.email).join(" ")}`.toLowerCase().includes(search))
       && (!body.status || body.status === "all" || (body.status === "readonly" ? row.status === "ready" && !row.capabilities?.canInvite && !row.capabilities?.canRemove : row.status === body.status))
       && (!body.seats || body.seats === "all" || (typeof row.subscription?.pools?.default?.available === "number" && (body.seats === "available" ? row.subscription.pools.default.available > 0 : row.subscription.pools.default.available === 0)))
@@ -101,13 +104,13 @@ export async function createTeamWorkspace({ root, vault, parseText, listSources 
     const pages = Math.max(1, Math.ceil(rows.length / 20));
     const page = Math.min(pages, Math.max(1, Number.isSafeInteger(body.page) ? body.page : 1));
     return { rows: rows.slice((page - 1) * 20, page * 20), total: rows.length, page, pages, overview: overview(),
-      tasks: state.accounts.filter((row) => LIVE.has(row.status) || row.status === "interrupted").map(publicAccount) };
+      tasks: state.accounts.filter((row) => !row.hidden && (LIVE.has(row.status) || row.status === "interrupted")).map(publicAccount) };
   }
   function sources({ forImport = false } = {}) {
     if (forImport) importAccess(); else access();
     return { accounts: listSources().filter((row) => row.sources?.includes("authorization")).map((row) => ({ ...row,
       busy: row.busy || isBusy(row.email) || state.accounts.some((account) => account.email === row.email && LIVE.has(account.status)),
-      linked: state.accounts.some((account) => account.email === row.email) })) };
+      linked: state.accounts.some((account) => account.email === row.email && !account.hidden) })) };
   }
   function parseImport(body) {
     if (body.sourceIds !== undefined) {
@@ -126,7 +129,7 @@ export async function createTeamWorkspace({ root, vault, parseText, listSources 
       if (entry.session) teamIdentity(entry.session, entry.email);
       const existing = state.accounts.find((row) => row.email === entry.email);
       if (isAccountBusy(entry.email) || isBusy(entry.email) || existing && LIVE.has(existing.status)) throw fail(`账号 ${entry.email} 正在执行任务，请稍后重试`, 409);
-      return { email: entry.email, existing: Boolean(existing), action: existing ? body.updateExisting === true ? "更新资料并识别" : "复用并识别" : "新账号",
+      return { email: entry.email, existing: Boolean(existing), restoring: Boolean(existing?.hidden), action: existing ? existing.hidden ? "恢复管理并识别" : body.updateExisting === true ? "更新资料并识别" : "复用并识别" : "新账号",
         hasPassword: Boolean(entry.credentials.password), hasTotp: Boolean(entry.credentials.totpSecret), hasMailbox: Boolean(entry.credentials.mailApiUrl), hasSession: Boolean(entry.session), source: entry.sourceRef ? "authorization" : "import" };
     });
     return { count: accounts.length, added: accounts.filter((row) => !row.existing).length, duplicateCount: parsed.duplicateCount,
@@ -146,7 +149,7 @@ export async function createTeamWorkspace({ root, vault, parseText, listSources 
     if (previous) { if (previous.digest !== bodyDigest) throw fail("该请求标识已用于其他导入", 409); return { accounts: previous.accountIds.map((id) => publicAccount(accountOf(id))), reused: true }; }
     const view = preview(body);
     if (body.digest !== view.digest) throw fail("导入内容或账号状态已变化，请重新预览", 409);
-    if (state.accounts.length + view.added > 500) throw fail("团队管理账号已达 500 个上限");
+    if (state.accounts.filter((row) => !row.hidden).length + view.accounts.filter((row) => !row.existing || row.restoring).length > 500) throw fail("团队管理账号已达 500 个上限");
     const entries = parseImport(body).entries, ids = [];
     const selection = proxyPool?.normalizeSelection(body) || null;
     const before = structuredClone(state);
@@ -163,7 +166,7 @@ export async function createTeamWorkspace({ root, vault, parseText, listSources 
       if (entry.sourceRef) payload.sourceRef = entry.sourceRef;
       if (selection) { payload.proxyUrl = proxyPool.resolve(selection) || ""; payload.networkSet = true; }
       putSecret(account, payload);
-      Object.assign(account, { status: "queued", taskKind: body.forceLogin === true ? "login" : "connect", actorId, message: "等待登录与识别团队", errorCode: "", prompt: null, updatedAt: stamp(), hasCredentials: Boolean(payload.credentials.password || payload.credentials.mailApiUrl) });
+      Object.assign(account, { status: "queued", hidden: false, restoreDeletedTeamIds: body.forceLogin === true ? [] : state.deletedTeams.map((row) => row.id), taskKind: body.forceLogin === true ? "login" : "connect", actorId, message: "等待登录与识别团队", errorCode: "", prompt: null, updatedAt: stamp(), hasCredentials: Boolean(payload.credentials.password || payload.credentials.mailApiUrl) });
       ids.push(account.id);
     }
     state.imports.push({ key, digest: bodyDigest, accountIds: ids }); state.imports = state.imports.slice(-200);
@@ -194,6 +197,12 @@ export async function createTeamWorkspace({ root, vault, parseText, listSources 
     }
   }
   function attach(account, found) {
+    if (account.restoreDeletedTeamIds?.length) {
+      const restored = new Set(found.map((row) => row.id));
+      state.deletedTeams = state.deletedTeams.filter((row) => !account.restoreDeletedTeamIds.includes(row.id) || !restored.has(row.workspaceId));
+    }
+    delete account.restoreDeletedTeamIds;
+    found = found.filter((row) => !state.deletedTeams.some((deleted) => deleted.workspaceId === row.id));
     const accessible = new Set(found.map((row) => row.id));
     for (const team of state.teams) if (team.accountIds.includes(account.id) && !accessible.has(team.workspaceId)) {
       team.accountIds = team.accountIds.filter((id) => id !== account.id); delete team.snapshots[account.id];
@@ -206,6 +215,7 @@ export async function createTeamWorkspace({ root, vault, parseText, listSources 
       team.name = row.name; team.planType = row.planType;
       if (!team.accountIds.includes(account.id)) team.accountIds.push(account.id);
     }
+    return found;
   }
   async function withClient(account, signal, action) {
     const payload = secret(account);
@@ -229,9 +239,11 @@ export async function createTeamWorkspace({ root, vault, parseText, listSources 
   }
   async function discoverAccount(account, run) {
     return withClient(account, run.controller.signal, async (client) => {
-      const found = await client.discover();
+      let found = await client.discover();
       if (run.controller.signal.aborted) throw teamError("TEAM_CANCELLED");
-      attach(account, found);
+      const discovered = found.length;
+      found = attach(account, found);
+      account.hidden = discovered > 0 && found.length === 0;
       let errors = 0;
       for (const discovered of found) {
         if (run.controller.signal.aborted || !canUse()) throw teamError("TEAM_CANCELLED");
@@ -339,9 +351,10 @@ export async function createTeamWorkspace({ root, vault, parseText, listSources 
   }
   async function queue(body, actorId, kind = "sync") {
     access();
-    const ids = body.ids === undefined ? state.accounts.map((row) => row.id) : body.ids;
+    const ids = body.ids === undefined ? state.accounts.filter((row) => !row.hidden).map((row) => row.id) : body.ids;
     if (!Array.isArray(ids) || !ids.length || ids.length > 500 || new Set(ids).size !== ids.length) throw fail("请选择不重复的团队管理账号");
     const accounts = ids.map(accountOf);
+    if (accounts.some((account) => account.hidden)) throw fail("该账号的管理记录已删除，请重新导入后再操作", 409);
     if (accounts.some((account) => isBusy(account.email) || isAccountBusy(account.email) || LIVE.has(account.status))) throw fail("所选账号正在执行任务", 409);
     for (const account of accounts) Object.assign(account, { status: "queued", taskKind: kind, actorId, errorCode: "", message: kind === "login" ? "等待重新登录" : "等待重新识别团队", updatedAt: stamp(), prompt: null });
     await save(); requestSchedule(); return { queued: accounts.length };
@@ -358,6 +371,28 @@ export async function createTeamWorkspace({ root, vault, parseText, listSources 
     if (run) { run.controller.abort(); await run.done; }
     else if (account.status === "queued") { account.status = "interrupted"; account.message = "任务已停止"; account.prompt = null; await save(); }
     return publicAccount(account);
+  }
+  async function deleteRecord(body) {
+    access();
+    const id = text(body.id), kind = body.kind;
+    if (!id || !["team", "account"].includes(kind)) throw fail("请选择要删除的团队或账号记录");
+    if (kind === "team" && state.deletedTeams.some((row) => row.id === id)) return { deleted: 0 };
+    const team = kind === "team" ? teamOf(id) : null;
+    const accounts = team ? team.accountIds.map(accountOf) : [accountOf(id)];
+    if (!team && accounts[0].hidden) return { deleted: 0 };
+    if (deleteBlocked(accounts, team?.id)) throw fail("团队或账号正在执行任务，请先停止任务或等待完成后再删除记录", 409);
+    if (!team && state.teams.some((row) => row.accountIds.includes(id))) throw fail("该账号仍关联团队，请删除对应的团队记录", 409);
+    const before = structuredClone(state);
+    try {
+      if (team) {
+        state.deletedTeams.push({ id: team.id, workspaceId: team.workspaceId });
+        state.teams = state.teams.filter((row) => row.id !== id);
+        state.requests = state.requests.filter((row) => row.teamId !== id);
+      } else state.requests = state.requests.filter((row) => row.accountId !== id);
+      for (const account of accounts) if (!state.teams.some((row) => row.accountIds.includes(account.id))) account.hidden = true;
+      await save();
+    } catch (error) { state = before; throw error; }
+    return { deleted: 1 };
   }
   function detail(id, body = {}) {
     access(); const team = teamOf(id), view = publicTeam(team, body.accountId);
@@ -528,7 +563,7 @@ export async function createTeamWorkspace({ root, vault, parseText, listSources 
     await Promise.allSettled([...active.values(), ...network.values()].map((run) => run.done)); await save();
   }
   async function shutdown() { closing = true; await stopAll(); await writes; }
-  return { query, sources, preview, importAccounts, queue, input, cancel, detail, selectAccount, invitePreview, mutate, tick, isBusy, invalidate, stopAll, shutdown,
+  return { query, sources, preview, importAccounts, queue, input, cancel, deleteRecord, detail, selectAccount, invitePreview, mutate, tick, isBusy, invalidate, stopAll, shutdown,
     planImport, inventory: () => state.accounts.map((row) => row.email),
     hasAccount: (email) => state.accounts.some((row) => row.email === teamEmail(email)),
     activeCount: () => [...active.values()].filter((run) => run.slot).length + network.size,

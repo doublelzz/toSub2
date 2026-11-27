@@ -1094,6 +1094,7 @@ async function handleTeamApi(req, res, url) {
   if (route === "import/preview") { sendJson(res, 200, teamWorkspace.preview(body)); return; }
   if (route === "import") { sendJson(res, 200, await teamWorkspace.importAccounts(body, actor)); return; }
   if (route === "sync") { sendJson(res, 200, await teamWorkspace.queue(body, actor)); return; }
+  if (route === "delete") { sendJson(res, 200, await teamWorkspace.deleteRecord(body)); return; }
   const accountMatch = /^accounts\/([a-zA-Z0-9-]+)\/(login|input|cancel)$/.exec(route);
   if (accountMatch) {
     const [, id, action] = accountMatch;

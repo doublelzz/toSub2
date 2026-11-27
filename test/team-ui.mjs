@@ -35,6 +35,7 @@ async function cdkFetch(url, options) {
     else if (route === "sources") result = workspace.sources();
     else if (route === "import/preview") result = workspace.preview(body);
     else if (route === "import") result = await workspace.importAccounts(body, "ui-fixture-actor");
+    else if (route === "delete") result = await workspace.deleteRecord(body);
     else {
       const [id, action] = route.split("/");
       result = action === "query" ? workspace.detail(id, body) : action === "invite-preview" ? workspace.invitePreview(id, body)
@@ -116,7 +117,31 @@ try {
   await click(button("取消"));
   assert.doesNotMatch(document.body.textContent, /fixture-private-access-token|fixture-private-password/);
   assert.ok(requests.some((entry) => entry.route.endsWith("/invite-preview")));
-  console.log("Team UI tests passed: live service data, member drawer, email deduplication, invitation results, removal confirmation, nested focus/Escape and import preview");
+  const teamRow = () => all(".team-table tbody tr").find((element) => element.textContent.includes("协作团队"));
+  await click(button("删除记录", teamRow()));
+  assert.match(document.querySelector(".team-delete-record-dialog").textContent, /GPT 团队、现有成员和订阅保持不变/);
+  assert.match(document.querySelector(".team-delete-record-dialog").textContent, /后续同步不会重新添加/);
+  assert.equal(requests.filter((entry) => entry.route === "delete").length, 0, "record deletion waits for confirmation");
+  await click(button("取消"));
+  assert.equal(workspace.query().overview.teams, 2);
+  await click(button("管理", teamRow())); await waitFor(() => button("删除记录", document.querySelector(".team-drawer-footer")));
+  await click(button("删除记录", document.querySelector(".team-drawer-footer")));
+  assert.equal(all('[role="dialog"]').length, 2);
+  await act(async () => document.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+  assert.equal(all('[role="dialog"]').length, 1, "Escape dismisses the delete confirmation and retains the drawer");
+  await click(button("删除记录", document.querySelector(".team-drawer-footer")));
+  const deletedTeamId = workspace.query().rows.find((entry) => entry.workspaceId === TEAM_A).id;
+  const upstreamBeforeDelete = fixture.state.requests.length;
+  await click(button("确认删除记录"));
+  await waitFor(() => all(".team-table tbody tr").length === 1 && all('[role="dialog"]').length === 0);
+  assert.equal(fixture.state.requests.length, upstreamBeforeDelete, "deleting a local team makes no upstream request");
+  assert.equal(fixture.state.spaces.get(TEAM_A).members.length, 4);
+  assert.match(document.querySelector(".team-notice").textContent, /已删除管理记录/);
+  assert.deepEqual(requests.findLast((entry) => entry.route === "delete").body, { id: deletedTeamId, kind: "team" });
+  await click(button("删除记录", all(".team-table tbody tr")[0]));
+  await click(button("确认删除记录")); await waitFor(() => all(".team-table tbody tr").length === 0);
+  assert.equal(workspace.query().overview.accounts, 0, "deleting the last team leaves no orphan account row");
+  console.log("Team UI tests passed: member drawer, invitations/roles/removal, import preview and local deletion confirmation/cancellation, nested Escape, drawer closure and list refresh");
 } finally {
   await act(async () => root.unmount()); dom.window.close(); await workspace.shutdown(); await fixture.close(); await fs.rm(rootDirectory, { recursive: true, force: true });
   delete globalThis.window; delete globalThis.document; delete globalThis.HTMLElement; delete globalThis.IS_REACT_ACT_ENVIRONMENT;

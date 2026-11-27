@@ -126,6 +126,9 @@
 .team-dialog-heading p { margin: 6px 0 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
 .team-dialog-body { padding: 21px 24px; font-size: 13px; line-height: 1.8; }
 .team-dialog-body > p { margin: 0; }
+.team-delete-record-dialog .team-dialog-body > p { margin-top: 16px; }
+.team-delete-record-dialog .team-dialog-body > .dialog-error { margin-bottom: 0; }
+.team-drawer-footer > span { margin-right: auto; }
 .team-field { display: flex; flex-direction: column; gap: 7px; margin-bottom: 18px; font-size: 13px; }
 .team-field textarea, .team-field input { width: 100%; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--ink); padding: 10px 12px; font: inherit; }
 .team-field textarea { min-height: 140px; resize: vertical; font: 13px/1.8 ui-monospace, "Microsoft YaHei", monospace; }
