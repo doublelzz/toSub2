@@ -4,9 +4,9 @@ import { protocolEnvironment } from "./cdk-security.mjs";
 import { OFFER_ERRORS, offerError } from "./offer-checker.mjs";
 
 // Private JSON messages use pipes. Credentials never enter argv or diagnostic logs.
-export function createOfferRunner(protocolScript) {
+export function createOfferRunner(protocolScript, { loginOnly = false } = {}) {
   return (payload, { signal, onPrompt = () => {}, onSession = () => {}, onMailSent = () => {} } = {}) => {
-    const child = spawn(process.execPath, [protocolScript, "--offer-check"], {
+    const child = spawn(process.execPath, [protocolScript, loginOnly ? "--team-login" : "--offer-check"], {
       env: { ...protocolEnvironment(), CHATGPT_PROXY_URL: payload.proxyUrl || "", CHATGPT_LOGIN_PASSWORD: "", CHATGPT_TOTP_SECRET: "" },
       stdio: ["pipe", "pipe", "ignore"], windowsHide: true,
     });

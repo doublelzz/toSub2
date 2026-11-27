@@ -14,6 +14,7 @@ import { invalidateMfaSession, writeMfaSession, reusableMfaSession, readMfaSessi
 import { createEmailRebindWorkspace, createRebindRunner } from "./email-rebind-workspace.mjs";
 import { createOfferWorkspace } from "./offer-workspace.mjs";
 import { createOfferRunner } from "./offer-runner.mjs";
+import { createTeamWorkspace } from "./team-workspace.mjs";
 import { matchesTaskQuery, normalizeTaskQuery, summarizeTasks } from "./task-query.mjs";
 import { ACCOUNT_SESSION_FILENAME, loadAccountInsights, publicAccountInsights } from "./account-insights.mjs";
 import { exportAccountAccessTokens } from "./account-token-export.mjs";
@@ -138,6 +139,7 @@ const emailJobLocks = new Map();
 let mfaWorkspace = null;
 let rebindWorkspace = null;
 let offerWorkspace = null;
+let teamWorkspace = null;
 let outputSyncPromise = null;
 let lastOutputSyncAt = 0;
 let shuttingDown = false;
@@ -199,7 +201,7 @@ mfaWorkspace = await createMfaWorkspace({
     save: (email, credentials) => mfaCredentialStore.save(`${mfaCredentialPrefix}${email}`, credentials),
     load: (email) => mfaCredentialStore.load(`${mfaCredentialPrefix}${email}`),
   },
-  isAccountBusy: (email) => Boolean(rebindWorkspace?.isBusy(email) || offerWorkspace?.isBusy(email)) || emailJobLocks.has(email.toLowerCase())
+  isAccountBusy: (email) => Boolean(rebindWorkspace?.isBusy(email) || offerWorkspace?.isBusy(email) || teamWorkspace?.isBusy(email)) || emailJobLocks.has(email.toLowerCase())
     || [...jobs.values()].some((job) => job.email.toLowerCase() === email.toLowerCase() && isActive(job.status)),
   onSuccess: syncMfaCredentials,
   onSyncAuthorization: syncMfaAuthorization,
@@ -213,6 +215,7 @@ mfaWorkspace = await createMfaWorkspace({
     } };
   },
   onLogout: async (email) => {
+    if (teamWorkspace?.hasAccount(email)) await teamWorkspace.invalidate(email);
     await withEmailJobLock(email, async () => {
       for (const job of [...jobs.values()].filter((item) => item.email.toLowerCase() === email.toLowerCase())) {
         await invalidateMfaSession(path.join(path.dirname(job.outputPath), ACCOUNT_SESSION_FILENAME), email);
@@ -236,7 +239,7 @@ rebindWorkspace = await createEmailRebindWorkspace({
   proxyPool,
   root: OUTPUT_ROOT, vault: options.rebindVault,
   listSources: rebindSources, resolveSource: resolveRebindSource,
-  isAccountBusy: (email) => Boolean(offerWorkspace?.isBusy(email)) || emailJobLocks.has(email.toLowerCase()) || mfaWorkspace.isBusy(email)
+  isAccountBusy: (email) => Boolean(offerWorkspace?.isBusy(email) || teamWorkspace?.isBusy(email)) || emailJobLocks.has(email.toLowerCase()) || mfaWorkspace.isBusy(email)
     || [...jobs.values()].some((job) => job.email.toLowerCase() === email.toLowerCase() && (isActive(job.status) || job.child)),
   lookupSync: (item) => findJobByEmail(item.newEmail),
   runStep: createRebindRunner(PROTOCOL_SCRIPT, path.join(OUTPUT_ROOT, "email-rebind", "ipc")),
@@ -259,9 +262,18 @@ offerWorkspace = await createOfferWorkspace({
     return { session: snapshot?.session || authorization || null, credentials: { ...stored, ...mfaCredentials, ...snapshot?.credentials,
       mailApiUrl: job?.mailApiUrl || "", mailRequestBody: job?.mailRequestBody || "" } };
   },
-  isAccountBusy: (email) => emailJobLocks.has(email.toLowerCase()) || mfaWorkspace.isBusy(email) || rebindWorkspace.isBusy(email)
+  isAccountBusy: (email) => emailJobLocks.has(email.toLowerCase()) || mfaWorkspace.isBusy(email) || rebindWorkspace.isBusy(email) || Boolean(teamWorkspace?.isBusy(email))
     || [...jobs.values()].some((job) => job.email.toLowerCase() === email.toLowerCase() && (isActive(job.status) || job.child)),
   mailRequest: () => mailRequestConfig, runAccount: createOfferRunner(PROTOCOL_SCRIPT), requestSchedule: options.requestSchedule,
+});
+if (options.teamVault || options.rebindVault) teamWorkspace = await createTeamWorkspace({
+  root: OUTPUT_ROOT, vault: options.teamVault || options.rebindVault, proxyPool,
+  parseText: (value) => parseBatchEntries(value, mailRequestConfig), listSources: rebindSources,
+  resolveSource: resolveTeamSource, runLogin: createOfferRunner(PROTOCOL_SCRIPT, { loginOnly: true }),
+  clientFactory: options.teamClientFactory,
+  isAccountBusy: (email) => emailJobLocks.has(email.toLowerCase()) || mfaWorkspace.isBusy(email) || rebindWorkspace.isBusy(email) || offerWorkspace.isBusy(email)
+    || [...jobs.values()].some((job) => job.email.toLowerCase() === email.toLowerCase() && (isActive(job.status) || job.child)),
+  canUse: options.isEnabled, requestSchedule: options.requestSchedule, mailRequest: () => mailRequestConfig,
 });
 scheduleQueuedJobs();
 scheduleSub2ApiMonitor();
@@ -292,6 +304,7 @@ async function handleApi(req, res, requestUrl) {
         mfaChange: true,
         emailRebind: true,
         offerCheck: true,
+        teamManagement: Boolean(teamWorkspace),
         passwordAdd: true,
         forceRelogin: true,
       },
@@ -310,6 +323,7 @@ async function handleApi(req, res, requestUrl) {
   }
   if (requestUrl.pathname.startsWith("/api/rebind/")) { await handleRebindApi(req, res, requestUrl); return; }
   if (requestUrl.pathname.startsWith("/api/offers/")) { await handleOfferApi(req, res, requestUrl); return; }
+  if (requestUrl.pathname.startsWith("/api/teams/")) { await handleTeamApi(req, res, requestUrl); return; }
 
   if (req.method === "GET" && requestUrl.pathname === "/api/jobs") {
     const requestedPage = Math.max(1, Number.parseInt(requestUrl.searchParams.get("page") || "1", 10) || 1);
@@ -984,6 +998,7 @@ async function handleMfaApi(req, res, requestUrl) {
 }
 
 function assertMfaIdle(email) {
+  if (teamWorkspace?.isBusy(email)) throw httpError(409, "该账号正在执行团队管理任务，请稍后重试");
   if (offerWorkspace?.isBusy(email)) throw httpError(409, "该账号正在进行优惠检测，请先结束当前检测");
   if (rebindWorkspace?.isBusy(email)) throw httpError(409, "该账号正在进行邮箱换绑，请先完成或停止当前任务");
   if (mfaWorkspace?.isBusy(email)) throw httpError(409, "该账号正在进行 MFA 修改，请等待当前操作结束");
@@ -1049,6 +1064,50 @@ async function resolveRebindSource(sourceRef, email) {
   return { session, cookies, credentials: { password: job?.password || stored.password || mfaCredentials.password || "",
     totpSecret: mfaCredentials.totpSecret || job?.totpSecret || stored.totpSecret || "",
     proxyUrl: job?.proxyUrl || stored.proxyUrl || mfaCredentials.proxyUrl || "" } };
+}
+
+async function resolveTeamSource(sourceRef, email) {
+  const source = rebindSources().find((row) => row.id === sourceRef && row.email === email);
+  if (!source) return null;
+  if (source.busy) throw httpError(409, "账号正在执行其他任务");
+  let snapshot; try { snapshot = await resolveRebindSource(sourceRef, email); } catch {}
+  const job = findJobByEmail(email), stored = await loadStoredLoginCredentials(email);
+  const mfa = mfaWorkspace.list().accounts.find((row) => row.email === email);
+  const mfaCredentials = mfa ? await mfaCredentialStore.load(`${mfaCredentialPrefix}${email}`) : {};
+  let session = snapshot?.session || null;
+  if (!session && job?.outputPath) {
+    try { const data = JSON.parse(await fs.readFile(job.outputPath, "utf8")); if (data.type === "sub2api-data") session = data; } catch {}
+  }
+  return { session, credentials: { ...stored, ...mfaCredentials, ...snapshot?.credentials,
+    mailApiUrl: job?.mailApiUrl || "", mailRequestBody: job?.mailRequestBody || "" } };
+}
+
+async function handleTeamApi(req, res, url) {
+  if (!teamWorkspace) throw httpError(503, "团队管理存储尚未初始化");
+  const route = url.pathname.slice("/api/teams/".length);
+  if (req.method === "GET" && route === "sources") { sendJson(res, 200, teamWorkspace.sources()); return; }
+  if (req.method === "GET" && route === "state") { sendJson(res, 200, teamWorkspace.query()); return; }
+  if (req.method !== "POST") throw httpError(405, "请求方法不支持");
+  const body = await readJson(req), actor = req.actorId || options.cdkId;
+  if (route === "query") { sendJson(res, 200, teamWorkspace.query(body)); return; }
+  if (route === "import/preview") { sendJson(res, 200, teamWorkspace.preview(body)); return; }
+  if (route === "import") { sendJson(res, 200, await teamWorkspace.importAccounts(body, actor)); return; }
+  if (route === "sync") { sendJson(res, 200, await teamWorkspace.queue(body, actor)); return; }
+  const accountMatch = /^accounts\/([a-zA-Z0-9-]+)\/(login|input|cancel)$/.exec(route);
+  if (accountMatch) {
+    const [, id, action] = accountMatch;
+    const result = action === "login" ? await teamWorkspace.queue({ ids: [id] }, actor, "login")
+      : action === "input" ? teamWorkspace.input(id, body) : await teamWorkspace.cancel(id);
+    sendJson(res, 200, result); return;
+  }
+  const teamMatch = /^([a-zA-Z0-9-]+)\/(query|select-account|invite-preview|invite|remove)$/.exec(route);
+  if (!teamMatch) throw httpError(404, "团队接口不存在");
+  const [, id, action] = teamMatch;
+  const result = action === "query" ? teamWorkspace.detail(id, body)
+    : action === "select-account" ? await teamWorkspace.selectAccount(id, body.accountId)
+    : action === "invite-preview" ? teamWorkspace.invitePreview(id, body)
+    : await teamWorkspace.mutate(id, body, actor, action);
+  sendJson(res, 200, result);
 }
 
 async function handleRebindApi(req, res, url) {
@@ -1425,7 +1484,7 @@ function scheduleQueuedJobs(coordinator = false) {
   let availableSlots = Math.min(1, MAX_ACTIVE_JOBS - [...jobs.values()].filter(occupiesActiveSlot).length, options.availableSlots());
   if (availableSlots <= 0) return;
   const queuedJobs = [...jobs.values()]
-    .filter((job) => job.status === "queued" && !emailJobLocks.has(job.email.toLowerCase()) && !mfaWorkspace?.isBusy(job.email) && !rebindWorkspace?.isBusy(job.email) && !offerWorkspace?.isBusy(job.email))
+    .filter((job) => job.status === "queued" && !emailJobLocks.has(job.email.toLowerCase()) && !mfaWorkspace?.isBusy(job.email) && !rebindWorkspace?.isBusy(job.email) && !offerWorkspace?.isBusy(job.email) && !teamWorkspace?.isBusy(job.email))
     .sort((a, b) => String(a.queuedAt || a.createdAt).localeCompare(String(b.queuedAt || b.createdAt)));
   let started = 0;
   for (const job of queuedJobs.slice(0, availableSlots)) {
@@ -4773,7 +4832,7 @@ function canForceRelogin(job) {
 }
 
 function canChangeMfa(job) {
-  return !isActive(job.status) && !job.child && !mfaWorkspace?.isBusy(job.email) && !rebindWorkspace?.isBusy(job.email) && !offerWorkspace?.isBusy(job.email)
+  return !isActive(job.status) && !job.child && !mfaWorkspace?.isBusy(job.email) && !rebindWorkspace?.isBusy(job.email) && !offerWorkspace?.isBusy(job.email) && !teamWorkspace?.isBusy(job.email)
     && Boolean(job.resultSaved || job.accountSessionAvailable);
 }
 
@@ -6312,6 +6371,7 @@ async function shutdown() {
       mfaWorkspace?.shutdown(),
       rebindWorkspace?.shutdown(),
       offerWorkspace?.shutdown(),
+      teamWorkspace?.shutdown(),
       sub2ApiMonitorPromise,
       ...sub2ApiRequestPromises,
       ...sub2ApiAutoRepairPromises,
@@ -6370,7 +6430,7 @@ function planImport(mode, body) {
   }
   for (const email of emails) {
     const existing = findJobByEmail(email);
-    if ((mode === "mfa" && existing && isActive(existing.status) && existing.status !== "queued") || mfaWorkspace.isBusy(email) || rebindWorkspace.isBusy(email) || offerWorkspace.isBusy(email)) throw httpError(409, "部分账号正在执行任务，请结束后再更新导入资料");
+    if ((mode === "mfa" && existing && isActive(existing.status) && existing.status !== "queued") || mfaWorkspace.isBusy(email) || rebindWorkspace.isBusy(email) || offerWorkspace.isBusy(email) || teamWorkspace?.isBusy(email)) throw httpError(409, "部分账号正在执行任务，请结束后再更新导入资料");
   }
   return [...new Set(emails)];
 }
@@ -6435,12 +6495,12 @@ return {
   inventory() { return [...new Set([...listUniqueJobs().map((job) => job.email.toLowerCase()), ...mfaWorkspace.list().accounts.map((account) => account.email.toLowerCase())])]; },
   publicJobs: () => listUniqueJobs().map(publicJob),
   refreshPoolStatus: refreshSmsPoolStates,
-  activeCount: () => [...jobs.values()].filter(occupiesActiveSlot).length + (offerWorkspace?.activeCount() || 0),
+  activeCount: () => [...jobs.values()].filter(occupiesActiveSlot).length + (offerWorkspace?.activeCount() || 0) + (teamWorkspace?.activeCount() || 0),
   pendingCount: () => [...jobs.values()].filter((job) => job.status === "queued").length,
-  checkOfferAccess: () => offerWorkspace?.tick(0),
+  checkOfferAccess: () => { offerWorkspace?.tick(0); teamWorkspace?.tick(0); },
   resume() { queueSchedulingPaused = false; scheduleQueuedJobs(); },
   pause() { queueSchedulingPaused = true; },
-  tick: () => { const started = scheduleQueuedJobs(true) || 0; return started + (offerWorkspace?.tick(Math.max(0, options.availableSlots() - started)) || 0); },
+  tick: () => { const started = scheduleQueuedJobs(true) || 0; const offers = offerWorkspace?.tick(Math.max(0, options.availableSlots() - started)) || 0; return started + offers + (teamWorkspace?.tick(Math.max(0, options.availableSlots() - started - offers)) || 0); },
   async stop() {
     queueSchedulingPaused = true;
     await cancelAllJobs();
@@ -6449,6 +6509,7 @@ return {
     const rebindIds = rebindWorkspace.list().items.map((item) => item.id);
     if (rebindIds.length) await rebindWorkspace.cancel(rebindIds);
     await offerWorkspace?.stopAll();
+    await teamWorkspace?.stopAll();
     queueSchedulingPaused = true;
   },
   shutdown,

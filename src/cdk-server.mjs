@@ -163,6 +163,7 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
         smsProviderAllowed: (providerId) => store.smsProviderAllowed(id, providerId),
         rebindVault: { seal: (value, scope) => vault.seal(value, `rebind:${id}:${scope}`), open: (value, scope) => vault.open(value, `rebind:${id}:${scope}`) },
         offerVault: { seal: (value, scope) => vault.seal(value, `offers:${id}:${scope}`), open: (value, scope) => vault.open(value, `offers:${id}:${scope}`) },
+        teamVault: { seal: (value, scope) => vault.seal(value, `team:${id}:${scope}`), open: (value, scope) => vault.open(value, `team:${id}:${scope}`) },
         offerCanUse: () => !shuttingDown && store.get(id)?.status === "active" && store.get(id).balance >= 1,
         legacyUsed: (email) => store.legacyUsed(id, email),
         markLegacyUsed: (email) => store.markLegacyUsed(id, email),

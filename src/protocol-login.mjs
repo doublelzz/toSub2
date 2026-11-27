@@ -323,13 +323,14 @@ async function run() {
       args.tlsProfile
       || process.env.TOSUB2_TLS_PROFILE
       || DEFAULT_TLS_PROFILE,
-    verbose: Boolean(args.verbose && !args.rotateTotp && !args.logoutAll && !args.rebindOperation && !args.offerCheck),
+    verbose: Boolean(args.verbose && !args.rotateTotp && !args.logoutAll && !args.rebindOperation && !args.offerCheck && !args.teamLogin),
     maxProxySessionAttempts: process.env.CHATGPT_PROXY_MAX_ATTEMPTS || 10,
     proxyPoolEnabled: process.env.CHATGPT_PROXY_POOL_ENABLED === "1",
     sameProxyRiskRetryDelayMs: process.env.CHATGPT_SAME_PROXY_RISK_RETRY_DELAY_MS,
   });
   try {
     if (args.offerCheck) { await runOfferProtocol({ chatgptBase, authBase, transport, proxyTemplate }); return; }
+    if (args.teamLogin) { await runOfferProtocol({ chatgptBase, authBase, transport, proxyTemplate, loginOnly: true }); return; }
     if (args.rebindOperation) {
       if (!args.rebindResult) throw new Error("Email rebind result path is required");
       let result;
@@ -755,7 +756,7 @@ async function run() {
   }
 }
 
-async function runOfferProtocol({ chatgptBase, authBase, transport, proxyTemplate }) {
+async function runOfferProtocol({ chatgptBase, authBase, transport, proxyTemplate, loginOnly = false }) {
   const channel = createLineReader({ input, crlfDelay: Infinity });
   const pending = new Map(); const attempts = {};
   const send = (message) => output.write(`${JSON.stringify(message)}\n`);
@@ -795,6 +796,11 @@ async function runOfferProtocol({ chatgptBase, authBase, transport, proxyTemplat
       } catch (error) { throw offerProtocolFailure(error, "offer_request", Boolean(proxyTemplate)); }
     };
     let result;
+    if (loginOnly && payload.session) {
+      offerIdentity(payload.session, email);
+      send({ type: "result", result: { session: payload.session } });
+      return;
+    }
     if (payload.session) {
       try { result = await checkOffer(payload.session, email, request); }
       catch (error) { if (!["unauthorized", "token_expired", "authorization_invalid"].includes(error.offerCode)) throw error; }
@@ -814,12 +820,12 @@ async function runOfferProtocol({ chatgptBase, authBase, transport, proxyTemplat
       stage = "session_request";
       const { data } = await client.getJson("GET", `${chatgptBase}/api/auth/session`, { referer: `${chatgptBase}/` });
       const session = { type: "chatgpt-session", version: 1, email: data?.user?.email, accessToken: data?.accessToken,
-        expiresAt: data?.expires, deviceId: web.deviceId, chatgptBase };
+        expiresAt: data?.expires, deviceId: web.deviceId, chatgptBase, tlsProfile: transport.profile };
       stage = "session_identity";
       session.accountId = offerIdentity(session, email).accountId;
       send({ type: "session", session });
       stage = "offer_request";
-      result = await checkOffer(session, email, request);
+      result = loginOnly ? { session } : await checkOffer(session, email, request);
     }
     send({ type: "result", result });
   } catch (error) { const failure = offerProtocolFailure(error, error.offerStage || stage, Boolean(proxyTemplate)); send({ type: "error", code: failure.offerCode, retryable: failure.retryable === true, stage: failure.offerStage || stage }); }
@@ -2757,6 +2763,7 @@ function parseArgs(argv) {
     else if (item === "--rotate-totp") args.rotateTotp = true;
     else if (item === "--logout-all") args.logoutAll = true;
     else if (item === "--offer-check") args.offerCheck = true;
+    else if (item === "--team-login") args.teamLogin = true;
     else if (item === "--rebind-operation") args.rebindOperation = argv[++i];
     else if (item === "--rebind-result") args.rebindResult = argv[++i];
     else if (item.startsWith("--mfa-session=")) args.mfaSession = item.slice("--mfa-session=".length);

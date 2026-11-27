@@ -32,6 +32,7 @@ import {
   Smartphone,
   PhoneIncoming,
   Trash2,
+  Users,
   X,
 } from "lucide-react";
 import "./styles.css";
@@ -39,6 +40,7 @@ import "./workspace.css";
 import MfaWorkspace from "./MfaWorkspace.jsx";
 import EmailRebindWorkspace, { AuthorizationRebindDialog } from "./EmailRebindWorkspace.jsx";
 import OfferWorkspace from "./OfferWorkspace.jsx";
+import TeamWorkspace from "./TeamWorkspace.jsx";
 import SmsPoolWorkspace, { SmsPoolChoice, SmsPoolChargeDialog } from "./SmsPoolWorkspace.jsx";
 import CdkGate from "./CdkGate.jsx";
 import CdkWorkspace from "./CdkWorkspace.jsx";
@@ -1224,6 +1226,7 @@ function App({ auth }) {
         <div className="brand-block"><div className="brand-mark"><ShieldCheck size={21} /></div><h1>账号工作台</h1></div>
         <nav className="workspace-tabs" aria-label="工作区">
           <button type="button" className={activeWorkspace === "authorization" ? "active" : ""} aria-pressed={activeWorkspace === "authorization"} onClick={() => setActiveWorkspace("authorization")}><LogIn size={17} />账号授权</button>
+          <button type="button" className={activeWorkspace === "teams" ? "active" : ""} aria-pressed={activeWorkspace === "teams"} onClick={() => setActiveWorkspace("teams")}><Users size={17} />Team 空间</button>
           <button type="button" className={activeWorkspace === "mfa" ? "active" : ""} aria-pressed={activeWorkspace === "mfa"} onClick={() => setActiveWorkspace("mfa")}><ShieldCheck size={17} />MFA 修改</button>
           <button type="button" className={activeWorkspace === "rebind" ? "active" : ""} aria-pressed={activeWorkspace === "rebind"} onClick={() => setActiveWorkspace("rebind")}><MailCheck size={17} />邮箱换绑</button>
           <button type="button" className={activeWorkspace === "offers" ? "active" : ""} aria-pressed={activeWorkspace === "offers"} onClick={() => setActiveWorkspace("offers")}><Sparkles size={17} />优惠检测</button>
@@ -1240,7 +1243,7 @@ function App({ auth }) {
       </aside>
       <div className="workspace-content">
       <header className="topbar">
-        <div className="workspace-path"><span>工作区</span><ChevronRight size={14} /><strong>{({ authorization: "账号授权", mfa: "MFA 修改", rebind: "邮箱换绑", offers: "优惠检测", "sms-pool": "接码池", "cdk-mine": "我的 CDK", "cdk-management": "CDK 管理", "cdk-security": "安全中心", announcement: "公告管理" })[activeWorkspace]}</strong></div>
+        <div className="workspace-path"><span>工作区</span><ChevronRight size={14} /><strong>{({ authorization: "账号授权", teams: "Team 空间", mfa: "MFA 修改", rebind: "邮箱换绑", offers: "优惠检测", "sms-pool": "接码池", "cdk-mine": "我的 CDK", "cdk-management": "CDK 管理", "cdk-security": "安全中心", announcement: "公告管理" })[activeWorkspace]}</strong></div>
         <div className="topbar-actions cdk-session-actions">
           {auth.announcement?.enabled && <AnnouncementEntry announcement={auth.announcement} />}
           <CurrentCdk auth={auth} onOpen={() => setActiveWorkspace("cdk-mine")} />
@@ -1261,6 +1264,7 @@ function App({ auth }) {
       {activeWorkspace === "announcement" && adminView && auth.account.role === "admin" && <AnnouncementManager token={token} onChanged={auth.reload} onStateChange={reportAnnouncementState} />}
       {activeWorkspace === "sms-pool" && auth.account.role === "admin" && <SmsPoolWorkspace token={token} />}
       {activeWorkspace === "offers" && <OfferWorkspace token={token} balance={auth.workspace.balance} />}
+      {activeWorkspace === "teams" && <TeamWorkspace key={auth.workspace.id} token={token} />}
       {activeWorkspace === "rebind" && <EmailRebindWorkspace token={token} initialTab={rebindInitialTab} onOpenAuthorization={() => { setPhoneTab("disabled"); setFilters(DEFAULT_FILTERS); setPage(1); setSelectedJobIds(new Set()); setExpandedJobId(null); setEmailFilter([]); setActiveWorkspace("authorization"); }} />}
       {activeWorkspace === "mfa" && <MfaWorkspace token={token} defaultProxyUrl={accountProxyUrl} focusAccountId={mfaFocusAccountId} onReconnect={() => setConnectionAttempt((current) => current + 1)} onOpenAuthorization={() => {
         setPhoneTab("disabled"); setFilters(DEFAULT_FILTERS); setEmailFilter([]); setSelectedJobIds(new Set()); setExpandedJobId(null); setPage(1); setActiveWorkspace("authorization");
