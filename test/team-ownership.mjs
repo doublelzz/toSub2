@@ -1,0 +1,64 @@
+import assert from "node:assert/strict";
+import crypto from "node:crypto";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { createCdkVault } from "../src/cdk-vault.mjs";
+import { createTeamWorkspace } from "../src/team-workspace.mjs";
+import { createTeamClient } from "../src/team-client.mjs";
+import { createTeamFixture, fixtureSession, TEAM_A, TEAM_B } from "./team-fixture.mjs";
+
+const root = await fs.mkdtemp(path.join(os.tmpdir(), "tosub2-team-ownership-")), fixture = await createTeamFixture();
+const previousKey = process.env.TOSUB2_ENCRYPTION_KEY; process.env.TOSUB2_ENCRYPTION_KEY = crypto.randomBytes(32).toString("base64");
+const vault = await createCdkVault(root);
+let workspace;
+const space = fixture.state.spaces.get(TEAM_A); space.members = space.members.filter((row) => row.email === "owner@example.com");
+const member = (email, id) => ({ id, account_user_id: `membership-${id}`, name: email, email, role: "standard-user", seat_type: "default", created_time: new Date().toISOString() });
+async function wait() { const until = Date.now() + 5000; while (Date.now() < until) { workspace.tick(3); if (!workspace.query().overview.active) return; await new Promise((resolve) => setTimeout(resolve, 15)); } throw new Error("Ownership fixture did not settle"); }
+const key = () => crypto.randomUUID();
+try {
+  workspace = await createTeamWorkspace({ root, vault, parseText: () => [], clientFactory: (options) => createTeamClient({ ...options, chatgptBase: fixture.base }) });
+  const raw = JSON.stringify(["owner@example.com", "second@example.com"].map((email) => fixtureSession(email, fixture.base)));
+  const preview = workspace.preview({ text: raw });
+  const imported = await workspace.importAccounts({ text: raw, digest: preview.digest, requestKey: key() }, "test-owner"); await wait();
+  const account1 = imported.accounts.find((row) => row.email === "owner@example.com"), account2 = imported.accounts.find((row) => row.email === "second@example.com");
+  let team = workspace.query().rows.find((row) => row.workspaceId === TEAM_A);
+  const demote = { accountId: account1.id, memberId: "user-owner", memberEmail: account1.email, previousRole: "account-owner", role: "standard-user", requestKey: key() };
+  await assert.rejects(workspace.mutate(team.id, demote, "operator", "role"), /最后一位所有者/);
+  assert.equal(fixture.state.requests.some((row) => row.method === "PATCH"), false);
+  const invited = await workspace.mutate(team.id, { accountId: account1.id, emails: [account2.email], requestKey: key() }, "operator", "invite");
+  assert.equal(invited.results[0].status, "invited");
+  await assert.rejects(workspace.mutate(team.id, { accountId: account1.id, memberId: "user-second", memberEmail: account2.email, previousRole: "standard-user", role: "account-owner", requestKey: key() }, "operator", "role"), /成员身份/);
+  // Acceptance belongs to account2's invitation flow; simulate the official membership transition.
+  space.members.push(member(account2.email, "user-second")); space.invites = [];
+  await workspace.queue({ ids: [account2.id] }, "operator"); await wait();
+  team = workspace.detail(team.id).team; assert.equal(team.accounts.length, 2);
+  const promotion = { accountId: account1.id, memberId: "user-second", memberEmail: account2.email, previousRole: "standard-user", role: "account-owner", requestKey: key() };
+  const promoted = await workspace.mutate(team.id, promotion, "operator", "role"); assert.equal(promoted.role, "account-owner");
+  const patches = () => fixture.state.requests.filter((row) => row.method === "PATCH").length;
+  const patchCount = patches(); assert.deepEqual(await workspace.mutate(team.id, promotion, "operator", "role"), promoted); assert.equal(patches(), patchCount);
+  const changed = await workspace.mutate(team.id, { ...demote, requestKey: key() }, "operator", "role");
+  assert.equal(changed.selfChanged, true); assert.equal(space.members.find((row) => row.email === account1.email).role, "standard-user");
+  assert.equal(workspace.detail(team.id).team.capabilities.canRemove, false, "self demotion immediately drops owner capabilities");
+  await assert.rejects(workspace.mutate(team.id, { accountId: account1.id, memberId: "user-owner", memberEmail: account1.email, requestKey: key() }, "operator", "remove"), /没有移除/);
+  await workspace.selectAccount(team.id, account2.id, "operator"); await wait();
+  assert.equal(workspace.detail(team.id).team.capabilities.canChangeRoles, true);
+  assert.equal(workspace.detail(team.id).items.find((row) => row.email === account1.email).canRemove, true);
+  const removed = await workspace.mutate(team.id, { accountId: account2.id, memberId: "user-owner", memberEmail: account1.email, requestKey: key() }, "operator", "remove");
+  assert.equal(removed.success, true); assert.equal(space.members.some((row) => row.email === account1.email), false);
+  const after = workspace.detail(team.id).team; assert.equal(after.accounts.length, 1); assert.equal(after.accountId, account2.id); assert.equal(after.accounts[0].email, account2.email);
+  assert.ok(workspace.query().rows.some((row) => row.workspaceId === TEAM_B && row.email === account1.email), "removal preserves account1's unrelated teams");
+  assert.deepEqual(workspace.inventory().sort(), [account1.email, account2.email].sort(), "member removal must not delete credentials or reset charged inventory");
+  await assert.rejects(workspace.mutate(team.id, { accountId: account2.id, memberId: "user-second", memberEmail: account2.email, previousRole: "account-owner", role: "standard-user", requestKey: key() }, "operator", "role"), /最后一位所有者/);
+  space.members.push(member("third@example.com", "user-third"));
+  const uncertain = { accountId: account2.id, memberId: "user-third", memberEmail: "third@example.com", previousRole: "standard-user", role: "account-owner", requestKey: key() };
+  fixture.state.nextRole = "disconnect";
+  await assert.rejects(workspace.mutate(team.id, uncertain, "operator", "role"), { code: "TEAM_NETWORK" });
+  const unknownCount = patches();
+  await assert.rejects(workspace.mutate(team.id, { ...uncertain, requestKey: key() }, "operator", "role"), /尚未确认/);
+  await workspace.queue({ ids: [account2.id] }, "operator"); await wait();
+  assert.equal((await workspace.mutate(team.id, uncertain, "operator", "role")).reconciled, true); assert.equal(patches(), unknownCount);
+  assert.ok(workspace.detail(team.id).team.logs.some((row) => row.action === "role"));
+  assert.equal(fixture.state.requests.some((row) => /subscriptions\/update/.test(row.path)), false);
+  console.log("Team ownership passed: invite/accept account2, promote owner2, self-demote owner1, switch manager, remove owner1, preserve other teams, last-owner guard and uncertain role reconciliation");
+} finally { await workspace?.shutdown(); await fixture.close(); await fs.rm(root, { recursive: true, force: true }); if (previousKey === undefined) delete process.env.TOSUB2_ENCRYPTION_KEY; else process.env.TOSUB2_ENCRYPTION_KEY = previousKey; }

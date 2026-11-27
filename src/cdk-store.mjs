@@ -102,6 +102,7 @@ export async function createCdkStore(root, vault) {
     importConsumed: -db.prepare("SELECT COALESCE(SUM(delta),0) AS total FROM ledger WHERE cdk_id=? AND kind='import'").get(row.id).total,
     smsPoolConsumed: -db.prepare("SELECT COALESCE(SUM(delta),0) AS total FROM ledger WHERE cdk_id=? AND kind='sms-pool'").get(row.id).total,
     allowedSmsProviders: allowedSmsProviders(row),
+    teamManagementEnabled: teamManagementEnabled(row),
     everConsumed: Boolean(row.ever_consumed), note: row.note, createdAt: new Date(row.created_at).toISOString(), lastLogin: row.last_login ? new Date(row.last_login).toISOString() : null, accounts: db.prepare("SELECT COUNT(*) AS total FROM accounts WHERE cdk_id=? AND deleted_at IS NULL").get(row.id).total } : null;
   const requireActive = (id) => { const row = get(id); if (!row || row.status !== "active") throw cdkError(403, "CDK 已失效或被禁用"); return row; };
   const setting = (id, name) => { const row = db.prepare("SELECT value FROM settings WHERE cdk_id=? AND name=?").get(id, name); return row ? vault.open(row.value, `${id}:${name}`) : null; };
@@ -112,6 +113,7 @@ export async function createCdkStore(root, vault) {
     const permissions = setting(row.id, "sms-permissions");
     return CDK_SMS_PROVIDER_IDS.filter((id) => id === "custom" || permissions?.allowedSmsProviders?.includes(id));
   };
+  const teamManagementEnabled = (row) => Boolean(row && (row.role === "admin" || setting(row.id, "team-permissions")?.enabled === true));
   let administrator = db.prepare("SELECT * FROM cdks WHERE role='admin' ORDER BY created_at LIMIT 1").get();
   if (!administrator) {
     const secret = process.env.TOSUB2_ADMIN_CDK || randomSecret("TS2-ADMIN");
@@ -251,6 +253,7 @@ export async function createCdkStore(root, vault) {
     adminId, publicCdk,
     allowedSmsProviders: (id) => allowedSmsProviders(get(id)),
     smsProviderAllowed(id, providerId) { const row = get(id); return row?.status === "active" && allowedSmsProviders(row).includes(providerId); },
+    teamManagementAllowed(id) { const row = get(id); return row?.status === "active" && teamManagementEnabled(row); },
     get: (id) => publicCdk(get(id)),
     list: () => db.prepare("SELECT * FROM cdks ORDER BY role,created_at DESC").all().map(publicCdk),
     rawIds: () => db.prepare("SELECT id,role,status FROM cdks").all(),
@@ -567,16 +570,19 @@ export async function createCdkStore(root, vault) {
     markLegacyUsed(id, email) { db.prepare("INSERT INTO legacy_credentials VALUES(?,?,?) ON CONFLICT(cdk_id,email) DO NOTHING").run(id, email.toLowerCase(), Date.now()); },
     markLegacyUsedMany(id, emails) { if (emails.length) transaction(() => { for (const email of emails) store.markLegacyUsed(id, email); }); },
     readInitialSecret() { return transaction(() => { const value = setting(adminId, "initial-secret"); db.prepare("DELETE FROM settings WHERE cdk_id=? AND name='initial-secret'").run(adminId); return value?.secret || null; }); },
-    generate({ count, quota, note, allowedSmsProviders: requestedProviders }, actor) {
+    generate({ count, quota, note, allowedSmsProviders: requestedProviders, teamManagementEnabled: requestedTeam }, actor) {
       count = positiveInteger(count, "数量", 100); quota = positiveInteger(quota, "初始次数"); note = String(note || "").trim().slice(0, 160);
       const providers = requestedProviders === undefined ? ["custom"] : normalizeSmsPermissions(requestedProviders);
       if (requestedProviders !== undefined && get(actor)?.role !== "admin") throw cdkError(403, "需要管理员权限");
+      if (requestedTeam !== undefined && typeof requestedTeam !== "boolean") throw cdkError(422, "Team 空间权限必须为开启或关闭");
+      if (requestedTeam !== undefined && get(actor)?.role !== "admin") throw cdkError(403, "需要管理员权限");
       return transaction(() => Array.from({ length: count }, () => {
         let secret; let hash;
         do { secret = randomSecret(); hash = secretHash(secret); } while (db.prepare("SELECT 1 FROM cdks WHERE secret_hash=?").get(hash));
         const id = crypto.randomUUID(); db.prepare("INSERT INTO cdks(id,secret_hash,label,role,balance,note,created_at) VALUES(?,?,?,'user',?,?,?)").run(id, hash, `TS2-••••-${secret.slice(-4)}`, quota, note, Date.now());
         saveSetting(id, "login-secret", { secret });
         saveSetting(id, "sms-permissions", { allowedSmsProviders: providers });
+        saveSetting(id, "team-permissions", { enabled: requestedTeam === true });
         ledger(id, "issue", quota, id, note || "初始发放", actor); audit(actor, "generate-cdk", id, { quota });
         return { ...publicCdk(get(id)), secret };
       }));
@@ -584,6 +590,14 @@ export async function createCdkStore(root, vault) {
     update(id, patch, actor) {
       return transaction(() => {
         const row = get(id); if (!row) throw cdkError(404, "CDK 不存在");
+        if (Object.hasOwn(patch, "teamManagementEnabled")) {
+          if (get(actor)?.role !== "admin") throw cdkError(403, "需要管理员权限");
+          if (row.role === "admin") throw cdkError(409, "管理员始终拥有 Team 空间权限");
+          if (typeof patch.teamManagementEnabled !== "boolean") throw cdkError(422, "Team 空间权限必须为开启或关闭");
+          if (!patch.teamManagementEnabled && db.prepare("SELECT 1 FROM imports WHERE cdk_id=? AND mode='team' AND status='pending'").get(id)) throw cdkError(409, "团队账号正在提交导入，请完成后再关闭权限");
+          saveSetting(id, "team-permissions", { enabled: patch.teamManagementEnabled });
+          audit(actor, "cdk-team-permissions", id, { enabled: patch.teamManagementEnabled });
+        }
         if (Object.hasOwn(patch, "allowedSmsProviders")) {
           if (get(actor)?.role !== "admin") throw cdkError(403, "需要管理员权限");
           if (row.role === "admin") throw cdkError(409, "管理员始终拥有全部接码方式，无需配置");

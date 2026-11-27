@@ -108,6 +108,8 @@
 .team-member-name strong > small { display: inline; margin-left: 4px; }
 .team-member-avatar { width: 30px; height: 30px; font-size: 12px; border-radius: 7px; }
 .team-member-table .team-danger { color: var(--danger); font-size: 12px; }
+.team-role-select { width: 100%; min-height: 34px; padding: 5px; border: 1px solid var(--line); border-radius: 6px; color: var(--ink); background: var(--surface); font: inherit; font-size: 12px; }
+.team-billing-preview { font-variant-numeric: tabular-nums; }
 .team-section-errors { margin-bottom: 17px; padding: 11px 13px; background: var(--amber-soft); color: var(--amber); border-radius: 8px; font-size: 12px; line-height: 1.8; }
 .team-section-errors p { margin: 0; }
 .team-drawer-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 28px; border-top: 1px solid var(--line); padding-top: 17px; color: var(--muted); font-size: 12px; }
@@ -117,7 +119,7 @@
 .team-logs strong { font-weight: 500; }
 .team-logs p { margin: 5px 0; overflow-wrap: anywhere; }
 .team-logs small { color: var(--muted); font-size: 11px; }
-.team-modal-backdrop { z-index: 60; }
+.team-modal-backdrop { z-index: 60; justify-content: center; align-items: center; padding: 24px; }
 .team-dialog { width: 590px; max-height: 90vh; overflow-y: auto; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); color: var(--ink); box-shadow: 0 16px 50px var(--shadow); }
 .team-dialog-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; padding: 21px 24px 18px; border-bottom: 1px solid var(--line); }
 .team-dialog-heading h2 { margin: 0; font-size: 18px; font-weight: 600; }

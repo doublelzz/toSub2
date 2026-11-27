@@ -51,6 +51,10 @@ try {
   } });
   await act(async () => root.render(React.createElement(CdkWorkspace, { auth: adminAuth, section: "management", onNavigate() {} })));
   await click("详情");
+  assert.equal(checkbox("开放 Team 空间").checked, false);
+  await check("开放 Team 空间"); await click("保存 Team 权限");
+  assert.deepEqual(calls.findLast((call) => call.method === "PATCH").body, { teamManagementEnabled: true });
+  assert.equal(checkbox("开放 Team 空间").checked, true);
   assert.equal(checkbox("允许自定义接码").checked, true); assert.equal(checkbox("允许自定义接码").disabled, true);
   for (const label of ["允许鲁班接码", "允许SMSBower", "允许Hero SMS", "允许大西瓜接码", "允许接码池"]) assert.equal(checkbox(label).checked, false, "old and new ordinary CDKs default to custom only");
   await check("允许SMSBower"); await click("保存接码权限");
@@ -60,10 +64,12 @@ try {
   assert.deepEqual(calls.findLast((call) => call.method === "PATCH").body, { allowedSmsProviders: ["custom"] });
   await act(async () => document.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
   await click("生成 CDK");
+  assert.equal(checkbox("开放 Team 空间").checked, false); await check("开放 Team 空间");
   assert.equal(checkbox("允许SMSBower").checked, false); await check("允许Hero SMS");
   await fill(container.querySelector('input[name="note"]'), "New fixture");
   await click("生成并显示 CDK");
   assert.deepEqual(calls.findLast((call) => call.method === "POST").body.allowedSmsProviders, ["custom", "herosms"], "generation can grant providers before the CDK is issued");
+  assert.equal(calls.findLast((call) => call.method === "POST").body.teamManagementEnabled, true);
 
   const definitions = [
     { id: "luban", name: "鲁班接码", fields: [{ key: "apiKey", label: "API Key" }] },
@@ -74,6 +80,7 @@ try {
     { id: "pool", name: "接码池", fields: [] },
   ];
   let featureProviders = [definitions[4]];
+  let teamAllowed = false;
   let permissionChanges = 0;
   window.addEventListener("cdk-sms-permissions-changed", () => { permissionChanges++; });
   const savedSettings = [];
@@ -83,10 +90,10 @@ try {
   ];
   const { SmsServiceSelector } = await load("../web/src/SmsServiceSelector.jsx", ["SmsServiceSelector"]);
   let stored = { selectedProviderId: "herosms", configs: { custom: { entries: "+12025550123----https://fixture.example.invalid/code" }, herosms: { apiKey: "hidden-fixture-key" } } };
-  const auth = () => ({ authenticated: true, token: "fixture-user-token", account: ordinary, workspace: ordinary, features: { smsProviders: featureProviders, allowedSmsProviders: featureProviders.map((row) => row.id), bulkActions: true }, logout: async () => {} });
+  const auth = () => ({ authenticated: true, token: "fixture-user-token", account: ordinary, workspace: ordinary, features: { teamManagement: teamAllowed, smsProviders: featureProviders, allowedSmsProviders: featureProviders.map((row) => row.id), bulkActions: true }, logout: async () => {} });
   const { App, withSmsProviderDefaults } = await load("../web/src/main.jsx", ["App", "withSmsProviderDefaults"], {
     ...filters, ...smsOptions, ...ui,
-    MfaWorkspace: () => null, EmailRebindWorkspace: () => null, OfferWorkspace: () => null, SmsPoolWorkspace: () => null, SmsPoolChoice: () => null, SmsPoolChargeDialog: () => null,
+    MfaWorkspace: () => null, EmailRebindWorkspace: () => null, OfferWorkspace: () => null, TeamWorkspace: () => React.createElement("div", { "data-team-feature": true }, "团队管理测试"), SmsPoolWorkspace: () => null, SmsPoolChoice: () => null, SmsPoolChargeDialog: () => null,
     CdkWorkspace: () => null, CurrentCdk: () => null, SmsPriceSelector: () => null, SmsServiceSelector,
     readWorkspaceValue: (key) => key === "chatgpt-onboarding.sms-provider-settings-v1" ? JSON.stringify(stored) : null,
     writeWorkspaceValue: (key, value) => { if (key === "chatgpt-onboarding.sms-provider-settings-v1") savedSettings.push(JSON.parse(value)); }, flushWorkspaceSettings: async () => {},
@@ -139,6 +146,16 @@ try {
   await act(async () => container.querySelectorAll(".sms-country-row")[1].click());
   assert.equal(container.querySelectorAll(".sms-country-row").length, 2, "changing project keeps the complete service list available");
   assert.equal(container.querySelectorAll(".sms-country-row")[1].getAttribute("aria-pressed"), "true");
+  await act(async () => root.render(React.createElement(App, { key: "team-menu", auth: auth() })));
+  assert.equal(button("Team 空间", container.querySelector(".workspace-tabs")), undefined);
+  teamAllowed = true;
+  await act(async () => root.render(React.createElement(App, { key: "team-menu", auth: auth() })));
+  await click("Team 空间", container.querySelector(".workspace-tabs"));
+  assert.ok(container.querySelector("[data-team-feature]"));
+  teamAllowed = false;
+  await act(async () => root.render(React.createElement(App, { key: "team-menu", auth: auth() })));
+  assert.equal(button("Team 空间", container.querySelector(".workspace-tabs")), undefined);
+  assert.equal(container.querySelector("[data-team-feature]"), null, "revoking the CDK grant unmounts the active Team page");
   console.log("CDK SMS permissions UI passed (custom-only defaults, administrator grant/revoke and issue-time choice, filtered platform tabs, cached credential removal and live draft fallback)");
 } finally {
   await act(async () => root.unmount()); dom.window.close(); globalThis.FormData = previousFormData; globalThis.matchMedia = previousMatchMedia;

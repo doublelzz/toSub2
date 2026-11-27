@@ -12,12 +12,13 @@ const root = await fs.mkdtemp(path.join(os.tmpdir(), "tosub2-team-preview-")), f
 Object.assign(process.env, { TOSUB2_ADMIN_CDK: "team-local-preview-administrator-only", TOSUB2_ENCRYPTION_KEY: crypto.randomBytes(32).toString("base64"), CHATGPT_BASE: fixture.base, AUTH_BASE: fixture.base });
 const app = await startCdkServer({ root, listen: false, createWorkspace: (options) => createConsoleWorkspace({ ...options,
   teamClientFactory: (input) => createTeamClient({ ...input, chatgptBase: fixture.base }) }) });
-const [owner] = app.store.generate({ count: 1, quota: 10, note: "Team 开发验收（模拟数据）" }, app.store.adminId);
+const [owner] = app.store.generate({ count: 1, quota: 10, note: "Team 开发验收（模拟数据）", teamManagementEnabled: true }, app.store.adminId);
 const workspace = await app.workspaceFor(owner.id);
 const raw = JSON.stringify(["owner@example.com", "other-owner@example.com", "viewer@example.com"].map((email) => fixtureSession(email, fixture.base)));
 const parse = (response) => JSON.parse(response.body.toString());
 const preview = parse(await workspace.dispatch("POST", "/api/teams/import/preview", { text: raw }));
-await workspace.dispatch("POST", "/api/teams/import", { text: raw, digest: preview.digest, requestKey: crypto.randomUUID() });
+const importKey = crypto.randomUUID();
+await app.importFor(owner.id, "team", { text: raw, digest: preview.digest, requestKey: importKey }, importKey, owner.id);
 const until = Date.now() + 8000;
 while (Date.now() < until) { const value = parse(await workspace.dispatch("GET", "/api/teams/state")); if (!value.overview.active) break; await new Promise((resolve) => setTimeout(resolve, 30)); }
 await new Promise((resolve) => app.server.listen(0, "127.0.0.1", resolve));

@@ -41,6 +41,11 @@ export function teamCanRemove(role, member, current) {
   if (role === "account-owner") return true;
   return role === "account-admin" && ["standard-user", "analytics-viewer", "account-analytics-viewer"].includes(member.role);
 }
+export function teamRoleChoices(role, member, current, members = []) {
+  if (role !== "account-owner" || !current || !member || member.scimManaged) return [];
+  if (member.role === "account-owner") return members.filter((row) => row.role === "account-owner").length > 1 ? ["standard-user"] : [];
+  return ["standard-user", "account-admin", "analytics-viewer", "account-analytics-viewer"].includes(member.role) ? ["account-owner"] : [];
+}
 function segment(value) {
   if (!/^[a-zA-Z0-9_-]{1,128}$/.test(value || "")) throw teamError("TEAM_IDENTITY");
   return encodeURIComponent(value);
@@ -187,6 +192,7 @@ export async function createTeamClient({ session, email, proxyUrl = "", chatgptB
     result.capabilities = { role, roleLabel: teamRoleLabel(role || team.role), currentMemberId: current?.id || null,
       canInvite: Boolean(current && ["account-owner", "account-admin", "standard-user"].includes(role) && seatType === "default" && policyKnown && result.invites && result.subscription),
       canRemove: Boolean(current && ["account-owner", "account-admin"].includes(role)), inviteSeatType: seatType || null,
+      canChangeRoles: Boolean(current && role === "account-owner"),
       inviteReason: !current ? "无法确认当前账号的团队身份，请同步成员"
         : !["account-owner", "account-admin", "standard-user"].includes(role) ? "当前团队角色没有邀请权限"
         : seatType !== "default" ? "当前默认席位类型尚未接入邀请，请在官方页面操作"
@@ -202,5 +208,6 @@ export async function createTeamClient({ session, email, proxyUrl = "", chatgptB
       body: { email_addresses: emails, role: "standard-user", seat_type: "default", resend_emails: false, submission_id: requestKey,
         submission_surface: "admin_console_members", purchase_authorization_choice: "not_shown", entry_surface: "admin_console_members" } }),
     remove: (id, memberId) => request(`/backend-api/accounts/${segment(id)}/users/${segment(memberId)}`, { method: "DELETE", workspaceId: id }),
+    setRole: (id, memberId, role) => request(`/backend-api/accounts/${segment(id)}/users/${segment(memberId)}`, { method: "PATCH", workspaceId: id, body: { role } }),
     close: async () => { signal?.removeEventListener("abort", abort); await transport?.close(); } };
 }

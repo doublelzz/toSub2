@@ -65,13 +65,14 @@ export default function CdkGate({ children }) {
     void reload();
     const refresh = () => void reload();
     const refreshVisible = () => { if (document.visibilityState !== "hidden") void reload(); };
+    const permissionsTimer = window.setInterval(refreshVisible, 15_000);
     const onBlocked = (event) => { setBlocked(event.detail); setBootstrap(null); current.current = null; clearWorkspaceSettings(); };
     const onSettingsError = (event) => setSettingsError(event.detail);
     window.addEventListener("cdk-session-refresh", refresh); window.addEventListener("cdk-balance-changed", refresh);
     window.addEventListener("cdk-sms-permissions-changed", refresh); window.addEventListener("focus", refreshVisible); document.addEventListener("visibilitychange", refreshVisible);
     window.addEventListener("cdk-access-blocked", onBlocked); window.addEventListener("cdk-settings-error", onSettingsError);
     setImportConfirmation((next) => new Promise((resolve) => { quoteResolver.current?.(false); quoteResolver.current = resolve; setQuote(next); }));
-    return () => { window.removeEventListener("cdk-session-refresh", refresh); window.removeEventListener("cdk-balance-changed", refresh); window.removeEventListener("cdk-sms-permissions-changed", refresh); window.removeEventListener("focus", refreshVisible); document.removeEventListener("visibilitychange", refreshVisible); window.removeEventListener("cdk-access-blocked", onBlocked); window.removeEventListener("cdk-settings-error", onSettingsError); setImportConfirmation(null); quoteResolver.current?.(false); };
+    return () => { window.clearInterval(permissionsTimer); window.removeEventListener("cdk-session-refresh", refresh); window.removeEventListener("cdk-balance-changed", refresh); window.removeEventListener("cdk-sms-permissions-changed", refresh); window.removeEventListener("focus", refreshVisible); document.removeEventListener("visibilitychange", refreshVisible); window.removeEventListener("cdk-access-blocked", onBlocked); window.removeEventListener("cdk-settings-error", onSettingsError); setImportConfirmation(null); quoteResolver.current?.(false); };
   }, []);
 
   const finishQuote = (accepted) => { quoteResolver.current?.(accepted); quoteResolver.current = null; setQuote(null); };

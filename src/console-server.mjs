@@ -273,7 +273,8 @@ if (options.teamVault || options.rebindVault) teamWorkspace = await createTeamWo
   clientFactory: options.teamClientFactory,
   isAccountBusy: (email) => emailJobLocks.has(email.toLowerCase()) || mfaWorkspace.isBusy(email) || rebindWorkspace.isBusy(email) || offerWorkspace.isBusy(email)
     || [...jobs.values()].some((job) => job.email.toLowerCase() === email.toLowerCase() && (isActive(job.status) || job.child)),
-  canUse: options.isEnabled, requestSchedule: options.requestSchedule, mailRequest: () => mailRequestConfig,
+  canUse: () => options.isEnabled() && (options.teamCanUse?.() ?? true), requestSchedule: options.requestSchedule, mailRequest: () => mailRequestConfig,
+  canImport: () => options.teamCanUse?.() ?? options.isEnabled(),
 });
 scheduleQueuedJobs();
 scheduleSub2ApiMonitor();
@@ -304,7 +305,7 @@ async function handleApi(req, res, requestUrl) {
         mfaChange: true,
         emailRebind: true,
         offerCheck: true,
-        teamManagement: Boolean(teamWorkspace),
+        teamManagement: Boolean(teamWorkspace) && (options.teamCanUse?.() ?? true),
         passwordAdd: true,
         forceRelogin: true,
       },
@@ -1100,11 +1101,11 @@ async function handleTeamApi(req, res, url) {
       : action === "input" ? teamWorkspace.input(id, body) : await teamWorkspace.cancel(id);
     sendJson(res, 200, result); return;
   }
-  const teamMatch = /^([a-zA-Z0-9-]+)\/(query|select-account|invite-preview|invite|remove)$/.exec(route);
+  const teamMatch = /^([a-zA-Z0-9-]+)\/(query|select-account|invite-preview|invite|remove|role)$/.exec(route);
   if (!teamMatch) throw httpError(404, "团队接口不存在");
   const [, id, action] = teamMatch;
   const result = action === "query" ? teamWorkspace.detail(id, body)
-    : action === "select-account" ? await teamWorkspace.selectAccount(id, body.accountId)
+    : action === "select-account" ? await teamWorkspace.selectAccount(id, body.accountId, actor)
     : action === "invite-preview" ? teamWorkspace.invitePreview(id, body)
     : await teamWorkspace.mutate(id, body, actor, action);
   sendJson(res, 200, result);
@@ -6418,6 +6419,10 @@ async function dispatch(method, pathname, body = {}, actorId = options.cdkId) {
 }
 
 function planImport(mode, body) {
+  if (mode === "team") {
+    if (!teamWorkspace) throw httpError(503, "团队管理存储尚未初始化");
+    return teamWorkspace.planImport(body);
+  }
   let emails;
   if (mode === "mfa") emails = mfaWorkspace.preview(body.text).accounts.map((account) => account.email);
   else if (mode === "rebind") emails = rebindWorkspace.importRecords(body.ids).map((item) => item.newEmail);
@@ -6436,6 +6441,10 @@ function planImport(mode, body) {
 }
 
 async function applyImport(mode, body, actorId = options.cdkId) {
+  if (mode === "team") {
+    try { return { status: 200, data: await teamWorkspace.importAccounts(body, actorId) }; }
+    catch (error) { error.importRolledBack = true; throw error; }
+  }
   const emails = planImport(mode, body);
   const route = mode === "rebind" ? "/api/rebind/sync" : mode === "mfa" ? "/api/mfa/import" : mode === "single" ? "/api/jobs" : "/api/jobs/batch";
   const activeUpdate = mode !== "mfa" && emails.some((email) => { const job = findJobByEmail(email); return job && isActive(job.status) && job.status !== "queued"; });
@@ -6492,7 +6501,7 @@ return {
     await bindSub2ApiRemote(config, id, local.email);
     await saveSub2ApiLinkSnapshot(config, local.email, { status: "linked", message: "已关联", accounts: [publicSub2ApiAccount(account)], checkedAt: new Date().toISOString(), metadataComplete: true });
   },
-  inventory() { return [...new Set([...listUniqueJobs().map((job) => job.email.toLowerCase()), ...mfaWorkspace.list().accounts.map((account) => account.email.toLowerCase())])]; },
+  inventory() { return [...new Set([...listUniqueJobs().map((job) => job.email.toLowerCase()), ...mfaWorkspace.list().accounts.map((account) => account.email.toLowerCase()), ...(teamWorkspace?.inventory() || [])])]; },
   publicJobs: () => listUniqueJobs().map(publicJob),
   refreshPoolStatus: refreshSmsPoolStates,
   activeCount: () => [...jobs.values()].filter(occupiesActiveSlot).length + (offerWorkspace?.activeCount() || 0) + (teamWorkspace?.activeCount() || 0),
@@ -6500,7 +6509,7 @@ return {
   checkOfferAccess: () => { offerWorkspace?.tick(0); teamWorkspace?.tick(0); },
   resume() { queueSchedulingPaused = false; scheduleQueuedJobs(); },
   pause() { queueSchedulingPaused = true; },
-  tick: () => { const started = scheduleQueuedJobs(true) || 0; const offers = offerWorkspace?.tick(Math.max(0, options.availableSlots() - started)) || 0; return started + offers + (teamWorkspace?.tick(Math.max(0, options.availableSlots() - started - offers)) || 0); },
+  tick: () => { const started = scheduleQueuedJobs(true) || 0; const offers = offerWorkspace?.tick(Math.max(0, options.availableSlots() - started)) || 0; return started + offers + (teamWorkspace?.tick(queueSchedulingPaused ? 0 : Math.max(0, options.availableSlots() - started - offers)) || 0); },
   async stop() {
     queueSchedulingPaused = true;
     await cancelAllJobs();

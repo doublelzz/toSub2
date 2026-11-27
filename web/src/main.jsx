@@ -106,6 +106,7 @@ function App({ auth }) {
   function setActiveWorkspace(next) {
     if (next === activeWorkspace || canLeaveAnnouncement()) updateActiveWorkspace(next);
   }
+  useEffect(() => { if (activeWorkspace === "teams" && !auth.features?.teamManagement) updateActiveWorkspace("authorization"); }, [activeWorkspace, auth.features?.teamManagement]);
   const [mfaFocusAccountId, setMfaFocusAccountId] = useState(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [remoteBindingOpen, setRemoteBindingOpen] = useState(false);
@@ -1226,7 +1227,7 @@ function App({ auth }) {
         <div className="brand-block"><div className="brand-mark"><ShieldCheck size={21} /></div><h1>账号工作台</h1></div>
         <nav className="workspace-tabs" aria-label="工作区">
           <button type="button" className={activeWorkspace === "authorization" ? "active" : ""} aria-pressed={activeWorkspace === "authorization"} onClick={() => setActiveWorkspace("authorization")}><LogIn size={17} />账号授权</button>
-          <button type="button" className={activeWorkspace === "teams" ? "active" : ""} aria-pressed={activeWorkspace === "teams"} onClick={() => setActiveWorkspace("teams")}><Users size={17} />Team 空间</button>
+          {auth.features?.teamManagement && <button type="button" className={activeWorkspace === "teams" ? "active" : ""} aria-pressed={activeWorkspace === "teams"} onClick={() => setActiveWorkspace("teams")}><Users size={17} />Team 空间</button>}
           <button type="button" className={activeWorkspace === "mfa" ? "active" : ""} aria-pressed={activeWorkspace === "mfa"} onClick={() => setActiveWorkspace("mfa")}><ShieldCheck size={17} />MFA 修改</button>
           <button type="button" className={activeWorkspace === "rebind" ? "active" : ""} aria-pressed={activeWorkspace === "rebind"} onClick={() => setActiveWorkspace("rebind")}><MailCheck size={17} />邮箱换绑</button>
           <button type="button" className={activeWorkspace === "offers" ? "active" : ""} aria-pressed={activeWorkspace === "offers"} onClick={() => setActiveWorkspace("offers")}><Sparkles size={17} />优惠检测</button>
@@ -1264,7 +1265,7 @@ function App({ auth }) {
       {activeWorkspace === "announcement" && adminView && auth.account.role === "admin" && <AnnouncementManager token={token} onChanged={auth.reload} onStateChange={reportAnnouncementState} />}
       {activeWorkspace === "sms-pool" && auth.account.role === "admin" && <SmsPoolWorkspace token={token} />}
       {activeWorkspace === "offers" && <OfferWorkspace token={token} balance={auth.workspace.balance} />}
-      {activeWorkspace === "teams" && <TeamWorkspace key={auth.workspace.id} token={token} />}
+      {activeWorkspace === "teams" && auth.features?.teamManagement && <TeamWorkspace key={auth.workspace.id} token={token} />}
       {activeWorkspace === "rebind" && <EmailRebindWorkspace token={token} initialTab={rebindInitialTab} onOpenAuthorization={() => { setPhoneTab("disabled"); setFilters(DEFAULT_FILTERS); setPage(1); setSelectedJobIds(new Set()); setExpandedJobId(null); setEmailFilter([]); setActiveWorkspace("authorization"); }} />}
       {activeWorkspace === "mfa" && <MfaWorkspace token={token} defaultProxyUrl={accountProxyUrl} focusAccountId={mfaFocusAccountId} onReconnect={() => setConnectionAttempt((current) => current + 1)} onOpenAuthorization={() => {
         setPhoneTab("disabled"); setFilters(DEFAULT_FILTERS); setEmailFilter([]); setSelectedJobIds(new Set()); setExpandedJobId(null); setPage(1); setActiveWorkspace("authorization");

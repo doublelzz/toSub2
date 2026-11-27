@@ -91,6 +91,15 @@ try {
   await waitFor(() => document.querySelector(".team-member-table tbody")?.textContent.includes("new-ui@example.com"));
   await click(all(".team-detail-tabs button").find((element) => element.textContent.startsWith("现有成员")));
   await waitFor(() => document.querySelector(".team-member-table tbody")?.textContent.includes("member@example.com"));
+  const roleSelect = () => document.querySelector('[aria-label="修改 admin@example.com 的角色"]');
+  await act(async () => { roleSelect().value = "account-owner"; roleSelect().dispatchEvent(new window.Event("change", { bubbles: true })); });
+  assert.match(document.querySelector('[role="dialog"] [role="dialog"]')?.textContent || document.querySelectorAll('[role="dialog"]')[1].textContent, /admin@example.com/);
+  assert.equal(fixture.state.spaces.get(TEAM_A).members.find((row) => row.email === "admin@example.com").role, "account-admin", "role change waits for explicit confirmation");
+  await click(button("确认修改为所有者")); await waitFor(() => !button("确认修改为所有者"));
+  assert.equal(fixture.state.spaces.get(TEAM_A).members.find((row) => row.email === "admin@example.com").role, "account-owner");
+  await act(async () => { roleSelect().value = "standard-user"; roleSelect().dispatchEvent(new window.Event("change", { bubbles: true })); });
+  await click(button("确认修改为普通成员")); await waitFor(() => !button("确认修改为普通成员"));
+  assert.equal(fixture.state.spaces.get(TEAM_A).members.find((row) => row.email === "admin@example.com").role, "standard-user");
   const memberRow = all(".team-member-table tbody tr").find((element) => element.textContent.includes("member@example.com"));
   await click(button("移除", memberRow)); assert.match(document.querySelector(".team-remove-target").textContent, /member@example.com/);
   assert.equal(fixture.state.spaces.get(TEAM_A).members.length, 5, "confirmation must precede removal");

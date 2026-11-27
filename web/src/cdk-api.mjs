@@ -161,7 +161,7 @@ async function saveWorkspaceSnapshot(current, values) {
 export async function cdkFetch(url, options = {}) {
   const headers = new Headers(options.headers || {});
   const method = String(options.method || "GET").toUpperCase();
-  const mode = method === "POST" && ({ "/api/jobs": "single", "/api/jobs/batch": "authorization", "/api/mfa/import": "mfa", "/api/rebind/sync": "rebind" })[url];
+  const mode = method === "POST" && ({ "/api/jobs": "single", "/api/jobs/batch": "authorization", "/api/mfa/import": "mfa", "/api/rebind/sync": "rebind", "/api/teams/import": "team" })[url];
   let requestOptions = options;
   if (mode) {
     let payload; try { payload = JSON.parse(options.body || "{}"); } catch { throw new Error("导入内容格式错误"); }
@@ -187,7 +187,7 @@ export async function cdkFetch(url, options = {}) {
     }
     if (!confirmationHandler) throw new Error("导入确认尚未准备好，请稍后重试");
     if (!await confirmationHandler(quote)) throw new Error("已取消导入，未消耗次数");
-    if (!headers.has("idempotency-key")) headers.set("idempotency-key", requestId());
+    if (!headers.has("idempotency-key")) headers.set("idempotency-key", mode === "team" && payload.requestKey ? payload.requestKey : requestId());
   }
   const response = await fetch(url, { ...requestOptions, headers });
   const quotaOwner = response.headers.get("x-cdk-id");
@@ -204,6 +204,7 @@ export async function cdkFetch(url, options = {}) {
 }
 
 function handleSessionStatus(response, body) {
-  if (body.code === "IP_BLOCKED") window.dispatchEvent(new CustomEvent("cdk-access-blocked", { detail: body }));
+  if (body.code === "TEAM_FEATURE_FORBIDDEN") window.dispatchEvent(new Event("cdk-session-refresh"));
+  else if (body.code === "IP_BLOCKED") window.dispatchEvent(new CustomEvent("cdk-access-blocked", { detail: body }));
   else if (response.status === 401 || body.code === "CSRF_INVALID") window.dispatchEvent(new Event("cdk-session-refresh"));
 }

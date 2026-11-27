@@ -3,7 +3,7 @@ import fs from "./workspace-storage.mjs";
 import path from "node:path";
 import { parseOfferImport } from "./offer-workspace.mjs";
 import { fetchMailboxOtpCandidates, filterMailboxOtpCandidatesByRequestTime } from "./mail-otp.mjs";
-import { createTeamClient, teamIdentity, teamEmail, teamError, publicTeamError, teamCanRemove } from "./team-client.mjs";
+import { createTeamClient, teamIdentity, teamEmail, teamError, publicTeamError, teamCanRemove, teamRoleChoices, teamRoleLabel } from "./team-client.mjs";
 
 const text = (value) => typeof value === "string" ? value.trim() : "";
 const fail = (message, status = 400) => Object.assign(new Error(message), { status });
@@ -19,7 +19,7 @@ export function parseTeamEmails(value) {
 }
 
 export async function createTeamWorkspace({ root, vault, parseText, listSources = () => [], resolveSource = async () => null,
-  proxyPool, runLogin, requestSchedule = () => {}, isAccountBusy = () => false, canUse = () => true,
+  proxyPool, runLogin, requestSchedule = () => {}, isAccountBusy = () => false, canUse = () => true, canImport = canUse,
   clientFactory = createTeamClient, pollMailbox = fetchMailboxOtpCandidates, mailRequest = () => ({}), now = Date.now }) {
   if (!vault?.seal || !vault?.open) throw new Error("Team workspace requires a credential vault");
   const directory = path.join(root, "team-space");
@@ -33,6 +33,7 @@ export async function createTeamWorkspace({ root, vault, parseText, listSources 
   let closing = false, writes = Promise.resolve();
   const stamp = () => new Date(now()).toISOString();
   const access = () => { if (closing || !canUse()) throw fail("工作区已暂停，请稍后再操作", 409); };
+  const importAccess = () => { if (closing || !canImport()) throw fail("当前 CDK 的团队导入不可用", 403); };
   const accountOf = (id) => { const account = state.accounts.find((row) => row.id === id); if (!account) throw fail("团队管理账号不存在", 404); return account; };
   const teamOf = (id) => { const team = state.teams.find((row) => row.id === id); if (!team) throw fail("团队记录不存在", 404); return team; };
   const secret = (account) => vault.open(account.secret, `account:${account.id}`);
@@ -102,8 +103,8 @@ export async function createTeamWorkspace({ root, vault, parseText, listSources 
     return { rows: rows.slice((page - 1) * 20, page * 20), total: rows.length, page, pages, overview: overview(),
       tasks: state.accounts.filter((row) => LIVE.has(row.status) || row.status === "interrupted").map(publicAccount) };
   }
-  function sources() {
-    access();
+  function sources({ forImport = false } = {}) {
+    if (forImport) importAccess(); else access();
     return { accounts: listSources().filter((row) => row.sources?.includes("authorization")).map((row) => ({ ...row,
       busy: row.busy || isBusy(row.email) || state.accounts.some((account) => account.email === row.email && LIVE.has(account.status)),
       linked: state.accounts.some((account) => account.email === row.email) })) };
@@ -111,13 +112,13 @@ export async function createTeamWorkspace({ root, vault, parseText, listSources 
   function parseImport(body) {
     if (body.sourceIds !== undefined) {
       if (!Array.isArray(body.sourceIds) || !body.sourceIds.length || body.sourceIds.length > 100 || new Set(body.sourceIds).size !== body.sourceIds.length) throw fail("请选择 1 至 100 个账号");
-      const available = sources().accounts;
+      const available = sources({ forImport: true }).accounts;
       return { entries: body.sourceIds.map((id) => { const source = available.find((row) => row.id === id); if (!source || source.busy) throw fail("所选授权账号不存在或正在执行其他任务", 409); return { email: source.email, credentials: {}, session: null, sourceRef: source.id }; }), duplicateCount: 0 };
     }
     return parseOfferImport(body.text, parseText);
   }
   function preview(body) {
-    access();
+    importAccess();
     const parsed = parseImport(body);
     const selection = proxyPool?.normalizeSelection(body) || null;
     if (parsed.entries.length > 100) throw fail("每次最多导入 100 个团队管理账号");
@@ -129,13 +130,18 @@ export async function createTeamWorkspace({ root, vault, parseText, listSources 
         hasPassword: Boolean(entry.credentials.password), hasTotp: Boolean(entry.credentials.totpSecret), hasMailbox: Boolean(entry.credentials.mailApiUrl), hasSession: Boolean(entry.session), source: entry.sourceRef ? "authorization" : "import" };
     });
     return { count: accounts.length, added: accounts.filter((row) => !row.existing).length, duplicateCount: parsed.duplicateCount,
-      charge: 0, accounts, digest: hash({ entries: parsed.entries, updateExisting: body.updateExisting === true, forceLogin: body.forceLogin === true, selection }) };
+      accounts, digest: hash({ entries: parsed.entries, updateExisting: body.updateExisting === true, forceLogin: body.forceLogin === true, selection }) };
   }
   function requestKey(body) { const key = text(body.requestKey); if (!/^[a-zA-Z0-9_-]{16,100}$/.test(key)) throw fail("缺少有效请求标识，请重新操作"); return key; }
+  const importDigest = (body) => hash({ text: body.text, sourceIds: body.sourceIds, digest: body.digest, updateExisting: body.updateExisting === true, forceLogin: body.forceLogin === true, network: proxyPool?.normalizeSelection(body) || null });
+  function planImport(body) {
+    importAccess(); const previous = state.imports.find((row) => row.key === body.requestKey);
+    if (previous) { if (previous.digest !== importDigest(body)) throw fail("该请求标识已用于其他导入", 409); return previous.accountIds.map((id) => accountOf(id).email); }
+    return preview(body).accounts.map((row) => row.email);
+  }
   async function importAccounts(body, actorId) {
-    access(); const key = requestKey(body);
-    const bodyDigest = hash({ text: body.text, sourceIds: body.sourceIds, digest: body.digest, updateExisting: body.updateExisting === true, forceLogin: body.forceLogin === true,
-      network: proxyPool?.normalizeSelection(body) || null });
+    importAccess(); const key = requestKey(body);
+    const bodyDigest = importDigest(body);
     const previous = state.imports.find((row) => row.key === key);
     if (previous) { if (previous.digest !== bodyDigest) throw fail("该请求标识已用于其他导入", 409); return { accounts: previous.accountIds.map((id) => publicAccount(accountOf(id))), reused: true }; }
     const view = preview(body);
@@ -143,6 +149,8 @@ export async function createTeamWorkspace({ root, vault, parseText, listSources 
     if (state.accounts.length + view.added > 500) throw fail("团队管理账号已达 500 个上限");
     const entries = parseImport(body).entries, ids = [];
     const selection = proxyPool?.normalizeSelection(body) || null;
+    const before = structuredClone(state);
+    try {
     for (const entry of entries) {
       let account = state.accounts.find((row) => row.email === entry.email);
       const existing = Boolean(account);
@@ -159,7 +167,9 @@ export async function createTeamWorkspace({ root, vault, parseText, listSources 
       ids.push(account.id);
     }
     state.imports.push({ key, digest: bodyDigest, accountIds: ids }); state.imports = state.imports.slice(-200);
-    await save(); requestSchedule(); return { accounts: ids.map((id) => publicAccount(accountOf(id))) };
+    await save();
+    } catch (error) { state = before; throw error; }
+    requestSchedule(); return { accounts: ids.map((id) => publicAccount(accountOf(id))) };
   }
   function addLog(team, actorId, action, message, status = "success") {
     (team.logs ||= []).unshift({ id: crypto.randomUUID(), actorId, action, message, status, at: stamp() });
@@ -167,7 +177,10 @@ export async function createTeamWorkspace({ root, vault, parseText, listSources 
   }
   function reconcileRequests(team, fresh) {
     for (const record of state.requests.filter((row) => row.teamId === team.id && row.status === "unknown")) {
-      if (record.kind === "remove" && fresh.members && !fresh.members.items.some((row) => row.id === record.memberId)) {
+      if (record.kind === "role" && fresh.members?.items.some((row) => row.id === record.memberId && row.email === record.memberEmail && row.role === record.role)) {
+        record.status = "completed"; record.result = { success: true, memberEmail: record.memberEmail, role: record.role, reconciled: true, refreshErrors: {} };
+        addLog(team, record.actorId, "role", `重新同步已确认 ${record.memberEmail} 的角色为${teamRoleLabel(record.role)}`);
+      } else if (record.kind === "remove" && fresh.members && !fresh.members.items.some((row) => row.id === record.memberId)) {
         record.status = "completed"; record.result = { success: true, memberEmail: record.memberEmail, reconciled: true, refreshErrors: {} };
         addLog(team, record.actorId, "remove", "重新同步已确认目标成员不在团队中");
       } else if (record.kind === "invite" && record.targetEmails?.length && fresh.members && fresh.invites) {
@@ -207,7 +220,7 @@ export async function createTeamWorkspace({ root, vault, parseText, listSources 
     const merged = { ...fresh };
     // Keep last successful sections visible, with explicit per-section stale errors.
     for (const section of ["members", "invites", "subscription"]) if (!fresh[section] && old?.[section]) merged[section] = old[section];
-    if (fresh.errors.members) { merged.capabilities.canRemove = false; merged.capabilities.canInvite = false; }
+    if (fresh.errors.members) { merged.capabilities.canRemove = false; merged.capabilities.canInvite = false; merged.capabilities.canChangeRoles = false; }
     if (fresh.errors.invites || fresh.errors.subscription || fresh.errors.policy) merged.capabilities.canInvite = false;
     team.snapshots[account.id] = merged;
     if (fresh.subscription) team.lastSubscription = fresh.subscription;
@@ -351,15 +364,19 @@ export async function createTeamWorkspace({ root, vault, parseText, listSources 
     const snapshot = team.snapshots[view.accountId];
     const query = text(body.search).toLowerCase();
     const all = (body.tab === "invites" ? snapshot?.invites?.items : snapshot?.members?.items) || [];
+    const current = snapshot?.members?.items.find((member) => member.id === snapshot?.capabilities?.currentMemberId);
     const items = all.filter((row) => !query || `${row.email} ${row.name || ""}`.toLowerCase().includes(query)).map((row) => body.tab === "invites" ? row : { ...row,
-      canRemove: !row.scimManaged && !snapshot?.errors?.members && teamCanRemove(snapshot?.capabilities?.role, row, snapshot?.members?.items.find((member) => member.id === snapshot?.capabilities?.currentMemberId)) });
+      canRemove: !row.scimManaged && !snapshot?.errors?.members && teamCanRemove(snapshot?.capabilities?.role, row, current),
+      roleChoices: !snapshot?.errors?.members ? teamRoleChoices(snapshot?.capabilities?.role, row, current, snapshot?.members?.items) : [] });
     const pages = Math.max(1, Math.ceil(items.length / 20)), page = Math.min(pages, Math.max(1, Number.isSafeInteger(body.page) ? body.page : 1));
     return { team: view, items: items.slice((page - 1) * 20, page * 20), total: items.length, page, pages };
   }
-  async function selectAccount(id, accountId) {
+  async function selectAccount(id, accountId, actorId) {
     access(); const team = teamOf(id);
     if (teamLocks.has(id)) throw fail("团队操作正在执行，请完成后再切换账号", 409);
-    publicTeam(team, accountId); team.selectedAccountId = accountId; await save(); return publicTeam(team);
+    publicTeam(team, accountId); team.selectedAccountId = accountId; await save();
+    if (team.snapshots[accountId]?.errors?.members?.code === "TEAM_REFRESH_REQUIRED") await queue({ ids: [accountId] }, actorId || accountOf(accountId).actorId);
+    return publicTeam(team);
   }
   function invitePreview(id, body) {
     access(); const team = teamOf(id), view = publicTeam(team, body.accountId);
@@ -375,23 +392,25 @@ export async function createTeamWorkspace({ root, vault, parseText, listSources 
       reason: !snapshot?.capabilities?.canInvite ? snapshot?.capabilities?.inviteReason || "请先同步团队信息" : !capacityOk ? "空闲席位不足（含待接受邀请），请减少新增邮箱数量" : view.stale ? "团队信息存在同步失败项，请先同步" : "" };
   }
   async function mutate(id, body, actorId, kind) {
+    if (!["invite", "remove", "role"].includes(kind)) throw fail("团队操作不存在", 404);
     access(); const team = teamOf(id), account = accountOf(body.accountId || team.selectedAccountId);
     if (!team.accountIds.includes(account.id)) throw fail("账号与目标团队不匹配", 403);
     const key = requestKey(body), emails = kind === "invite" ? parseTeamEmails(body.emails) : null;
-    if (kind === "remove" && (!text(body.memberId) || !validEmail(teamEmail(body.memberEmail)))) throw fail("缺少要移除的成员身份，请重新打开确认框");
-    const digest = hash({ id, accountId: account.id, kind, emails, memberId: body.memberId, memberEmail: teamEmail(body.memberEmail) });
+    if (["remove", "role"].includes(kind) && (!text(body.memberId) || !validEmail(teamEmail(body.memberEmail)))) throw fail("缺少目标成员身份，请重新打开确认框");
+    if (kind === "role" && (!["account-owner", "standard-user"].includes(body.role) || !text(body.previousRole))) throw fail("请选择所有者或普通成员，并重新确认当前角色");
+    const digest = hash({ id, accountId: account.id, kind, emails, memberId: body.memberId, memberEmail: teamEmail(body.memberEmail), ...(kind === "role" ? { role: body.role, previousRole: body.previousRole } : {}) });
     const previous = state.requests.find((row) => row.key === key);
     if (previous) {
       if (previous.digest !== digest) throw fail("同一请求标识不能用于其他团队操作", 409);
       if (previous.status === "completed") return previous.result;
       throw fail(previous.status === "running" ? "该操作正在执行，请稍后查看" : "该操作尚未确认成功，请先同步核对，不要重复提交", 409);
     }
-    if (state.requests.some((row) => row.teamId === id && row.status === "unknown" && row.kind === kind && (kind === "remove" ? row.memberId === body.memberId : row.targetEmails?.some((email) => emails.includes(email))))) throw fail("该成员或邮箱存在尚未确认的操作，请先同步团队核对", 409);
+    if (state.requests.some((row) => row.teamId === id && row.status === "unknown" && (kind === "invite" ? row.kind === kind && row.targetEmails?.some((email) => emails.includes(email)) : row.memberId === body.memberId))) throw fail("该成员或邮箱存在尚未确认的操作，请先同步团队核对", 409);
     if (teamLocks.has(id) || team.accountIds.some((id) => isBusy(accountOf(id).email) || LIVE.has(accountOf(id).status)) || isAccountBusy(account.email)) throw fail("团队或账号正在执行任务，请稍后重试", 409);
     if (network.size >= 3) throw fail("当前有多个团队操作，请稍后重试", 409);
     const run = { email: account.email, controller: new AbortController() };
     teamLocks.add(id); network.set(key, run);
-    const record = { key, digest, status: "running", kind, teamId: id, accountId: account.id, actorId, memberId: body.memberId, memberEmail: teamEmail(body.memberEmail), at: stamp() };
+    const record = { key, digest, status: "running", kind, teamId: id, accountId: account.id, actorId, memberId: body.memberId, memberEmail: teamEmail(body.memberEmail), role: kind === "role" ? body.role : undefined, at: stamp() };
     state.requests.push(record); state.requests = state.requests.slice(-1000);
     const task = (async () => {
       await save();
@@ -411,6 +430,7 @@ export async function createTeamWorkspace({ root, vault, parseText, listSources 
           const results = emails.filter((email) => existing.has(email) || pending.has(email)).map((email) => ({ email, status: existing.has(email) ? "already_member" : "already_invited", message: existing.has(email) ? "已是成员，已跳过" : "已有待接受邀请，已跳过" }));
           if (actionable.length) {
             record.targetEmails = actionable; record.mutationStarted = true; await save();
+            if (run.controller.signal.aborted || !canUse()) throw teamError("TEAM_CANCELLED");
             const response = await client.invite(team.workspaceId, actionable, key);
             if (!["account_invites", "errored_emails", "already_member_emails"].every((field) => Array.isArray(response[field]))) throw teamError("TEAM_RESPONSE", 502, true);
             const emailsOf = (list) => new Set(list.map((row) => teamEmail(typeof row === "string" ? row : row?.email_address || row?.email)).filter(Boolean));
@@ -421,6 +441,17 @@ export async function createTeamWorkspace({ root, vault, parseText, listSources 
             }
           }
           result = { results, teamId: id, requestKey: key };
+        } else if (kind === "role") {
+          if (!fresh.members || fresh.errors.members || !fresh.capabilities.canChangeRoles) throw fail("只有已确认的团队所有者可以修改角色", 403);
+          const target = fresh.members.items.find((row) => row.id === body.memberId), current = fresh.members.items.find((row) => row.id === fresh.capabilities.currentMemberId);
+          if (!target || target.email !== teamEmail(body.memberEmail)) throw fail("成员身份已变化，请重新确认", 409);
+          if (target.role !== body.previousRole) throw fail("成员当前角色已变化，请重新同步并确认", 409);
+          if (!teamRoleChoices(fresh.capabilities.role, target, current, fresh.members.items).includes(body.role)) throw fail(target.role === "account-owner" && fresh.members.items.filter((row) => row.role === "account-owner").length <= 1 ? "不能降级最后一位所有者，请先让账号2加入并设置为所有者" : "当前成员的角色不允许修改", 403);
+          record.mutationStarted = true; await save();
+          if (run.controller.signal.aborted || !canUse()) throw teamError("TEAM_CANCELLED");
+          const response = await client.setRole(team.workspaceId, target.id, body.role);
+          if (response.success !== true) throw teamError("TEAM_RESPONSE", 502, true);
+          result = { success: true, memberEmail: target.email, role: body.role, selfChanged: target.id === current.id };
         } else {
           if (!fresh.members || fresh.errors.members || !fresh.capabilities.canRemove) throw fail("当前账号没有移除此成员的权限，或成员信息未同步", 403);
           const target = fresh.members.items.find((row) => row.id === body.memberId);
@@ -430,6 +461,7 @@ export async function createTeamWorkspace({ root, vault, parseText, listSources 
             if (target.email !== teamEmail(body.memberEmail)) throw fail("成员身份已变化，请重新确认", 409);
             if (target.scimManaged || !teamCanRemove(fresh.capabilities.role, target, current)) throw fail("当前账号、所有者或此角色的成员不允许移除", 403);
             record.mutationStarted = true; await save();
+            if (run.controller.signal.aborted || !canUse()) throw teamError("TEAM_CANCELLED");
             const response = await client.remove(team.workspaceId, target.id);
             if (response.success !== true) throw teamError("TEAM_RESPONSE", 502, true);
             result = { success: true, memberEmail: target.email, hasBillingNotice: Boolean(response.billing_notice), hasPolicyNotice: Boolean(response.policy_notice) };
@@ -437,16 +469,39 @@ export async function createTeamWorkspace({ root, vault, parseText, listSources 
         }
         const after = await updateSnapshot(client, account, team, discovered).catch((error) => {
           const failure = publicTeamError(error), snapshot = team.snapshots[account.id];
-          if (snapshot) { snapshot.errors.refresh = failure; snapshot.capabilities.canInvite = false; if (error.code === "TEAM_AUTH_EXPIRED") snapshot.capabilities.canRemove = false; }
+          if (snapshot) { snapshot.errors.refresh = failure; snapshot.capabilities.canInvite = false; snapshot.capabilities.canChangeRoles = false; if (error.code === "TEAM_AUTH_EXPIRED") snapshot.capabilities.canRemove = false; }
           if (error.code === "TEAM_AUTH_EXPIRED") { account.status = "auth_expired"; account.errorCode = error.code; }
           return { errors: { refresh: failure } };
         });
         result.refreshErrors = after.errors;
         if (kind === "remove" && result.success && after.members?.items.some((row) => row.id === body.memberId)) result.verifying = true;
+        if (kind === "role" && !after.members?.items.some((row) => row.id === body.memberId && row.role === body.role)) result.verifying = true;
+        if (["role", "remove"].includes(kind)) {
+          for (const otherId of [...team.accountIds]) {
+            if (otherId === account.id) continue;
+            const peer = accountOf(otherId), snapshot = team.snapshots[otherId];
+            if (kind === "remove" && peer.email === teamEmail(body.memberEmail) && after.members && !after.members.items.some((row) => row.email === peer.email)) {
+              team.accountIds = team.accountIds.filter((id) => id !== otherId); delete team.snapshots[otherId];
+              if (team.selectedAccountId === otherId) team.selectedAccountId = account.id;
+              peer.message = "该账号已从此团队移除，其他团队与账号资料保留";
+            } else if (snapshot) {
+              const identity = after.members?.items.find((row) => row.email === peer.email);
+              if (identity && after.members && !after.errors.members) {
+                snapshot.members = after.members;
+                snapshot.capabilities.role = identity.role; snapshot.capabilities.roleLabel = identity.roleLabel;
+                snapshot.capabilities.canRemove = ["account-owner", "account-admin"].includes(identity.role);
+                snapshot.capabilities.canChangeRoles = identity.role === "account-owner";
+                snapshot.capabilities.currentMemberId = identity.id;
+              }
+              snapshot.errors.members = { code: "TEAM_REFRESH_REQUIRED", message: "团队成员或角色已变化，请使用当前管理账号重新同步" };
+              snapshot.capabilities.canInvite = false; snapshot.capabilities.canRemove = false; snapshot.capabilities.canChangeRoles = false;
+            }
+          }
+        }
         if (account.status !== "auth_expired") account.status = "ready";
         account.message = Object.keys(after.errors).length ? "操作已返回，部分数据仍需重新同步" : "团队信息已同步"; account.updatedAt = stamp();
         record.status = result.verifying || result.results?.some((row) => row.status === "unknown") ? "unknown" : "completed"; record.result = result;
-        addLog(team, actorId, kind, kind === "invite" ? `处理 ${emails.length} 个邀请邮箱，成功 ${result.results.filter((row) => row.status === "invited").length} 个` : `移除成员 ${teamEmail(body.memberEmail)}${result.verifying ? "，等待列表确认" : ""}`, Object.keys(after.errors).length || result.verifying || result.results?.some((row) => ["failed", "unknown"].includes(row.status)) ? "partial" : "success");
+        addLog(team, actorId, kind, kind === "invite" ? `处理 ${emails.length} 个邀请邮箱，成功 ${result.results.filter((row) => row.status === "invited").length} 个` : kind === "role" ? `将 ${teamEmail(body.memberEmail)} 修改为${teamRoleLabel(body.role)}${result.verifying ? "，等待确认" : ""}` : `移除成员 ${teamEmail(body.memberEmail)}${result.verifying ? "，等待列表确认" : ""}`, Object.keys(after.errors).length || result.verifying || result.results?.some((row) => ["failed", "unknown"].includes(row.status)) ? "partial" : "success");
         await save(); return result;
       });
     })().catch(async (error) => {
@@ -474,6 +529,7 @@ export async function createTeamWorkspace({ root, vault, parseText, listSources 
   }
   async function shutdown() { closing = true; await stopAll(); await writes; }
   return { query, sources, preview, importAccounts, queue, input, cancel, detail, selectAccount, invitePreview, mutate, tick, isBusy, invalidate, stopAll, shutdown,
+    planImport, inventory: () => state.accounts.map((row) => row.email),
     hasAccount: (email) => state.accounts.some((row) => row.email === teamEmail(email)),
     activeCount: () => [...active.values()].filter((run) => run.slot).length + network.size,
     pendingCount: () => state.accounts.filter((row) => row.status === "queued").length };

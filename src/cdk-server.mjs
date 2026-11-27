@@ -164,6 +164,7 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
         rebindVault: { seal: (value, scope) => vault.seal(value, `rebind:${id}:${scope}`), open: (value, scope) => vault.open(value, `rebind:${id}:${scope}`) },
         offerVault: { seal: (value, scope) => vault.seal(value, `offers:${id}:${scope}`), open: (value, scope) => vault.open(value, `offers:${id}:${scope}`) },
         teamVault: { seal: (value, scope) => vault.seal(value, `team:${id}:${scope}`), open: (value, scope) => vault.open(value, `team:${id}:${scope}`) },
+        teamCanUse: () => store.teamManagementAllowed(id),
         offerCanUse: () => !shuttingDown && store.get(id)?.status === "active" && store.get(id).balance >= 1,
         legacyUsed: (email) => store.legacyUsed(id, email),
         markLegacyUsed: (email) => store.markLegacyUsed(id, email),
@@ -203,6 +204,7 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
     await previous;
     let workspace; let record; let applied = false;
     try {
+      if (mode === "team" && !store.teamManagementAllowed(id)) throw cdkError(403, "当前 CDK 未开通 Team 空间，请联系管理员", "TEAM_FEATURE_FORBIDDEN");
       if (["single", "authorization"].includes(mode)) assertSmsRequest(id, body);
       workspace = await workspaceFor(id); workspace.pause();
       const prior = store.findImport(id, mode, body, requestKey);
@@ -265,7 +267,7 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
     const allowedSmsProviders = store.allowedSmsProviders(session.workspace.id);
     const allowedSmsProviderSet = new Set(allowedSmsProviders);
     const smsProviders = (original.features?.smsProviders || []).filter((provider) => allowedSmsProviderSet.has(provider.id));
-    const features = { ...original.features, smsProviders,
+    const features = { ...original.features, smsProviders, teamManagement: original.features?.teamManagement === true && store.teamManagementAllowed(session.workspace.id),
       allowedSmsProviders, cdk: true, admin: session.actor.role === "admin" };
     if (!allowedSmsProviders.includes("pool")) delete features.smsPool;
     return { authenticated: true, token: session.csrf, account: store.get(session.actor.id), workspace: store.get(session.workspace.id), settings: visibleWorkspaceSettings(session.workspace.id), features, announcement: announcements.publicAnnouncement() };
@@ -459,6 +461,7 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
       throw cdkError(404, "管理接口不存在");
     }
     if (url.pathname.startsWith("/api/offers/")) assertOfferAccess(() => store.get(owner)?.status === "active" && store.get(owner).balance >= 1);
+    if (url.pathname.startsWith("/api/teams/") && !store.teamManagementAllowed(owner)) throw cdkError(403, "当前 CDK 未开通 Team 空间，请联系管理员", "TEAM_FEATURE_FORBIDDEN");
     const workspace = await workspaceFor(owner);
     if (url.pathname === "/api/sub2api/bind" && req.method === "POST") {
       const body = await readRequestJson(req);
@@ -468,11 +471,18 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
       await workspace.bindRemote(body.remoteId, body.email, config); send(res, 200, { ok: true }); return;
     }
     if (url.pathname === "/api/imports/preview" && req.method === "POST") {
-      const body = await readRequestJson(req); const mode = ["single", "authorization", "mfa", "rebind"].includes(body.mode) ? body.mode : "authorization";
+      const body = await readRequestJson(req); const mode = ["single", "authorization", "mfa", "rebind", "team"].includes(body.mode) ? body.mode : "authorization";
+      if (mode === "team" && !store.teamManagementAllowed(owner)) throw cdkError(403, "当前 CDK 未开通 Team 空间，请联系管理员", "TEAM_FEATURE_FORBIDDEN");
       if (["single", "authorization"].includes(mode)) assertSmsRequest(owner, body.payload || {});
       const emails = workspace.planImport(mode, body.payload || {}); send(res, 200, store.preview(owner, emails, { mode })); return;
     }
-    const importMode = req.method === "POST" && ({ "/api/jobs": "single", "/api/jobs/batch": "authorization", "/api/mfa/import": "mfa", "/api/rebind/sync": "rebind" })[url.pathname];
+    if (url.pathname === "/api/teams/import/preview" && req.method === "POST") {
+      const body = await readRequestJson(req), response = await workspace.dispatch("POST", url.pathname, body, actor);
+      const preview = JSON.parse(response.body.toString());
+      const emails = workspace.planImport("team", body);
+      send(res, 200, { ...preview, billing: store.preview(owner, emails, { mode: "team" }) }); return;
+    }
+    const importMode = req.method === "POST" && ({ "/api/jobs": "single", "/api/jobs/batch": "authorization", "/api/mfa/import": "mfa", "/api/rebind/sync": "rebind", "/api/teams/import": "team" })[url.pathname];
     if (importMode) {
       const body = await readRequestJson(req); const result = await importFor(owner, importMode, body, String(req.headers["idempotency-key"] || body.requestKey || ""), actor);
       res.setHeader("x-cdk-balance", String(store.get(owner).balance)); send(res, result.status, result.data); return;
