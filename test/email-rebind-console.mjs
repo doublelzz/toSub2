@@ -35,7 +35,7 @@ async function call(route, method = "GET", body, headers = {}) {
   return { status: response.status, data: await response.json() };
 }
 async function start() {
-  app = await startCdkServer({ createWorkspace: createConsoleWorkspace, root, listen: false });
+  app = await startCdkServer({ emailVerification: false, createWorkspace: createConsoleWorkspace, root, listen: false });
   await new Promise((resolve) => app.server.listen(0, "127.0.0.1", resolve)); base = `http://127.0.0.1:${app.server.address().port}`;
 }
 async function login(secret) {

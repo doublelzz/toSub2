@@ -43,7 +43,7 @@ function client(ip) {
 
 function equal(actual, expected, name) { assert.deepEqual(actual, expected, name); assertions += 1; }
 async function start() {
-  app = await startCdkServer({ createWorkspace: async (options) => {
+  app = await startCdkServer({ emailVerification: false, createWorkspace: async (options) => {
     const workspace = await createConsoleWorkspace(options); const apply = workspace.applyImport;
     workspace.applyImport = async (mode, body) => { if (failRecovery && body.email === "recoverable@example.com") throw new Error("Synthetic interrupted recovery"); return apply(mode, body); };
     return workspace;
@@ -53,7 +53,7 @@ async function start() {
 
 try {
   await start();
-  await assert.rejects(startCdkServer({ createWorkspace: createConsoleWorkspace, root, listen: false }), /已有控制台/); assertions += 1;
+  await assert.rejects(startCdkServer({ emailVerification: false, createWorkspace: createConsoleWorkspace, root, listen: false }), /已有控制台/); assertions += 1;
   const anonymous = client("198.51.100.1"); const admin = client("198.51.100.2");
   equal((await anonymous.call("/api/bootstrap")).data.authenticated, false, "bootstrap does not issue public credentials");
   equal((await anonymous.call("/api/jobs")).status, 401, "anonymous task request rejected");

@@ -38,7 +38,7 @@ const parsed = response => JSON.parse(response.body.toString("utf8"));
 const ids = new Map();
 const email = name => `${name}@fixture.invalid`;
 async function start() {
-  app = await startCdkServer({ createWorkspace: createConsoleWorkspace, root, listen: false });
+  app = await startCdkServer({ emailVerification: false, createWorkspace: createConsoleWorkspace, root, listen: false });
   await new Promise(resolve => app.server.listen(0, "127.0.0.1", resolve));
   base = `http://127.0.0.1:${app.server.address().port}`;
 }

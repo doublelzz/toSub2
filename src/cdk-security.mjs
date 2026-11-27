@@ -36,6 +36,7 @@ export function cdkError(status, message, code = "") { return Object.assign(new 
 export function protocolEnvironment() {
   const environment = { ...process.env };
   delete environment.TOSUB2_ADMIN_CDK; delete environment.TOSUB2_ENCRYPTION_KEY;
+  for (const name of Object.keys(environment)) if (name.startsWith("TOSUB2_SMTP_")) delete environment[name];
   return environment;
 }
 

@@ -19,7 +19,7 @@ await fs.writeFile(wrapper, `if(!process.argv.includes('--team-login'))process.e
 const requests = [];
 let app, base, owner, other, credentials, administrator;
 async function start() {
-  app = await startCdkServer({ root, listen: false, createWorkspace: (options) => createConsoleWorkspace({ ...options, protocolScript: wrapper,
+  app = await startCdkServer({ emailVerification: false, root, listen: false, createWorkspace: (options) => createConsoleWorkspace({ ...options, protocolScript: wrapper,
     teamClientFactory: (input) => createTeamClient({ ...input, chatgptBase: upstream.base }) }) });
   await new Promise((resolve) => app.server.listen(0, "127.0.0.1", resolve)); base = `http://127.0.0.1:${app.server.address().port}`;
 }

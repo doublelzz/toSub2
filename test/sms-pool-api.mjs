@@ -18,7 +18,7 @@ function client() {
   };
 }
 try {
-  app = await startCdkServer({ root, listen: false, smsPoolOptions: { createProvider: (id, config) => ({ listNumberOptions: async () => {
+  app = await startCdkServer({ emailVerification: false, root, listen: false, smsPoolOptions: { createProvider: (id, config) => ({ listNumberOptions: async () => {
     optionsCalls++; assert.equal(config.apiKey, "synthetic-pool-key"); return [{ country: "1", title: "Synthetic country", price: 0.25, count: 5 }];
   }, getNumber: async () => ({ requestId: crypto.randomUUID(), number: `+1202555${String(++numberCount).padStart(4, "0")}`, cost: { amount: "0.25", currency: "USD", source: "order" } }) }) }, createWorkspace: async (options) => {
     scopes.set(options.cdkId, options.smsPool);

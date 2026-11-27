@@ -29,7 +29,7 @@ const wait = async (predicate) => {
   while (!predicate()) { assert.ok(Date.now() < deadline, "fixture operation did not reach expected stage"); await new Promise((resolve) => setTimeout(resolve, 10)); }
 };
 async function start() {
-  app = await startCdkServer({ root, listen: false, smsPoolOptions: { createProvider: () => ({
+  app = await startCdkServer({ emailVerification: false, root, listen: false, smsPoolOptions: { createProvider: () => ({
     activationPolicy: { lifetimeSeconds: 1500, minCancelAgeSeconds: 120, source: "fixture" },
     getNumber: async () => { const index = ++purchases; const order = { requestId: `permission-order-${index}`, number: `+1202555${String(index).padStart(4, "0")}` }; if (holdPurchase) return new Promise((resolve) => { finishPurchase = () => resolve(order); }); return order; },
     inspect: async () => { inspections++; return { state: "waiting", hasSms: false }; },

@@ -70,7 +70,7 @@ childProcess.spawn = (command, ...args) => {
 };
 syncBuiltinESMExports();
 async function start() {
-  app = await startCdkServer({ root, listen: false, createWorkspace: async (options) => {
+  app = await startCdkServer({ emailVerification: false, root, listen: false, createWorkspace: async (options) => {
     const open = options.credentialVault.open;
     options.credentialVault = { ...options.credentialVault, open: (value, scope) => { decrypted.push(scope); return open(value, scope); } };
     const openRebind = options.rebindVault.open;

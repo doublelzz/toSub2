@@ -51,7 +51,7 @@ async function waitFor(operation) {
   throw new Error("synthetic sync condition timed out");
 }
 try {
-  app = await startCdkServer({ root, createWorkspace: createConsoleWorkspace, listen: false });
+  app = await startCdkServer({ emailVerification: false, root, createWorkspace: createConsoleWorkspace, listen: false });
   const [owner, other] = app.store.generate({ count: 2, quota: 10, note: "synthetic MFA sync" }, app.store.adminId);
   const workspace = await app.workspaceFor(owner.id);
   const otherWorkspace = await app.workspaceFor(other.id);
@@ -110,7 +110,7 @@ try {
   await fs.writeFile(metadataPath, JSON.stringify({ ...metadata, status: "completed", result_saved: true, account_insights_return_status: null }));
   await app.close();
   const countBeforeRestart = requests.length;
-  app = await startCdkServer({ root, createWorkspace: createConsoleWorkspace, listen: false });
+  app = await startCdkServer({ emailVerification: false, root, createWorkspace: createConsoleWorkspace, listen: false });
   const restored = await app.workspaceFor(owner.id);
   job = restored.publicJobs()[0];
   assert.equal(job.status, "completed");

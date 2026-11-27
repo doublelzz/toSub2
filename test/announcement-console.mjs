@@ -31,7 +31,7 @@ function client() {
 }
 
 async function start() {
-  app = await startCdkServer({ root, listen: false, createWorkspace: async () => ({
+  app = await startCdkServer({ emailVerification: false, root, listen: false, createWorkspace: async () => ({
     activeCount: () => 0, tick: () => 0, inventory: () => [], publicJobs: () => [],
     pause() {}, resume() {}, stop: async () => {}, shutdown: async () => {},
     dispatch: async () => ({ status: 200, body: Buffer.from(JSON.stringify({ features: {} })) }),

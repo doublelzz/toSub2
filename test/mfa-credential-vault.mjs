@@ -47,7 +47,7 @@ function client() {
 }
 
 async function start() {
-  app = await startCdkServer({
+  app = await startCdkServer({ emailVerification: false,
     root, listen: false,
     async createWorkspace(options) {
       // Keep native process locking on the host OS; only credential-store

@@ -4,6 +4,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { cdkError, normalizeClientIp, positiveInteger, randomSecret, secretHash } from "./cdk-security.mjs";
 import { poolCostOrder, summarizePoolCosts, poolCostFilters, matchesPoolCost, poolCostAnalytics } from "./sms-pool-costs.mjs";
+import { createCdkEmailAuth } from "./cdk-email-auth.mjs";
 
 const DEFAULT_RULES = { ratePerMinute: 30, warnFailures: 5, banFailures: 10, failureWindowMinutes: 10, banMinutes: 30, escalationCount: 3, escalationHours: 24, retentionDays: 30 };
 export const CDK_SMS_PROVIDER_IDS = ["custom", "luban", "smsbower", "herosms", "daxigua", "pool"];
@@ -103,6 +104,8 @@ export async function createCdkStore(root, vault) {
     smsPoolConsumed: -db.prepare("SELECT COALESCE(SUM(delta),0) AS total FROM ledger WHERE cdk_id=? AND kind='sms-pool'").get(row.id).total,
     allowedSmsProviders: allowedSmsProviders(row),
     teamManagementEnabled: teamManagementEnabled(row),
+    email: row.bound_email || null, emailBoundAt: row.email_bound_at ? new Date(row.email_bound_at).toISOString() : null,
+    trustedDevices: db.prepare("SELECT COUNT(*) AS n FROM trusted_devices WHERE cdk_id=? AND version=? AND revoked_at IS NULL AND expires_at>?").get(row.id, row.version, Date.now()).n,
     everConsumed: Boolean(row.ever_consumed), note: row.note, createdAt: new Date(row.created_at).toISOString(), lastLogin: row.last_login ? new Date(row.last_login).toISOString() : null, accounts: db.prepare("SELECT COUNT(*) AS total FROM accounts WHERE cdk_id=? AND deleted_at IS NULL").get(row.id).total } : null;
   const requireActive = (id) => { const row = get(id); if (!row || row.status !== "active") throw cdkError(403, "CDK 已失效或被禁用"); return row; };
   const setting = (id, name) => { const row = db.prepare("SELECT value FROM settings WHERE cdk_id=? AND name=?").get(id, name); return row ? vault.open(row.value, `${id}:${name}`) : null; };
@@ -652,9 +655,9 @@ export async function createCdkStore(root, vault) {
       audit(actor, "reveal-current-cdk", id);
       return stored.secret;
     },
-    createSession(id) {
+    createSession(id, deviceId = null) {
       const row = requireActive(id); const secret = crypto.randomBytes(32).toString("base64url"); const csrf = crypto.randomBytes(24).toString("base64url"); const now = Date.now();
-      db.prepare("INSERT INTO sessions VALUES(?,?,?,?,?,?,?,?)").run(secretHash(secret), id, id, csrf, row.version, now, now, now + 24 * 60 * 60_000);
+      db.prepare("INSERT INTO sessions(id_hash,cdk_id,workspace_id,csrf,version,created_at,last_seen,expires_at,device_id) VALUES(?,?,?,?,?,?,?,?,?)").run(secretHash(secret), id, id, csrf, row.version, now, now, now + 24 * 60 * 60_000, deviceId);
       db.prepare("UPDATE cdks SET last_login=? WHERE id=?").run(now, id); return { secret, csrf };
     },
     session(secret) {
@@ -741,6 +744,7 @@ export async function createCdkStore(root, vault) {
       if (!source) throw cdkError(400, "CDK 无效或不可用", "INVALID_CDK");
       if (target.role !== "user" || source.role !== "user") throw cdkError(409, "管理员 CDK 不参与次数融合");
       if (target.id === source.id) throw cdkError(409, "不能融合当前 CDK");
+      if (source.email) throw cdkError(409, "来源 CDK 已绑定邮箱，是独立账号，不能被融合", "CDK_EMAIL_BOUND");
       if (source.everConsumed || source.consumed > 0) throw cdkError(409, "来源 CDK 曾消耗过次数，无法融合");
       if (db.prepare("SELECT 1 FROM sms_pool_operations WHERE cdk_id=? AND status NOT IN ('verified','released')").get(source.id)) throw cdkError(409, "来源 CDK 有未完成的接码操作，请稍后重试");
       if (source.reserved || db.prepare("SELECT 1 FROM imports WHERE cdk_id=? AND status='pending'").get(source.id)) throw cdkError(409, "来源 CDK 有未完成的导入，请稍后重试");
@@ -847,5 +851,6 @@ export async function createCdkStore(root, vault) {
     cleanup() { const now = Date.now(); const rules = store.rules(); db.prepare("DELETE FROM sessions WHERE expires_at<? OR last_seen<?").run(now, now - 2 * 60 * 60000); db.prepare("DELETE FROM verification_attempts WHERE created_at<?").run(now - Math.max(24 * 60, rules.failureWindowMinutes) * 60000); db.prepare("DELETE FROM security_events WHERE last_at<?").run(now - rules.retentionDays * 86400000); },
     close: () => db.close(),
   };
+  store.emailAuth = createCdkEmailAuth({ db, vault, createSession: (id, deviceId) => store.createSession(id, deviceId) });
   return store;
 }

@@ -67,7 +67,7 @@ try {
   const forbiddenProtocol = path.join(root, "must-not-run.mjs");
   const protocolMarker = path.join(root, "unexpected-protocol-run");
   await fs.writeFile(forbiddenProtocol, `import fs from 'node:fs/promises'; await fs.writeFile(${JSON.stringify(protocolMarker)}, 'unexpected'); process.exit(1);`);
-  app = await startCdkServer({ root, listen: false, createWorkspace: (options) => createConsoleWorkspace({ ...options, protocolScript: forbiddenProtocol,
+  app = await startCdkServer({ emailVerification: false, root, listen: false, createWorkspace: (options) => createConsoleWorkspace({ ...options, protocolScript: forbiddenProtocol,
     credentialVault: { ...options.credentialVault, open: (...args) => { credentialDecrypts++; return options.credentialVault.open(...args); } } }) });
   await new Promise((resolve) => app.server.listen(0, "127.0.0.1", resolve));
   const base = `http://127.0.0.1:${app.server.address().port}`;

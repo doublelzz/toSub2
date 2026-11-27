@@ -44,7 +44,7 @@ const providerBase = `http://127.0.0.1:${provider.address().port}/handler_api.ph
 let app;
 async function wait(predicate, message) { const until = Date.now() + 15000; while (Date.now() < until) { if (await predicate()) return; await new Promise((resolve) => setTimeout(resolve, 20)); } throw new Error(message); }
 try {
-  app = await startCdkServer({ root: path.join(root, "data"), listen: false, smsPoolOptions: { providerOptions: { smsBowerApiBase: providerBase } },
+  app = await startCdkServer({ emailVerification: false, root: path.join(root, "data"), listen: false, smsPoolOptions: { providerOptions: { smsBowerApiBase: providerBase } },
     createWorkspace: (options) => createConsoleWorkspace({ ...options, protocolScript: protocolFile }) });
   const admin = app.store.adminId; const [owner] = app.store.generate({ count: 1, quota: 20, note: "legacy demand fixture", allowedSmsProviders: ["custom", "pool"] }, admin);
   app.smsPool.saveRules({ enabled: true, requestConcurrency: 2 }, admin);

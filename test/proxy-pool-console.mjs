@@ -41,7 +41,7 @@ function client(ip) {
 }
 async function start() {
   captured.clear();
-  app = await startCdkServer({ root, listen: false, createWorkspace: async (options) => {
+  app = await startCdkServer({ emailVerification: false, root, listen: false, createWorkspace: async (options) => {
     captured.set(options.cdkId, options);
     return createConsoleWorkspace(options);
   } });

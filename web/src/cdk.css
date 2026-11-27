@@ -15,6 +15,20 @@
 .cdk-entry-form label { display: grid; gap: 8px; font-size: 13px; margin: 25px 0 20px; }
 .cdk-entry-form input { min-width: 0; width: 100%; padding: 11px; color: var(--ink); background: var(--surface); border: 1px solid var(--line); border-radius: 8px; font: inherit; }
 .cdk-entry-form .primary-button { width: 100%; }
+.cdk-email-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+.cdk-email-actions .secondary-button { flex: 1 1 auto; min-height: 44px; }
+.cdk-binding-tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 18px; }
+.cdk-binding-tabs button[aria-pressed="true"] { color: var(--green); border-color: var(--green); background: var(--surface-subtle); }
+.cdk-account-security { margin-top: 28px; padding-top: 4px; border-top: 1px solid var(--line); }
+.cdk-device-list { list-style: none; margin: 12px 0 0; padding: 0; }
+.cdk-device-list li { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 15px 0; border-bottom: 1px solid var(--line); }
+.cdk-device-list li > div { min-width: 0; }
+.cdk-device-list strong { font-size: 14px; overflow-wrap: anywhere; }
+.cdk-device-list small { display: block; margin-top: 7px; color: var(--muted); font-size: 12px; line-height: 1.8; }
+.cdk-device-list button { flex-shrink: 0; min-height: 44px; }
+.cdk-entry-form input:focus-visible { outline: 2px solid var(--green); outline-offset: 3px; }
+.cdk-entry-form input[autocomplete="one-time-code"] { font-size: 22px; font-variant-numeric: tabular-nums; letter-spacing: .15em; }
+@media (max-width: 480px) { .cdk-device-list li { align-items: flex-start; flex-direction: column; gap: 10px; } }
 .cdk-remember { margin: -8px 0 18px; }
 .cdk-entry-form .cdk-remember label { display: flex; align-items: center; gap: 8px; min-height: 32px; margin: 0; cursor: pointer; }
 .cdk-entry-form .cdk-remember input { flex: 0 0 16px; width: 16px; height: 16px; margin: 0; padding: 0; accent-color: var(--green); }

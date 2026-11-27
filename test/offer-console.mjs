@@ -88,7 +88,7 @@ async function call(route, method = "GET", body, extra = {}) {
   const response = await fetch(`${base}${route}`, { method, headers: { "content-type": "application/json", "x-console-token": token, cookie, ...extra }, ...(body && method !== "GET" ? { body: JSON.stringify(body) } : {}) });
   return { status: response.status, data: await response.json() };
 }
-async function startServer() { app = await startCdkServer({ createWorkspace: createConsoleWorkspace, root, listen: false }); await new Promise((resolve) => app.server.listen(0, "127.0.0.1", resolve)); base = `http://127.0.0.1:${app.server.address().port}`; }
+async function startServer() { app = await startCdkServer({ emailVerification: false, createWorkspace: createConsoleWorkspace, root, listen: false }); await new Promise((resolve) => app.server.listen(0, "127.0.0.1", resolve)); base = `http://127.0.0.1:${app.server.address().port}`; }
 async function login(secret) { const response = await fetch(`${base}/api/auth/login`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ cdk: secret }) }); assert.equal(response.status, 200); cookie = response.headers.get("set-cookie").split(";")[0]; token = (await response.json()).token; }
 async function begin(raw, extra = {}) {
   const preview = await call("/api/offers/preview", "POST", { text: raw }); assert.equal(preview.status, 200, JSON.stringify(preview.data));

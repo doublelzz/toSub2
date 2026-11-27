@@ -10,7 +10,7 @@ import { createTeamFixture, fixtureSession } from "./team-fixture.mjs";
 
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "tosub2-team-preview-")), fixture = await createTeamFixture();
 Object.assign(process.env, { TOSUB2_ADMIN_CDK: "team-local-preview-administrator-only", TOSUB2_ENCRYPTION_KEY: crypto.randomBytes(32).toString("base64"), CHATGPT_BASE: fixture.base, AUTH_BASE: fixture.base });
-const app = await startCdkServer({ root, listen: false, createWorkspace: (options) => createConsoleWorkspace({ ...options,
+const app = await startCdkServer({ emailVerification: false, root, listen: false, createWorkspace: (options) => createConsoleWorkspace({ ...options,
   teamClientFactory: (input) => createTeamClient({ ...input, chatgptBase: fixture.base }) }) });
 const [owner] = app.store.generate({ count: 1, quota: 10, note: "Team 开发验收（模拟数据）", teamManagementEnabled: true }, app.store.adminId);
 const workspace = await app.workspaceFor(owner.id);

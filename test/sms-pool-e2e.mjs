@@ -47,7 +47,7 @@ process.env.SMSBOWER_API_BASE = providerBase;
 let app; let first; let second; let assertions = 0;
 const check = (actual, expected, message) => { assert.deepEqual(actual, expected, message); assertions++; };
 async function start() {
-  app = await startCdkServer({ root: path.join(root, "data"), listen: false,
+  app = await startCdkServer({ emailVerification: false, root: path.join(root, "data"), listen: false,
     smsPoolOptions: { providerOptions: { smsBowerApiBase: providerBase } },
     createWorkspace: (options) => createConsoleWorkspace({ ...options, protocolScript: fixture }) });
 }

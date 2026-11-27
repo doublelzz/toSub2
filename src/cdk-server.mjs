@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 import { JSDOM } from "jsdom";
 import { createCdkStore } from "./cdk-store.mjs";
 import { createCdkVault } from "./cdk-vault.mjs";
+import { createCdkMailer } from "./cdk-mailer.mjs";
+import { DEVICE_TTL } from "./cdk-email-auth.mjs";
 import { acquireCdkLock } from "./cdk-lock.mjs";
 import { cdkError, clientIp, normalizeClientIp, readRequestJson, requireSameOrigin } from "./cdk-security.mjs";
 import { assertOfferAccess } from "./offer-workspace.mjs";
@@ -16,6 +18,8 @@ import { createProxyPool, normalizeProxyPool, workspaceProxyPool, PROXY_POOL_SET
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cookieName = "tosub2_session";
+const challengeCookieName = "tosub2_login_challenge";
+const deviceCookieName = (id) => `tosub2_device_${id.replace(/-/g, "")}`;
 const smsSettingsKey = "chatgpt-onboarding.sms-provider-settings-v1";
 const legacySmsSettingsKeys = ["chatgpt-onboarding.luban-api-key", "chatgpt-onboarding.luban-service-id"];
 
@@ -30,10 +34,10 @@ function argument(name, fallback) {
   return inline ? inline.slice(name.length + 3) : index >= 0 ? process.argv[index + 1] : fallback;
 }
 
-function cookie(req) {
-  const entry = String(req.headers.cookie || "").split(";").map((part) => part.trim()).find((part) => part.startsWith(`${cookieName}=`));
+function cookie(req, name = cookieName) {
+  const entry = String(req.headers.cookie || "").split(";").map((part) => part.trim()).find((part) => part.startsWith(`${name}=`));
   if (!entry) return null;
-  try { return decodeURIComponent(entry.slice(cookieName.length + 1)); } catch { return null; }
+  try { return decodeURIComponent(entry.slice(name.length + 1)); } catch { return null; }
 }
 
 async function legacyEmails(root) {
@@ -54,7 +58,8 @@ async function legacyEmails(root) {
   return emails;
 }
 
-export async function startCdkServer({ createWorkspace, root = process.env.ONBOARDING_OUTPUT_ROOT || path.join(projectRoot, "tmp", "chatgpt-onboarding-console"), listen = true, smsPoolOptions = {} } = {}) {
+export async function startCdkServer({ createWorkspace, root = process.env.ONBOARDING_OUTPUT_ROOT || path.join(projectRoot, "tmp", "chatgpt-onboarding-console"), listen = true, smsPoolOptions = {}, emailVerification = true, mailer = createCdkMailer() } = {}) {
+  if (!emailVerification && listen) throw new Error("Email verification may only be disabled by isolated test harnesses");
   root = path.resolve(root); await fs.mkdir(root, { recursive: true });
   const processLock = await acquireCdkLock(root);
   let cleanupFailedStart = async () => {};
@@ -250,8 +255,13 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
     try { await fs.access(folder); await workspaceFor(record.id); } catch (error) { if (error.code !== "ENOENT") throw error; }
   }
 
-  function authenticated(req) {
+  function requestSession(req) {
     const session = store.session(cookie(req));
+    return session && (!emailVerification || store.emailAuth.acceptsSession(session, cookie(req, deviceCookieName(session.cdk_id)))) ? session : null;
+  }
+
+  function authenticated(req) {
+    const session = requestSession(req);
     if (!session) throw cdkError(401, "请验证 CDK 后继续", "AUTH_REQUIRED");
     if (!["GET", "HEAD"].includes(req.method) || req.headers["x-console-token"] !== undefined) {
       const supplied = String(req.headers["x-console-token"] || "");
@@ -273,10 +283,10 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
     return { authenticated: true, token: session.csrf, account: store.get(session.actor.id), workspace: store.get(session.workspace.id), settings: visibleWorkspaceSettings(session.workspace.id), features, announcement: announcements.publicAnnouncement() };
   }
 
-  function sessionCookie(req, value, expired = false) {
+  function sessionCookie(req, value, expired = false, name = cookieName, maxAge = 86400, cookiePath = "/") {
     const direct = normalizeClientIp(req.socket?.remoteAddress);
     const secure = Boolean(req.socket?.encrypted) || trustedProxies.map(normalizeClientIp).includes(direct) && req.headers["x-forwarded-proto"] === "https";
-    return `${cookieName}=${encodeURIComponent(value)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${expired ? 0 : 86400}${secure ? "; Secure" : ""}`;
+    return `${name}=${encodeURIComponent(value)}; Path=${cookiePath}; HttpOnly; SameSite=Strict; Max-Age=${expired ? 0 : maxAge}${secure ? "; Secure" : ""}`;
   }
 
   async function api(req, res, url, ip) {
@@ -289,11 +299,44 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
         throw cdkError(401, "CDK 无效或不可用", "INVALID_CDK");
       }
       store.rememberSecret(cdk.id, body.cdk);
-      const created = store.createSession(cdk.id); res.setHeader("set-cookie", sessionCookie(req, created.secret));
+      const previous = store.session(cookie(req)); if (previous) store.logout(previous);
+      store.emailAuth.cancel(cookie(req, challengeCookieName));
+      const created = emailVerification ? store.emailAuth.loginWithDevice(cdk.id, cookie(req, deviceCookieName(cdk.id))) : store.createSession(cdk.id);
+      if (!created) {
+        const { secret, ...challenge } = store.emailAuth.begin(cdk.id, ip, req.headers["user-agent"]);
+        res.setHeader("set-cookie", [sessionCookie(req, "", true), sessionCookie(req, secret, false, challengeCookieName, 600, "/api")]);
+        send(res, 200, challenge); return;
+      }
+      res.setHeader("set-cookie", [sessionCookie(req, created.secret), sessionCookie(req, "", true, challengeCookieName, 600, "/api")]);
       send(res, 200, await bootstrap(store.session(created.secret))); return;
     }
+    if (emailVerification && ["/api/auth/email/send", "/api/auth/email/verify", "/api/auth/cancel"].includes(url.pathname) && req.method === "POST") {
+      const attempt = store.checkVerification(ip); const challenge = cookie(req, challengeCookieName);
+      store.emailAuth.checkCsrf(challenge, req.headers["x-console-token"]);
+      const body = await readRequestJson(req);
+      if (url.pathname === "/api/auth/cancel") {
+        store.emailAuth.cancel(challenge); res.setHeader("set-cookie", sessionCookie(req, "", true, challengeCookieName, 600, "/api")); send(res, 200, { authenticated: false }); return;
+      }
+      if (url.pathname.endsWith("/send")) {
+        if (!mailer.configured) throw cdkError(503, "发信服务尚未配置，请联系管理员", "SMTP_UNAVAILABLE");
+        const delivery = store.emailAuth.prepareSend(challenge, body.email, ip);
+        try { await mailer.sendCode(delivery); store.emailAuth.sent(challenge, delivery.generation, true); }
+        catch (error) { store.emailAuth.sent(challenge, delivery.generation, false); throw error; }
+        send(res, 200, store.emailAuth.challenge(challenge)); return;
+      }
+      let result;
+      try { result = store.emailAuth.verify(challenge, body.code); }
+      catch (error) { if (error.code === "OTP_INVALID") store.failedVerification(ip, "email", "email-otp-invalid", attempt); throw error; }
+      res.setHeader("set-cookie", [sessionCookie(req, result.session.secret), sessionCookie(req, result.deviceSecret, false, deviceCookieName(result.cdkId), DEVICE_TTL / 1000), sessionCookie(req, "", true, challengeCookieName, 600, "/api")]);
+      send(res, 200, await bootstrap(store.session(result.session.secret))); return;
+    }
     if (url.pathname === "/api/bootstrap" && req.method === "GET") {
-      const session = store.session(cookie(req)); send(res, 200, session ? await bootstrap(session) : { authenticated: false, features: { cdk: true } }); return;
+      const session = requestSession(req);
+      if (session) { send(res, 200, await bootstrap(session)); return; }
+      if (emailVerification && cookie(req, challengeCookieName)) {
+        try { send(res, 200, store.emailAuth.challenge(cookie(req, challengeCookieName))); return; } catch (error) { if (error.code !== "AUTH_CHALLENGE_EXPIRED") throw error; }
+      }
+      send(res, 200, { authenticated: false, features: { cdk: true } }); return;
     }
     const session = authenticated(req); const actor = session.actor.id; const owner = session.workspace.id;
     req.actorId = actor;
@@ -306,6 +349,9 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
     if (url.pathname === "/api/sms-pool" && req.method === "GET") { assertSmsProvider(owner, "pool"); send(res, 200, smsPool.publicSummary(url.searchParams.get("categoryId") || null)); return; }
     if (url.pathname === "/api/auth/me" && req.method === "GET") { send(res, 200, await bootstrap(session)); return; }
     if (url.pathname === "/api/auth/logout" && req.method === "POST") { store.logout(session); res.setHeader("set-cookie", sessionCookie(req, "", true)); send(res, 200, { ok: true }); return; }
+    if (url.pathname === "/api/auth/devices" && req.method === "GET") { send(res, 200, { items: store.emailAuth.devices(actor, session.device_id) }); return; }
+    const revokeDevice = /^\/api\/auth\/devices\/([a-f0-9-]+)$/.exec(url.pathname);
+    if (revokeDevice && req.method === "DELETE") { store.emailAuth.revoke(actor, revokeDevice[1]); send(res, 200, { ok: true }); return; }
     if (url.pathname === "/api/auth/workspace" && req.method === "POST") {
       const body = await readRequestJson(req); const csrf = store.switchWorkspace(session, String(body.cdkId || actor));
       const updated = store.session(cookie(req)); updated.csrf = csrf; send(res, 200, await bootstrap(updated)); return;
@@ -531,7 +577,7 @@ export async function startCdkServer({ createWorkspace, root = process.env.ONBOA
   });
   server.requestTimeout = 30000; server.headersTimeout = 10000; server.keepAliveTimeout = 5000;
   queueTimer = setInterval(scheduleAll, 150); queueTimer.unref();
-  cleanupTimer = setInterval(() => store.cleanup(), 60000); cleanupTimer.unref();
+   cleanupTimer = setInterval(() => { store.cleanup(); store.emailAuth.cleanup(); }, 60000); cleanupTimer.unref();
   if (listen) {
     const host = String(argument("host", process.env.ONBOARDING_HOST || "127.0.0.1")); const port = Number(argument("port", process.env.ONBOARDING_PORT || 4399));
     if (!host || host.startsWith("--") || !Number.isInteger(port) || port < 1 || port > 65535) throw new Error("监听地址或端口无效");
