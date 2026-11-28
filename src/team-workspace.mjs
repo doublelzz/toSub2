@@ -4,7 +4,7 @@ import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { parseOfferImport } from "./offer-workspace.mjs";
 import { fetchMailboxOtpCandidates, filterMailboxOtpCandidatesByRequestTime } from "./mail-otp.mjs";
-import { createTeamClient, teamIdentity, teamEmail, teamError, publicTeamError, teamCanRemove, teamRoleChoices, teamRoleLabel, TEAM_INVITE_ROLES, teamInviteRoleChoices, teamSnapshotCapabilities } from "./team-client.mjs";
+import { createTeamClient, teamIdentity, teamEmail, teamError, publicTeamError, teamCanRemove, teamCanCancelInvite, teamRoleChoices, teamRoleLabel, TEAM_INVITE_ROLES, teamInviteRoleChoices, teamSnapshotCapabilities } from "./team-client.mjs";
 
 const text = (value) => typeof value === "string" ? value.trim() : "";
 const fail = (message, status = 400) => Object.assign(new Error(message), { status });
@@ -187,6 +187,9 @@ export async function createTeamWorkspace({ root, vault, parseText, listSources 
       } else if (record.kind === "remove" && fresh.members && !fresh.members.items.some((row) => row.id === record.memberId)) {
         record.status = "completed"; record.result = { success: true, memberEmail: record.memberEmail, reconciled: true, refreshErrors: {} };
         addLog(team, record.actorId, "remove", "重新同步已确认目标成员不在团队中");
+      } else if (record.kind === "cancel-invite" && fresh.invites && !fresh.errors.invites && fresh.members && !fresh.errors.members && !fresh.invites.items.some((row) => row.email === record.inviteEmail)) {
+        record.status = "completed"; record.result = { success: true, inviteEmail: record.inviteEmail, alreadyMember: fresh.members.items.some((row) => row.email === record.inviteEmail), reconciled: true, refreshErrors: {} };
+        addLog(team, record.actorId, "cancel-invite", `重新同步已确认 ${record.inviteEmail} 不在待接受邀请中`);
       } else if (record.kind === "invite" && record.targetEmails?.length && fresh.members && fresh.invites) {
         const role = record.role || "standard-user";
         const members = new Set(fresh.members.items.filter((row) => row.role === role).map((row) => row.email)), invites = new Set(fresh.invites.items.filter((row) => row.role === role).map((row) => row.email));
@@ -423,7 +426,8 @@ export async function createTeamWorkspace({ root, vault, parseText, listSources 
     const query = text(body.search).toLowerCase();
     const all = (body.tab === "invites" ? snapshot?.invites?.items : snapshot?.members?.items) || [];
     const current = snapshot?.members?.items.find((member) => member.id === snapshot?.capabilities?.currentMemberId);
-    const items = all.filter((row) => !query || `${row.email} ${row.name || ""}`.toLowerCase().includes(query)).map((row) => body.tab === "invites" ? row : { ...row,
+    const items = all.filter((row) => !query || `${row.email} ${row.name || ""}`.toLowerCase().includes(query)).map((row) => body.tab === "invites" ? { ...row,
+      canCancel: Boolean(row.id && view.status === "ready" && !snapshot?.errors?.refresh && !snapshot?.errors?.invites && !snapshot?.errors?.members && teamCanCancelInvite(snapshot?.capabilities?.role, row)) } : { ...row,
       canRemove: !row.scimManaged && !snapshot?.errors?.members && teamCanRemove(snapshot?.capabilities?.role, row, current),
       roleChoices: !snapshot?.errors?.members ? teamRoleChoices(snapshot?.capabilities?.role, row, current, snapshot?.members?.items) : [] });
     const pages = Math.max(1, Math.ceil(items.length / 20)), page = Math.min(pages, Math.max(1, Number.isSafeInteger(body.page) ? body.page : 1));
@@ -453,27 +457,32 @@ export async function createTeamWorkspace({ root, vault, parseText, listSources 
       reason: !roleAllowed ? "只有团队所有者可以邀请管理员或所有者" : !snapshot?.capabilities?.canInvite ? snapshot?.capabilities?.inviteReason || "请先同步团队信息" : !capacityOk ? "空闲席位不足（含待接受邀请），请减少新增邮箱数量" : view.stale ? "团队信息存在同步失败项，请先同步" : "" };
   }
   async function mutate(id, body, actorId, kind) {
-    if (!["invite", "remove", "role"].includes(kind)) throw fail("团队操作不存在", 404);
+    if (!["invite", "remove", "role", "cancel-invite"].includes(kind)) throw fail("团队操作不存在", 404);
     access(); const team = teamOf(id), account = accountOf(body.accountId || team.selectedAccountId);
     if (!team.accountIds.includes(account.id)) throw fail("账号与目标团队不匹配", 403);
     const key = requestKey(body), emails = kind === "invite" ? parseTeamEmails(body.emails) : null;
     const inviteRole = kind === "invite" ? body.role ?? "standard-user" : null;
     if (kind === "invite" && !TEAM_INVITE_ROLES.includes(inviteRole)) throw fail("请选择有效的邀请角色", 422);
+    if (kind === "cancel-invite" && (!text(body.inviteId) || !validEmail(teamEmail(body.inviteEmail)) || teamEmail(body.inviteEmail).length > 254)) throw fail("缺少目标邀请身份，请重新打开确认框");
     if (["remove", "role"].includes(kind) && (!text(body.memberId) || !validEmail(teamEmail(body.memberEmail)))) throw fail("缺少目标成员身份，请重新打开确认框");
     if (kind === "role" && (!["account-owner", "standard-user"].includes(body.role) || !text(body.previousRole))) throw fail("请选择所有者或普通成员，并重新确认当前角色");
-    const digest = hash({ id, accountId: account.id, kind, emails, memberId: body.memberId, memberEmail: teamEmail(body.memberEmail), ...(kind === "role" ? { role: body.role, previousRole: body.previousRole } : kind === "invite" && inviteRole !== "standard-user" ? { role: inviteRole } : {}) });
+    const digest = hash({ id, accountId: account.id, kind, emails, memberId: body.memberId, memberEmail: teamEmail(body.memberEmail), ...(kind === "role" ? { role: body.role, previousRole: body.previousRole } : kind === "cancel-invite" ? { inviteId: body.inviteId, inviteEmail: teamEmail(body.inviteEmail) } : kind === "invite" && inviteRole !== "standard-user" ? { role: inviteRole } : {}) });
     const previous = state.requests.find((row) => row.key === key);
     if (previous) {
       if (previous.digest !== digest) throw fail("同一请求标识不能用于其他团队操作", 409);
       if (previous.status === "completed") return previous.result;
       throw fail(previous.status === "running" ? "该操作正在执行，请稍后查看" : "该操作尚未确认成功，请先同步核对，不要重复提交", 409);
     }
-    if (state.requests.some((row) => row.teamId === id && row.status === "unknown" && (kind === "invite" ? row.kind === kind && row.targetEmails?.some((email) => emails.includes(email)) : row.memberId === body.memberId))) throw fail("该成员或邮箱存在尚未确认的操作，请先同步团队核对", 409);
+    if (state.requests.some((row) => row.teamId === id && row.status === "unknown" && (kind === "invite"
+      ? row.targetEmails?.some((email) => emails.includes(email)) || row.kind === "cancel-invite" && emails.includes(row.inviteEmail)
+      : kind === "cancel-invite" ? row.inviteEmail === teamEmail(body.inviteEmail) || row.targetEmails?.includes(teamEmail(body.inviteEmail))
+      : row.memberId === body.memberId))) throw fail("该成员或邮箱存在尚未确认的操作，请先同步团队核对", 409);
     if (teamLocks.has(id) || team.accountIds.some((id) => isBusy(accountOf(id).email) || LIVE.has(accountOf(id).status)) || isAccountBusy(account.email)) throw fail("团队或账号正在执行任务，请稍后重试", 409);
     if (network.size >= 3) throw fail("当前有多个团队操作，请稍后重试", 409);
     const run = { email: account.email, controller: new AbortController() };
     teamLocks.add(id); network.set(key, run);
-    const record = { key, digest, status: "running", kind, teamId: id, accountId: account.id, actorId, memberId: body.memberId, memberEmail: teamEmail(body.memberEmail), role: kind === "role" ? body.role : inviteRole || undefined, at: stamp() };
+    const record = { key, digest, status: "running", kind, teamId: id, accountId: account.id, actorId, memberId: body.memberId, memberEmail: teamEmail(body.memberEmail),
+      ...(kind === "cancel-invite" ? { inviteId: body.inviteId, inviteEmail: teamEmail(body.inviteEmail) } : {}), role: kind === "role" ? body.role : inviteRole || undefined, at: stamp() };
     state.requests.push(record); state.requests = state.requests.slice(-1000);
     const task = (async () => {
       await save();
@@ -506,6 +515,23 @@ export async function createTeamWorkspace({ root, vault, parseText, listSources 
           }
           record.targetEmails = results.filter((row) => ["invited", "unknown"].includes(row.status)).map((row) => row.email);
           result = { results, role: inviteRole, teamId: id, requestKey: key };
+        } else if (kind === "cancel-invite") {
+          if (!fresh.members || !fresh.invites || fresh.errors.members || fresh.errors.invites || fresh.errors.refresh || !["account-owner", "account-admin"].includes(fresh.capabilities.role)) throw fail("当前账号没有取消邀请的权限，或成员与邀请信息未完整同步", 403);
+          const email = teamEmail(body.inviteEmail);
+          if (fresh.members.items.some((row) => row.email === email)) throw fail("对方已接受邀请并加入团队，不能取消邀请；请在现有成员中处理", 409);
+          const target = fresh.invites.items.find((row) => row.id === body.inviteId);
+          if (!target) {
+            if (fresh.invites.items.some((row) => row.email === email)) throw fail("该邮箱的邀请记录已变化，请刷新后重新确认", 409);
+            result = { success: true, alreadyCanceled: true, inviteEmail: email };
+          } else {
+            if (target.email !== email) throw fail("邀请身份已变化，请重新确认目标邮箱", 409);
+            if (!teamCanCancelInvite(fresh.capabilities.role, target)) throw fail("当前账号无权取消此角色的邀请，或该邀请由目录管理", 403);
+            record.mutationStarted = true; await save();
+            if (run.controller.signal.aborted || !canUse()) throw teamError("TEAM_CANCELLED");
+            const response = await client.cancelInvite(team.workspaceId, email);
+            if (response.success !== true) throw teamError("TEAM_RESPONSE", 502, true);
+            result = { success: true, inviteEmail: email };
+          }
         } else if (kind === "role") {
           if (!fresh.members || fresh.errors.members || !fresh.capabilities.canChangeRoles) throw fail("只有已确认的团队所有者可以修改角色", 403);
           const target = fresh.members.items.find((row) => row.id === body.memberId), current = fresh.members.items.find((row) => row.id === fresh.capabilities.currentMemberId);
@@ -534,6 +560,7 @@ export async function createTeamWorkspace({ root, vault, parseText, listSources 
         }
         const observed = (snapshot) => kind === "invite"
           ? result.results.filter((row) => ["invited", "unknown"].includes(row.status)).every((row) => [...(snapshot.invites?.items || []), ...(snapshot.members?.items || [])].some((item) => item.email === row.email && item.role === inviteRole))
+          : kind === "cancel-invite" ? Boolean(snapshot.invites && !snapshot.errors.invites && !snapshot.invites.items.some((row) => row.email === teamEmail(body.inviteEmail)))
           : kind === "role" ? Boolean(snapshot.members?.items.some((row) => row.id === body.memberId && row.role === body.role))
           : Boolean(snapshot.members && !snapshot.members.items.some((row) => row.id === body.memberId));
         let after;
@@ -561,6 +588,7 @@ export async function createTeamWorkspace({ root, vault, parseText, listSources 
           }
         }
         result.refreshErrors = after.errors;
+        if (kind === "cancel-invite") result.alreadyMember = Boolean(after.members?.items.some((row) => row.email === teamEmail(body.inviteEmail)));
         for (const otherId of [...team.accountIds]) {
           if (otherId === account.id) continue;
           const peer = accountOf(otherId);
@@ -574,7 +602,7 @@ export async function createTeamWorkspace({ root, vault, parseText, listSources 
         if (account.status !== "auth_expired") account.status = "ready";
         account.message = Object.keys(after.errors).length ? "操作已返回，正在自动同步最新数据" : "团队信息已同步"; account.updatedAt = stamp();
         record.status = result.verifying || result.results?.some((row) => row.status === "unknown") ? "unknown" : "completed"; record.result = result;
-        addLog(team, actorId, kind, kind === "invite" ? `处理 ${emails.length} 个邀请邮箱，成功 ${result.results.filter((row) => row.status === "invited").length} 个` : kind === "role" ? `将 ${teamEmail(body.memberEmail)} 修改为${teamRoleLabel(body.role)}${result.verifying ? "，等待确认" : ""}` : `移除成员 ${teamEmail(body.memberEmail)}${result.verifying ? "，等待列表确认" : ""}`, Object.keys(after.errors).length || result.verifying || result.results?.some((row) => ["failed", "unknown"].includes(row.status)) ? "partial" : "success");
+        addLog(team, actorId, kind, kind === "invite" ? `处理 ${emails.length} 个邀请邮箱，成功 ${result.results.filter((row) => row.status === "invited").length} 个` : kind === "cancel-invite" ? `${result.alreadyMember ? "邀请已不在待接受列表，对方已是成员：" : "取消邀请 "}${teamEmail(body.inviteEmail)}${result.verifying ? "，等待确认" : ""}` : kind === "role" ? `将 ${teamEmail(body.memberEmail)} 修改为${teamRoleLabel(body.role)}${result.verifying ? "，等待确认" : ""}` : `移除成员 ${teamEmail(body.memberEmail)}${result.verifying ? "，等待列表确认" : ""}`, Object.keys(after.errors).length || result.verifying || result.results?.some((row) => ["failed", "unknown"].includes(row.status)) ? "partial" : "success");
         await save(); return result;
       });
     })().catch(async (error) => {

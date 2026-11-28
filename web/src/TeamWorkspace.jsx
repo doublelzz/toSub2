@@ -22,7 +22,7 @@ function useTeamApi(token) {
       headers: { "content-type": "application/json", "x-console-token": token }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
     const data = await response.json();
     if (controller.signal.aborted) throw new DOMException("Workspace changed", "AbortError");
-    if (!response.ok) throw new Error(data.error || "团队请求失败，请重试");
+    if (!response.ok) throw Object.assign(new Error(data.error || "团队请求失败，请重试"), { code: data.code, status: response.status });
     return data;
   }, [token, controller]);
 }
@@ -116,10 +116,11 @@ function TeamDeleteRecord({ api, record, onClose, onDeleted }) {
 function TeamManage({ api, selected, revision, onClose, onChanged, onUpdate, onDelete }) {
   const [accountId, setAccountId] = useState(selected.accountId), [tab, setTab] = useState("members"), [search, setSearch] = useState(""), [page, setPage] = useState(1);
   const [data, setData] = useState(null), [error, setError] = useState(""), [busy, setBusy] = useState(false), [invite, setInvite] = useState(false), [removing, setRemoving] = useState(null), [roleChange, setRoleChange] = useState(null);
+  const [cancelingInvite, setCancelingInvite] = useState(null);
   const detailSequence = useRef(0);
   const loadDetail = useCallback(async (overrides = {}) => {
     const ticket = ++detailSequence.current;
-    try { const value = await api(`${selected.id}/query`, { accountId, tab, search, page, ...overrides }); if (ticket === detailSequence.current) { setData(value); setError(""); } return value; }
+    try { const value = await api(`${selected.id}/query`, { accountId, tab, search, page, ...overrides }); if (ticket === detailSequence.current) { setData(value); if (value.page !== (overrides.page ?? page)) setPage(value.page); setError(""); } return value; }
     catch (failure) { if (ticket === detailSequence.current && !isAbort(failure)) setError(failure.message); throw failure; }
   }, [api, selected.id, accountId, tab, search, page]);
   useEffect(() => { void loadDetail().catch(() => {}); return () => { detailSequence.current += 1; }; }, [loadDetail, revision]);
@@ -149,17 +150,18 @@ function TeamManage({ api, selected, revision, onClose, onChanged, onUpdate, onD
       <div className="team-seat-panels">{[["default", "标准席位"], ["prolite", "高级席位"]].map(([key, label]) => { const pool = team.subscription?.pools[key]; return <section key={key}><h3>{label}<Users size={15} /></h3><strong>{pool?.purchased ?? "—"}<small> 个席位</small></strong><div><span>已使用<b>{pool?.used ?? "—"}</b></span><span>当前可用<b className="team-blue">{pool?.available ?? "—"}</b></span></div></section>; })}</div>
       <div className="team-subscription-line"><CalendarDays size={15} /><span>{team.subscription?.event?.label || "订阅时间未知"}：{time(team.subscription?.event?.at)}</span><span>{team.subscription?.willRenew === true ? "自动续费已开启" : team.subscription?.willRenew === false ? "未开启自动续费" : "续费状态未知"}</span></div>
       <div className="team-detail-tabs" aria-label="团队管理视图">{[["members", "现有成员", team.membersTotal], ["invites", "待接受邀请", team.pendingInvites], ["logs", "操作记录", team.logs.length]].map(([key, label, count]) => <button type="button" key={key} aria-pressed={tab === key} onClick={() => { setTab(key); setPage(1); setSearch(""); }}>{label}<small>{count ?? "—"}</small></button>)}</div>
-      {tab === "logs" ? <div className="team-logs"><p className="team-muted">仅记录本工作台发起的操作。</p>{team.logs.length ? team.logs.map((row) => <div key={row.id}><Clock3 size={15} /><div><strong>{{ sync: "同步团队", invite: "邀请成员", remove: "移除成员", role: "修改成员角色" }[row.action] || row.action}</strong><p>{row.message}</p><small>{time(row.at)} · {row.status === "success" ? "已完成" : row.status === "partial" ? "部分完成" : row.status === "unknown" ? "待核对" : "未完成"}</small></div></div>) : <p className="team-empty">暂无操作记录</p>}</div> : <>
+      {tab === "logs" ? <div className="team-logs"><p className="team-muted">仅记录本工作台发起的操作。</p>{team.logs.length ? team.logs.map((row) => <div key={row.id}><Clock3 size={15} /><div><strong>{{ sync: "同步团队", invite: "邀请成员", remove: "移除成员", role: "修改成员角色", "cancel-invite": "取消邀请" }[row.action] || row.action}</strong><p>{row.message}</p><small>{time(row.at)} · {row.status === "success" ? "已完成" : row.status === "partial" ? "部分完成" : row.status === "unknown" ? "待核对" : "未完成"}</small></div></div>) : <p className="team-empty">暂无操作记录</p>}</div> : <>
         <div className="team-member-toolbar"><label className="team-search"><Search size={15} aria-hidden="true" /><input type="search" aria-label="搜索团队成员" placeholder={tab === "members" ? "搜索成员邮箱、姓名" : "搜索被邀请邮箱"} value={search} onChange={(event) => { setSearch(event.target.value); setPage(1); }} /></label><button type="button" className="primary-button" disabled={!team.capabilities.canInvite || team.status !== "ready" || team.busy || busy} title={team.capabilities.inviteReason || "邀请成员"} onClick={() => setInvite(true)}><Plus size={15} />邀请成员</button></div>
-        <table className="team-member-table"><thead><tr><th>{tab === "members" ? "成员" : "被邀请邮箱"}</th><th>角色</th><th>席位</th><th>{tab === "members" ? "加入日期" : "邀请时间"}</th><th>{tab === "members" ? "操作" : "状态"}</th></tr></thead><tbody>{data.items.map((row) => <tr key={row.id || row.email}><td><div className="team-member-name">{tab === "members" && <span className="team-member-avatar">{(row.name || row.email).slice(0, 1).toUpperCase()}</span>}<div><strong>{tab === "members" ? row.name || "未设置姓名" : row.email}{row.id === team.capabilities.currentMemberId && <small>（当前账号）</small>}</strong>{tab === "members" && <small>{row.email}</small>}</div></div></td><td>{tab === "members" && row.roleChoices?.length > 0 ? <select className="team-role-select" aria-label={`修改 ${row.email} 的角色`} value={row.role} disabled={team.busy || busy || team.status !== "ready"} onChange={(event) => setRoleChange({ member: row, role: event.target.value })}><option value={row.role}>{row.roleLabel}</option>{row.roleChoices.map((role) => <option key={role} value={role}>{role === "account-owner" ? "设为所有者" : "改为普通成员"}</option>)}</select> : row.roleLabel || ({ "standard-user": "成员", "account-owner": "所有者", "account-admin": "管理员" })[row.role] || "未识别角色"}</td><td>{seatName(row.seatType)}</td><td className="team-date">{time(tab === "members" ? row.joinedAt : row.createdAt, true)}</td><td>{tab === "invites" ? <span className="team-muted">待接受</span> : row.canRemove ? <button type="button" className="text-action team-danger" disabled={team.status !== "ready" || team.busy || busy} onClick={() => setRemoving(row)}>移除</button> : <span className="team-muted">{row.scimManaged ? "目录管理" : row.id === team.capabilities.currentMemberId || row.role === "account-owner" ? "受保护" : "无操作权限"}</span>}</td></tr>)}</tbody></table>
+        <table className="team-member-table"><thead><tr><th>{tab === "members" ? "成员" : "被邀请邮箱"}</th><th>角色</th><th>席位</th><th>{tab === "members" ? "加入日期" : "邀请时间"}</th><th>{tab === "members" ? "操作" : "状态"}</th>{tab === "invites" && <th>操作</th>}</tr></thead><tbody>{data.items.map((row) => <tr key={row.id || row.email}><td><div className="team-member-name">{tab === "members" && <span className="team-member-avatar">{(row.name || row.email).slice(0, 1).toUpperCase()}</span>}<div><strong>{tab === "members" ? row.name || "未设置姓名" : row.email}{row.id === team.capabilities.currentMemberId && <small>（当前账号）</small>}</strong>{tab === "members" && <small>{row.email}</small>}</div></div></td><td>{tab === "members" && row.roleChoices?.length > 0 ? <select className="team-role-select" aria-label={`修改 ${row.email} 的角色`} value={row.role} disabled={team.busy || busy || team.status !== "ready"} onChange={(event) => setRoleChange({ member: row, role: event.target.value })}><option value={row.role}>{row.roleLabel}</option>{row.roleChoices.map((role) => <option key={role} value={role}>{role === "account-owner" ? "设为所有者" : "改为普通成员"}</option>)}</select> : row.roleLabel || ({ "standard-user": "成员", "account-owner": "所有者", "account-admin": "管理员" })[row.role] || "未识别角色"}</td><td>{seatName(row.seatType)}</td><td className="team-date">{time(tab === "members" ? row.joinedAt : row.createdAt, true)}</td><td>{tab === "invites" ? <span className="team-muted">待接受</span> : row.canRemove ? <button type="button" className="text-action team-danger" disabled={team.status !== "ready" || team.busy || busy} onClick={() => setRemoving(row)}>移除</button> : <span className="team-muted">{row.scimManaged ? "目录管理" : row.id === team.capabilities.currentMemberId || row.role === "account-owner" ? "受保护" : "无操作权限"}</span>}</td>{tab === "invites" && <td>{row.canCancel ? <button type="button" className="text-action team-danger" aria-label={`取消 ${row.email} 的邀请`} disabled={busy || team.busy || team.status !== "ready"} onClick={() => setCancelingInvite(row)}>取消邀请</button> : <span className="team-muted">{row.scimManaged ? "目录管理" : "无操作权限"}</span>}</td>}</tr>)}</tbody></table>
         {!data.items.length && <div className="team-empty"><Mail size={26} /><h3>{search ? "没有匹配的记录" : tab === "members" ? "暂无可用成员数据" : "暂无待接受邀请"}</h3></div>}
         <Pager page={data.page} pages={data.pages} total={data.total} onPage={setPage} />
-        <p className="team-footnote">{tab === "members" ? "当前账号不能直接移除；可先由所有者降级目标账号，再切换另一所有者移除。团队至少保留一位所有者。" : "待接受邀请不计入现有成员。首版暂不提供撤销与重发操作。"}</p>
+        <p className="team-footnote">{tab === "members" ? "当前账号不能直接移除；可先由所有者降级目标账号，再切换另一所有者移除。团队至少保留一位所有者。" : "邀请有误时可取消，完成后自动刷新。对方已接受的邀请需在现有成员中处理。"}</p>
       </>}
       <footer className="team-drawer-footer"><span>最近查询：{time(team.checkedAt)} · Asia/Shanghai</span><button type="button" className="text-action team-danger" disabled={busy || team.canDelete === false} title={team.canDelete === false ? "请先停止任务或等待完成" : undefined} onClick={() => onDelete({ ...team, kind: "team" })}><Trash2 size={14} />删除记录</button><button type="button" className="secondary-button" disabled={busy || team.busy || ["queued", "running", "waiting_input"].includes(team.status)} onClick={() => void sync()}><RefreshCw size={15} />同步团队</button></footer>
       {invite && <TeamInvite api={api} team={team} onClose={() => setInvite(false)} onChanged={(message, result) => mutationChanged(message, result, "invites")} />}
       {roleChange && <TeamRoleChange api={api} team={team} member={roleChange.member} role={roleChange.role} onClose={() => setRoleChange(null)} onChanged={mutationChanged} />}
       {removing && <TeamRemove api={api} team={team} member={removing} onClose={() => setRemoving(null)} onChanged={mutationChanged} />}
+      {cancelingInvite && <TeamCancelInvite api={api} team={team} invitation={cancelingInvite} onClose={() => setCancelingInvite(null)} onChanged={mutationChanged} />}
     </>}
   </Drawer></div>;
 }
@@ -220,6 +222,25 @@ function TeamRoleChange({ api, team, member, role, onClose, onChanged }) {
     finally { setBusy(false); }
   };
   return <TeamDialog title="修改成员角色" description={`${team.name} · 管理账号 ${team.email}`} onClose={onClose} busy={busy}><div className="team-dialog-body"><p>将以下账号从{member.roleLabel}修改为{label}？</p><div className="team-remove-target"><ShieldCheck size={22} /><div><strong>{member.name || "团队成员"}</strong><span>{member.email}</span></div></div><p className="team-muted">{role === "account-owner" ? "对方需已接受邀请并成为现有成员。修改后拥有团队所有者管理权限。" : "系统会重新检查仍有其他所有者。若修改的是当前管理账号，之后请切换另一位所有者继续管理或移除该账号。"}</p>{error && <p className="dialog-error" role="alert">{error}</p>}</div><footer className="team-dialog-footer"><button type="button" className="secondary-button" disabled={busy} onClick={onClose} autoFocus>取消</button><button type="button" className="primary-button" disabled={busy} onClick={() => void change()}>{busy && <LoaderCircle className="spin" size={15} />}确认修改为{label}</button></footer></TeamDialog>;
+}
+
+function TeamCancelInvite({ api, team, invitation, onClose, onChanged }) {
+  const [busy, setBusy] = useState(false), [error, setError] = useState("");
+  const key = useRef(requestKey());
+  const cancel = async () => {
+    if (busy) return; setBusy(true); setError("");
+    try {
+      const result = await api(`${team.id}/cancel-invite`, { accountId: team.accountId, inviteId: invitation.id, inviteEmail: invitation.email, requestKey: key.current });
+      await onChanged(result.verifying || Object.keys(result.refreshErrors || {}).length ? "取消邀请请求已返回，正在自动同步确认" : result.alreadyMember ? "邀请已不在待接受列表，对方已加入团队，请查看现有成员" : `已取消 ${invitation.email} 的邀请，待接受列表已刷新`, result);
+      onClose();
+    } catch (failure) {
+      if (!isAbort(failure)) { setError(failure.message); await onChanged("", failure.status >= 500 ? { verifying: true } : undefined); }
+    } finally { setBusy(false); }
+  };
+  return <TeamDialog title="取消团队邀请" description={`${team.name} · 管理账号 ${team.email}`} onClose={onClose} busy={busy} className="team-cancel-invite-dialog">
+    <div className="team-dialog-body"><p>确认取消以下邮箱的待接受邀请？</p><div className="team-remove-target"><Mail size={22} /><div><strong>{invitation.email}</strong><span>{inviteRoleLabels[invitation.role] || "团队成员"} · {seatName(invitation.seatType)}席位</span></div></div><p className="team-muted">系统会重新核对邀请和成员状态。取消成功后，对方需要重新收到邀请才能加入；现有成员和购买席位数量保持不变。</p>{error && <p className="dialog-error" role="alert">{error}</p>}</div>
+    <footer className="team-dialog-footer"><button type="button" className="secondary-button" disabled={busy} onClick={onClose} autoFocus>保留邀请</button><button type="button" className="team-delete-button" disabled={busy} onClick={() => void cancel()}>{busy ? <LoaderCircle className="spin" size={15} /> : <X size={15} />}{busy ? "正在取消并刷新" : "确认取消邀请"}</button></footer>
+  </TeamDialog>;
 }
 
 function TeamRemove({ api, team, member, onClose, onChanged }) {

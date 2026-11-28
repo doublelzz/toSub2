@@ -9,7 +9,7 @@ const member = (email, role, index) => ({ id: `user-${index}`, account_user_id: 
   seat_type: "default", created_time: "2026-11-27T02:00:00Z", is_scim_managed: false });
 export async function createTeamFixture() {
   const state = { requests: [], partial: false, clamp: 100, failModule: "", failDiscovery: false, mode: "prepurchase", nextInvite: "", nextRemove: "", nextRole: "", defaultSeat: "default", mailAt: null,
-    nextInviteLagReads: 0, nextRoleLagReads: 0, staleCollections: new Map(),
+    nextInviteLagReads: 0, nextRoleLagReads: 0, nextCancelInvite: "", nextCancelInviteLagReads: 0, staleCollections: new Map(),
     spaces: new Map([
       [TEAM_A, { name: "协作团队", purchased: 10, premium: 0, invites: [], members: [member("owner@example.com", "account-owner", "owner"), member("other-owner@example.com", "account-owner", "other-owner"), member("admin@example.com", "account-admin", "admin"), member("member@example.com", "standard-user", "member"), member("viewer@example.com", "analytics-viewer", "viewer")] }],
       [TEAM_B, { name: "研究团队", purchased: 40, premium: 0, invites: [], members: [member("owner@example.com", "account-owner", "owner-b"), ...Array.from({ length: 25 }, (_, i) => member(`research-${i}@example.com`, "standard-user", `research-${i}`))] }],
@@ -76,13 +76,22 @@ export async function createTeamFixture() {
         if (space.members.some((row) => row.email === address)) response.already_member_emails.push(address);
         else if (address.startsWith("fail")) response.errored_emails.push({ email_address: address, error: "upstream-private-diagnostic-must-not-leak" });
         else {
-          const row = { id: `invite-${space.invites.length}`, email_address: address, role: body.role, seat_type: "default", status: 0, created_time: new Date().toISOString() };
+          const row = { id: `invite-${state.requests.length}-${space.invites.length}`, email_address: address, role: body.role, seat_type: "default", status: 2, created_time: new Date().toISOString() };
           space.invites.push(row); response.account_invites.push(row);
         }
       }
       if (state.nextInviteLagReads) { state.staleCollections.set(`${id}:invites`, { items: previous, remaining: state.nextInviteLagReads }); state.nextInviteLagReads = 0; }
       if (state.nextInvite === "disconnect") { state.nextInvite = ""; req.socket.destroy(); return; }
       return send(response);
+    }
+    if (req.method === "DELETE" && url.pathname.endsWith("/invites")) {
+      const actor = space.members.find((row) => row.email === email), target = space.invites.find((row) => row.email_address === body?.email_address);
+      if (!actor || !["account-owner", "account-admin"].includes(actor.role) || actor.role !== "account-owner" && target?.role !== "standard-user" || target?.is_scim_managed) return send({}, 403);
+      const previous = structuredClone(space.invites);
+      space.invites = space.invites.filter((row) => row.email_address !== body.email_address);
+      if (state.nextCancelInviteLagReads) { state.staleCollections.set(`${id}:invites`, { items: previous, remaining: state.nextCancelInviteLagReads }); state.nextCancelInviteLagReads = 0; }
+      if (state.nextCancelInvite === "disconnect") { state.nextCancelInvite = ""; req.socket.destroy(); return; }
+      return send({ success: true });
     }
     if (req.method === "PATCH" && /\/users\/[^/]+$/.test(url.pathname)) {
       const actor = space.members.find((row) => row.email === email), target = space.members.find((row) => row.id === url.pathname.split("/").at(-1));

@@ -1102,7 +1102,7 @@ async function handleTeamApi(req, res, url) {
       : action === "input" ? teamWorkspace.input(id, body) : await teamWorkspace.cancel(id);
     sendJson(res, 200, result); return;
   }
-  const teamMatch = /^([a-zA-Z0-9-]+)\/(query|select-account|invite-preview|invite|remove|role)$/.exec(route);
+  const teamMatch = /^([a-zA-Z0-9-]+)\/(query|select-account|invite-preview|invite|remove|role|cancel-invite)$/.exec(route);
   if (!teamMatch) throw httpError(404, "团队接口不存在");
   const [, id, action] = teamMatch;
   const result = action === "query" ? teamWorkspace.detail(id, body)

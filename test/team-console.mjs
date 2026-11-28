@@ -67,6 +67,19 @@ try {
   const pending = (await call(`/api/teams/${team.id}/query`, { tab: "invites" })).data;
   assert.equal(pending.total, 1); assert.equal(pending.team.membersTotal, 5);
   assert.equal(pending.items[0].role, "account-owner", "the HTTP invitation endpoint forwards the selected role and refreshes pending invitations");
+  const cancelInvitationBody = { accountId: team.accountId, inviteId: pending.items[0].id, inviteEmail: pending.items[0].email, requestKey: crypto.randomUUID() };
+  const quotaBeforeCancellation = app.store.get(owner.id).balance, ledgerBeforeCancellation = app.store.ledger(owner.id).length;
+  assert.equal((await call(`/api/teams/${team.id}/cancel-invite`, cancelInvitationBody, credentials, { "x-console-token": "invalid" })).status, 403);
+  const cancellation = await call(`/api/teams/${team.id}/cancel-invite`, cancelInvitationBody);
+  assert.equal(cancellation.status, 200); assert.equal(cancellation.data.success, true);
+  assert.equal((await call(`/api/teams/${team.id}/query`, { tab: "invites" })).data.total, 0);
+  assert.equal((await call("/api/teams/state")).data.overview.pending, 0);
+  const countCancellationWrites = () => upstream.state.requests.filter((entry) => entry.method === "DELETE" && entry.path.endsWith("/invites")).length;
+  assert.equal(countCancellationWrites(), 1);
+  assert.equal((await call(`/api/teams/${team.id}/cancel-invite`, cancelInvitationBody)).status, 200);
+  assert.equal(countCancellationWrites(), 1);
+  assert.equal(app.store.get(owner.id).balance, quotaBeforeCancellation);
+  assert.equal(app.store.ledger(owner.id).length, ledgerBeforeCancellation, "canceling an invitation does not charge CDK quota");
   const self = await call(`/api/teams/${team.id}/remove`, { memberId: "user-owner", memberEmail: "owner@example.com", requestKey: crypto.randomUUID() });
   assert.equal(self.status, 403);
   const removed = await call(`/api/teams/${team.id}/remove`, { memberId: "user-member", memberEmail: "member@example.com", requestKey: crypto.randomUUID() });
@@ -75,6 +88,7 @@ try {
   assert.equal((await call("/api/teams/state", undefined, otherAuth)).data.total, 0);
   assert.equal((await call(`/api/teams/${team.id}/query`, {}, otherAuth)).status, 404);
   assert.equal((await call(`/api/teams/${team.id}/remove`, { memberId: "user-admin", memberEmail: "admin@example.com", requestKey: crypto.randomUUID() }, otherAuth)).status, 404);
+  assert.equal((await call(`/api/teams/${team.id}/cancel-invite`, cancelInvitationBody, otherAuth)).status, 404);
   assert.equal((await call("/api/teams/delete", { id: team.id, kind: "team" }, otherAuth)).status, 404);
   assert.equal((await call(`/api/teams/accounts/${result.accounts[0].id}/login`, {}, otherAuth)).status, 404);
   assert.equal(app.store.get(owner.id).balance, 8);
@@ -141,7 +155,7 @@ try {
   assert.equal(app.store.ledger(poor.id).filter((row) => row.kind === "import").length, 1);
   assert.equal((await call(`/api/admin/cdks/${owner.id}`, { teamManagementEnabled: false }, administrator, {}, "PATCH")).status, 200);
   assert.equal((await call("/api/bootstrap")).data.features.teamManagement, false);
-  for (const [route, body] of [["/api/teams/state", undefined], ["/api/teams/import/preview", { text: repeatText }], [`/api/teams/${team.id}/query`, {}], [`/api/teams/${team.id}/role`, {}], ["/api/teams/delete", { id: team.id, kind: "team" }], ["/api/teams/import", {}]]) assert.equal((await call(route, body)).status, 403);
+  for (const [route, body] of [["/api/teams/state", undefined], ["/api/teams/import/preview", { text: repeatText }], [`/api/teams/${team.id}/query`, {}], [`/api/teams/${team.id}/role`, {}], [`/api/teams/${team.id}/cancel-invite`, cancelInvitationBody], ["/api/teams/delete", { id: team.id, kind: "team" }], ["/api/teams/import", {}]]) assert.equal((await call(route, body)).status, 403);
   assert.equal((await call("/api/health")).status, 200);
   const [recoverOwner] = app.store.generate({ count: 1, quota: 2, teamManagementEnabled: true }, app.store.adminId);
   const recoverWorkspace = await app.workspaceFor(recoverOwner.id), recoverText = JSON.stringify(fixtureSession("recovery@example.com", upstream.base));

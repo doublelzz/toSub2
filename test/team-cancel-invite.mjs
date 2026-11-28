@@ -1,0 +1,118 @@
+import assert from "node:assert/strict";
+import crypto from "node:crypto";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { createCdkVault } from "../src/cdk-vault.mjs";
+import { createTeamWorkspace } from "../src/team-workspace.mjs";
+import { createTeamClient } from "../src/team-client.mjs";
+import { createTeamFixture, fixtureSession, TEAM_A, TEAM_B } from "./team-fixture.mjs";
+
+const root = await fs.mkdtemp(path.join(os.tmpdir(), "tosub2-team-cancel-invite-")), fixture = await createTeamFixture();
+const previousKey = process.env.TOSUB2_ENCRYPTION_KEY;
+process.env.TOSUB2_ENCRYPTION_KEY = crypto.randomBytes(32).toString("base64");
+const vault = await createCdkVault(root);
+const options = { root, vault, parseText: () => [], refreshRetryDelayMs: 0,
+  clientFactory: (input) => createTeamClient({ ...input, chatgptBase: fixture.base }) };
+let workspace, team, owner, admin, member;
+const key = () => crypto.randomUUID();
+const cancelWrites = () => fixture.state.requests.filter((row) => row.method === "DELETE" && row.path.endsWith("/invites"));
+const pending = (accountId = owner.id) => workspace.detail(team.id, { accountId, tab: "invites" });
+const bodyFor = (invitation, accountId = owner.id) => ({ accountId, inviteId: invitation.id, inviteEmail: invitation.email, requestKey: key() });
+async function sync() {
+  await workspace.queue({ ids: [owner.id] }, "fixture-actor");
+  const until = Date.now() + 5000;
+  while (Date.now() < until) { workspace.tick(3); if (!workspace.query().overview.active && !workspace.activeCount()) return; await new Promise((resolve) => setTimeout(resolve, 10)); }
+  throw new Error("Cancel-invite fixture did not settle");
+}
+async function invite(email, role = "standard-user") {
+  await workspace.mutate(team.id, { accountId: owner.id, emails: [email], role, requestKey: key() }, "fixture-actor", "invite");
+  return pending().items.find((row) => row.email === email);
+}
+try {
+  workspace = await createTeamWorkspace(options);
+  const text = JSON.stringify(["owner@example.com", "admin@example.com", "member@example.com"].map((email) => fixtureSession(email, fixture.base)));
+  const view = workspace.preview({ text });
+  const imported = await workspace.importAccounts({ text, digest: view.digest, requestKey: key() }, "fixture-actor");
+  [owner, admin, member] = ["owner@example.com", "admin@example.com", "member@example.com"].map((email) => imported.accounts.find((row) => row.email === email));
+  workspace.tick(3);
+  const until = Date.now() + 5000;
+  while (workspace.query().overview.active && Date.now() < until) await new Promise((resolve) => setTimeout(resolve, 10));
+  team = workspace.query().rows.find((row) => row.workspaceId === TEAM_A);
+  const space = fixture.state.spaces.get(TEAM_A), originalMembers = structuredClone(space.members);
+  const ownerInvitation = await invite("wrong-owner@example.com", "account-owner");
+  assert.equal(ownerInvitation.status, 2, "the observed pending status is retained without guessing its meaning");
+  assert.equal(ownerInvitation.canCancel, true);
+  assert.equal(pending(admin.id).items[0].canCancel, false);
+  assert.equal(pending(member.id).items[0].canCancel, false);
+  await assert.rejects(workspace.mutate(team.id, bodyFor(ownerInvitation, admin.id), "fixture-actor", "cancel-invite"), { status: 403 });
+  await assert.rejects(workspace.mutate(team.id, bodyFor(ownerInvitation, member.id), "fixture-actor", "cancel-invite"), { status: 403 });
+  assert.equal(cancelWrites().length, 0);
+  const cancelBody = bodyFor(ownerInvitation);
+  fixture.state.nextCancelInviteLagReads = 2;
+  const canceled = await workspace.mutate(team.id, cancelBody, "fixture-actor", "cancel-invite");
+  assert.equal(canceled.success, true); assert.equal(canceled.verifying, undefined); assert.deepEqual(canceled.refreshErrors, {});
+  assert.equal(cancelWrites().length, 1, "lagged confirmation must not repeat the upstream DELETE");
+  assert.deepEqual(cancelWrites()[0].body, { email_address: ownerInvitation.email });
+  assert.equal(cancelWrites()[0].path, `/backend-api/accounts/${TEAM_A}/invites`);
+  assert.equal(cancelWrites()[0].workspace, TEAM_A);
+  for (const account of imported.accounts) assert.equal(pending(account.id).total, 0, "pending data refreshes for every linked management account");
+  assert.equal(workspace.query().overview.pending, 0);
+  assert.deepEqual(space.members, originalMembers); assert.equal(space.purchased, 10);
+  assert.deepEqual(await workspace.mutate(team.id, cancelBody, "fixture-actor", "cancel-invite"), canceled);
+  assert.equal(cancelWrites().length, 1);
+  assert.equal((await workspace.mutate(team.id, { ...cancelBody, requestKey: key() }, "fixture-actor", "cancel-invite")).alreadyCanceled, true);
+  assert.equal(cancelWrites().length, 1, "an already absent invitation requires no additional write");
+  const standard = await invite("wrong-member@example.com");
+  assert.equal(pending(admin.id).items.find((row) => row.email === standard.email).canCancel, true);
+  await workspace.mutate(team.id, bodyFor(standard, admin.id), "fixture-actor", "cancel-invite");
+  const recreated = await invite(ownerInvitation.email, "account-owner");
+  const writesBeforeStale = cancelWrites().length;
+  await workspace.mutate(team.id, cancelBody, "fixture-actor", "cancel-invite");
+  assert.equal(cancelWrites().length, writesBeforeStale, "replaying an old request must preserve a newer invitation");
+  await assert.rejects(workspace.mutate(team.id, { ...cancelBody, requestKey: key() }, "fixture-actor", "cancel-invite"), { status: 409 });
+  await assert.rejects(workspace.mutate(team.id, { ...bodyFor(recreated), inviteEmail: "different@example.com" }, "fixture-actor", "cancel-invite"), { status: 409 });
+  await assert.rejects(workspace.mutate(team.id, { ...bodyFor(recreated), inviteId: "" }, "fixture-actor", "cancel-invite"), { status: 400 });
+  await assert.rejects(workspace.mutate(team.id, { ...cancelBody, inviteEmail: recreated.email, inviteId: recreated.id }, "fixture-actor", "cancel-invite"), { status: 409 });
+  assert.equal(cancelWrites().length, writesBeforeStale);
+  const directory = await invite("directory@example.com");
+  space.invites.find((row) => row.id === directory.id).is_scim_managed = true;
+  await sync(); assert.equal(pending().items.find((row) => row.id === directory.id).canCancel, false);
+  await assert.rejects(workspace.mutate(team.id, bodyFor(directory), "fixture-actor", "cancel-invite"), { status: 403 });
+  const accepted = await invite("accepted@example.com");
+  space.invites = space.invites.filter((row) => row.id !== accepted.id);
+  space.members.push({ id: "user-accepted", account_user_id: "membership-accepted", email: accepted.email, role: "standard-user", seat_type: "default" });
+  const beforeAccepted = cancelWrites().length;
+  await assert.rejects(workspace.mutate(team.id, bodyFor(accepted), "fixture-actor", "cancel-invite"), { status: 409 });
+  assert.equal(cancelWrites().length, beforeAccepted); assert.ok(space.members.some((row) => row.email === accepted.email));
+  const uncertainInvite = await invite("uncertain-cancel@example.com"), uncertainBody = bodyFor(uncertainInvite);
+  fixture.state.nextCancelInvite = "disconnect";
+  await assert.rejects(workspace.mutate(team.id, uncertainBody, "fixture-actor", "cancel-invite"), { code: "TEAM_NETWORK" });
+  const beforeUncertainReplay = cancelWrites().length;
+  await assert.rejects(workspace.mutate(team.id, { ...uncertainBody, requestKey: key() }, "fixture-actor", "cancel-invite"), { status: 409 });
+  await assert.rejects(workspace.mutate(team.id, { accountId: owner.id, emails: [uncertainInvite.email], requestKey: key() }, "fixture-actor", "invite"), { status: 409 });
+  await sync();
+  assert.equal((await workspace.mutate(team.id, uncertainBody, "fixture-actor", "cancel-invite")).reconciled, true);
+  assert.equal(cancelWrites().length, beforeUncertainReplay);
+  const delayed = await invite("lagged-cancel@example.com");
+  fixture.state.nextCancelInviteLagReads = 6;
+  const delayedBody = bodyFor(delayed), delayedResult = await workspace.mutate(team.id, delayedBody, "fixture-actor", "cancel-invite");
+  assert.equal(delayedResult.verifying, true); assert.ok(delayedResult.refreshErrors.refresh);
+  fixture.state.staleCollections.clear(); await sync();
+  assert.equal((await workspace.mutate(team.id, delayedBody, "fixture-actor", "cancel-invite")).reconciled, true);
+  const busyInvitation = await invite("busy-cancel@example.com");
+  await workspace.queue({ ids: [admin.id] }, "fixture-actor");
+  await assert.rejects(workspace.mutate(team.id, bodyFor(busyInvitation), "fixture-actor", "cancel-invite"), { status: 409 });
+  await workspace.cancel(admin.id);
+  await workspace.mutate(team.id, bodyFor(busyInvitation), "fixture-actor", "cancel-invite");
+  await workspace.shutdown(); workspace = await createTeamWorkspace(options);
+  assert.equal((await workspace.mutate(team.id, cancelBody, "fixture-actor", "cancel-invite")).success, true);
+  assert.ok(workspace.detail(team.id).team.logs.some((row) => row.action === "cancel-invite"));
+  assert.equal(workspace.query().rows.find((row) => row.workspaceId === TEAM_B).membersTotal, 26);
+  assert.equal(fixture.state.requests.some((row) => row.method === "DELETE" && /\/users\//.test(row.path)), false, "canceling invitations must never remove an accepted member");
+  assert.equal(fixture.state.requests.some((row) => /subscriptions\/update/.test(row.path)), false);
+  console.log("Team cancellation passed: HAR DELETE body, role/SCIM guards, identity validation, acceptance race, read-after-write lag, idempotency/restart, uncertain result reconciliation and shared automatic refresh");
+} finally {
+  await workspace?.shutdown(); await fixture.close(); await fs.rm(root, { recursive: true, force: true });
+  if (previousKey === undefined) delete process.env.TOSUB2_ENCRYPTION_KEY; else process.env.TOSUB2_ENCRYPTION_KEY = previousKey;
+}

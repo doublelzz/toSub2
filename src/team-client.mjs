@@ -38,6 +38,9 @@ export function teamIdentity(source, email) {
 export const teamRoleLabel = (role) => ({ "account-owner": "所有者", "account-admin": "管理员", "standard-user": "成员", "analytics-viewer": "分析查看者", "account-analytics-viewer": "分析查看者" })[role] || "未识别角色";
 export const TEAM_INVITE_ROLES = ["standard-user", "account-admin", "account-owner"];
 export const teamInviteRoleChoices = (role) => role === "account-owner" ? [...TEAM_INVITE_ROLES] : ["account-admin", "standard-user"].includes(role) ? ["standard-user"] : [];
+export function teamCanCancelInvite(role, invite) {
+  return Boolean(invite && !invite.scimManaged && (role === "account-owner" || role === "account-admin" && invite.role === "standard-user"));
+}
 export function teamSnapshotCapabilities(snapshot, { email, accountUserId, role: discoveredRole } = {}) {
   const current = snapshot.members?.items.find((member) => member.email === email && (!accountUserId || member.accountUserId === accountUserId));
   const role = current?.role || "", seatType = role === "account-owner" ? "default" : snapshot.settings?.defaultSeatType;
@@ -119,7 +122,7 @@ function normalizeMember(row) {
 }
 function normalizeInvite(row) {
   if (!row || !teamEmail(row.email_address)) throw teamError("TEAM_RESPONSE");
-  return { id: text(row.id), email: teamEmail(row.email_address), role: text(row.role), seatType: text(row.seat_type),
+  return { id: text(row.id), email: teamEmail(row.email_address), role: text(row.role), seatType: text(row.seat_type), scimManaged: row.is_scim_managed === true,
     createdAt: date(row.created_time), status: typeof row.status === "number" || typeof row.status === "string" ? row.status : null };
 }
 
@@ -219,6 +222,11 @@ export async function createTeamClient({ session, email, proxyUrl = "", chatgptB
           submission_surface: "admin_console_members", purchase_authorization_choice: "not_shown", entry_surface: "admin_console_members" } });
     },
     remove: (id, memberId) => request(`/backend-api/accounts/${segment(id)}/users/${segment(memberId)}`, { method: "DELETE", workspaceId: id }),
+    cancelInvite: (id, email) => {
+      const address = teamEmail(email);
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(address) || address.length > 254) throw teamError("TEAM_IDENTITY");
+      return request(`/backend-api/accounts/${segment(id)}/invites`, { method: "DELETE", workspaceId: id, body: { email_address: address } });
+    },
     setRole: (id, memberId, role) => request(`/backend-api/accounts/${segment(id)}/users/${segment(memberId)}`, { method: "PATCH", workspaceId: id, body: { role } }),
     close: async () => { signal?.removeEventListener("abort", abort); await transport?.close(); } };
 }
