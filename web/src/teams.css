@@ -130,7 +130,7 @@
 .team-delete-record-dialog .team-dialog-body > .dialog-error { margin-bottom: 0; }
 .team-drawer-footer > span { margin-right: auto; }
 .team-field { display: flex; flex-direction: column; gap: 7px; margin-bottom: 18px; font-size: 13px; }
-.team-field textarea, .team-field input { width: 100%; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--ink); padding: 10px 12px; font: inherit; }
+.team-field textarea, .team-field input, .team-field select { width: 100%; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--ink); padding: 10px 12px; font: inherit; }
 .team-field textarea { min-height: 140px; resize: vertical; font: 13px/1.8 ui-monospace, "Microsoft YaHei", monospace; }
 .team-field small { color: var(--muted); font-size: 12px; }
 .team-field input[readonly] { color: var(--muted); background: var(--surface-subtle); }

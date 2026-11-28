@@ -63,9 +63,10 @@ try {
   const list = (await call("/api/teams/state")).data, team = list.rows.find((row) => row.workspaceId === TEAM_A);
   assert.equal(team.accounts.length, 1);
   assert.equal((await call(`/api/teams/${team.id}/query`, { search: "member@example.com" })).data.total, 1);
-  assert.equal((await call(`/api/teams/${team.id}/invite`, { emails: ["new-integration@example.com"], requestKey: crypto.randomUUID() })).status, 200);
+  assert.equal((await call(`/api/teams/${team.id}/invite`, { emails: ["new-integration@example.com"], role: "account-owner", requestKey: crypto.randomUUID() })).status, 200);
   const pending = (await call(`/api/teams/${team.id}/query`, { tab: "invites" })).data;
   assert.equal(pending.total, 1); assert.equal(pending.team.membersTotal, 5);
+  assert.equal(pending.items[0].role, "account-owner", "the HTTP invitation endpoint forwards the selected role and refreshes pending invitations");
   const self = await call(`/api/teams/${team.id}/remove`, { memberId: "user-owner", memberEmail: "owner@example.com", requestKey: crypto.randomUUID() });
   assert.equal(self.status, 403);
   const removed = await call(`/api/teams/${team.id}/remove`, { memberId: "user-member", memberEmail: "member@example.com", requestKey: crypto.randomUUID() });

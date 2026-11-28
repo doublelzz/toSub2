@@ -9,6 +9,7 @@ const member = (email, role, index) => ({ id: `user-${index}`, account_user_id: 
   seat_type: "default", created_time: "2026-11-27T02:00:00Z", is_scim_managed: false });
 export async function createTeamFixture() {
   const state = { requests: [], partial: false, clamp: 100, failModule: "", failDiscovery: false, mode: "prepurchase", nextInvite: "", nextRemove: "", nextRole: "", defaultSeat: "default", mailAt: null,
+    nextInviteLagReads: 0, nextRoleLagReads: 0, staleCollections: new Map(),
     spaces: new Map([
       [TEAM_A, { name: "协作团队", purchased: 10, premium: 0, invites: [], members: [member("owner@example.com", "account-owner", "owner"), member("other-owner@example.com", "account-owner", "other-owner"), member("admin@example.com", "account-admin", "admin"), member("member@example.com", "standard-user", "member"), member("viewer@example.com", "analytics-viewer", "viewer")] }],
       [TEAM_B, { name: "研究团队", purchased: 40, premium: 0, invites: [], members: [member("owner@example.com", "account-owner", "owner-b"), ...Array.from({ length: 25 }, (_, i) => member(`research-${i}@example.com`, "standard-user", `research-${i}`))] }],
@@ -60,20 +61,26 @@ export async function createTeamFixture() {
     if (url.pathname.endsWith("/settings")) return send({ default_seat_type: state.defaultSeat });
     if (url.pathname === "/backend-api/pageConfigs/billing") return send({ invite_prepurchase: { workspace_id: id, invite_purchase_mode: state.mode } });
     if (req.method === "GET" && (/\/users$/.test(url.pathname) || /\/invites$/.test(url.pathname))) {
-      const items = url.pathname.endsWith("/users") ? space.members : space.invites;
+      const module = url.pathname.endsWith("/users") ? "users" : "invites", stale = state.staleCollections.get(`${id}:${module}`);
+      const items = stale?.remaining > 0 ? stale.items : module === "users" ? space.members : space.invites;
+      if (stale && --stale.remaining <= 0) state.staleCollections.delete(`${id}:${module}`);
       const offset = Number(url.searchParams.get("offset") || 0), limit = Math.min(state.clamp, Number(url.searchParams.get("limit") || 100));
       return send({ items: items.slice(offset, offset + limit), total: items.length, limit, offset, has_more: offset + limit < items.length });
     }
     if (req.method === "POST" && url.pathname.endsWith("/invites")) {
+      const actor = space.members.find((row) => row.email === email);
+      if (!["standard-user", "account-admin", "account-owner"].includes(body.role) || actor?.role !== "account-owner" && body.role !== "standard-user") return send({}, 403);
+      const previous = structuredClone(space.invites);
       const response = { account_invites: [], errored_emails: [], already_member_emails: [] };
       for (const address of body.email_addresses || []) {
         if (space.members.some((row) => row.email === address)) response.already_member_emails.push(address);
         else if (address.startsWith("fail")) response.errored_emails.push({ email_address: address, error: "upstream-private-diagnostic-must-not-leak" });
         else {
-          const row = { id: `invite-${space.invites.length}`, email_address: address, role: "standard-user", seat_type: "default", status: 0, created_time: new Date().toISOString() };
+          const row = { id: `invite-${space.invites.length}`, email_address: address, role: body.role, seat_type: "default", status: 0, created_time: new Date().toISOString() };
           space.invites.push(row); response.account_invites.push(row);
         }
       }
+      if (state.nextInviteLagReads) { state.staleCollections.set(`${id}:invites`, { items: previous, remaining: state.nextInviteLagReads }); state.nextInviteLagReads = 0; }
       if (state.nextInvite === "disconnect") { state.nextInvite = ""; req.socket.destroy(); return; }
       return send(response);
     }
@@ -81,7 +88,8 @@ export async function createTeamFixture() {
       const actor = space.members.find((row) => row.email === email), target = space.members.find((row) => row.id === url.pathname.split("/").at(-1));
       if (actor?.role !== "account-owner" || !target || !["account-owner", "standard-user"].includes(body.role)) return send({}, 403);
       if (target.role === "account-owner" && body.role !== "account-owner" && space.members.filter((row) => row.role === "account-owner").length <= 1) return send({}, 409);
-      target.role = body.role;
+      const previous = structuredClone(space.members); target.role = body.role;
+      if (state.nextRoleLagReads) { state.staleCollections.set(`${id}:users`, { items: previous, remaining: state.nextRoleLagReads }); state.nextRoleLagReads = 0; }
       if (state.nextRole === "disconnect") { state.nextRole = ""; req.socket.destroy(); return; }
       return send({ success: true });
     }

@@ -15,7 +15,7 @@ import { createTeamFixture, fixtureSession, TEAM_A } from "./team-fixture.mjs";
 const rootDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "tosub2-team-ui-")), fixture = await createTeamFixture();
 const oldKey = process.env.TOSUB2_ENCRYPTION_KEY; process.env.TOSUB2_ENCRYPTION_KEY = crypto.randomBytes(32).toString("base64");
 const vault = await createCdkVault(rootDirectory);
-const workspace = await createTeamWorkspace({ root: rootDirectory, vault,
+const workspace = await createTeamWorkspace({ root: rootDirectory, vault, refreshRetryDelayMs: 5,
   parseText: (raw) => [{ email: raw.split("----")[0], password: raw.split("----")[1] || "" }],
   clientFactory: (options) => createTeamClient({ ...options, chatgptBase: fixture.base }) });
 const rawSession = JSON.stringify(fixtureSession("owner@example.com", fixture.base)), preview = workspace.preview({ text: rawSession });
@@ -36,6 +36,7 @@ async function cdkFetch(url, options) {
     else if (route === "import/preview") result = workspace.preview(body);
     else if (route === "import") result = await workspace.importAccounts(body, "ui-fixture-actor");
     else if (route === "delete") result = await workspace.deleteRecord(body);
+    else if (route === "sync") { result = await workspace.queue(body, "ui-fixture-actor"); workspace.tick(3); }
     else {
       const [id, action] = route.split("/");
       result = action === "query" ? workspace.detail(id, body) : action === "invite-preview" ? workspace.invitePreview(id, body)
@@ -79,27 +80,48 @@ try {
   assert.match(document.querySelector(".team-seat-panels").textContent, /标准席位/);
   const protectedRows = all(".team-member-table tbody tr").filter((element) => element.textContent.includes("受保护")); assert.equal(protectedRows.length, 2);
   await click(button("邀请成员")); assert.equal(all('[role="dialog"]').length, 2);
+  const inviteRole = document.querySelector('select[aria-label="邀请角色"]');
+  assert.ok(inviteRole && !inviteRole.disabled, "invitation role must be a working selector");
+  assert.deepEqual([...inviteRole.options].map((option) => option.value), ["standard-user", "account-admin", "account-owner"]);
+  await act(async () => { inviteRole.value = "account-owner"; inviteRole.dispatchEvent(new window.Event("change", { bubbles: true })); });
   await fill(document.querySelector('[aria-label="邀请成员邮箱"]'), "new-ui@example.com\nNEW-UI@example.com\nowner@example.com");
   await waitFor(() => button("发送邀请") && !button("发送邀请").disabled);
   const capacity = document.querySelector(".team-capacity").textContent; assert.match(capacity, /本次新增 1/);
-  await click(button("发送邀请")); await waitFor(() => document.querySelector(".team-invite-results"));
+  fixture.state.nextInviteLagReads = 2;
+  await click(button("发送邀请")); await waitFor(() => document.querySelector(".team-invite-results") && button("发送邀请"));
   assert.match(document.querySelector(".team-invite-results").textContent, /邀请已发送/); assert.match(document.querySelector(".team-invite-results").textContent, /已是成员/);
   assert.equal(fixture.state.requests.filter((entry) => entry.method === "POST" && entry.path.endsWith("/invites")).length, 1);
+  assert.equal(fixture.state.requests.find((entry) => entry.method === "POST" && entry.path.endsWith("/invites")).body.role, "account-owner");
+  assert.equal(requests.findLast((entry) => entry.route.endsWith("/invite-preview")).body.role, "account-owner");
   assert.equal(fixture.state.spaces.get(TEAM_A).members.length, 5);
   assert.equal(button("发送邀请").disabled, true, "successful submission cannot be sent twice");
   await click(button("完成")); assert.equal(all('[role="dialog"]').length, 1);
+  assert.ok(all(".team-detail-tabs button").find((element) => element.textContent.startsWith("待接受邀请")).getAttribute("aria-pressed") === "true");
+  assert.match(document.querySelector(".team-member-table tbody").textContent, /new-ui@example.com.*所有者/s, "invitation results automatically refresh the pending list and selected role");
   await click(all(".team-detail-tabs button").find((element) => element.textContent.startsWith("待接受邀请")));
   await waitFor(() => document.querySelector(".team-member-table tbody")?.textContent.includes("new-ui@example.com"));
+  await click(all(".team-detail-tabs button").find((element) => element.textContent.startsWith("现有成员")));
+  await waitFor(() => document.querySelector(".team-member-table tbody")?.textContent.includes("member@example.com"));
+  await click(button("邀请成员"));
+  await fill(document.querySelector('[aria-label="邀请成员邮箱"]'), "fail-ui@example.com");
+  await waitFor(() => button("发送邀请") && !button("发送邀请").disabled);
+  await click(button("发送邀请")); await waitFor(() => button("仅重试失败的 1 个邮箱") && button("完成") && !button("完成").disabled);
+  await click(button("仅重试失败的 1 个邮箱"));
+  await waitFor(() => button("发送邀请") && !button("发送邀请").disabled);
+  await click(button("取消"));
   await click(all(".team-detail-tabs button").find((element) => element.textContent.startsWith("现有成员")));
   await waitFor(() => document.querySelector(".team-member-table tbody")?.textContent.includes("member@example.com"));
   const roleSelect = () => document.querySelector('[aria-label="修改 admin@example.com 的角色"]');
   await act(async () => { roleSelect().value = "account-owner"; roleSelect().dispatchEvent(new window.Event("change", { bubbles: true })); });
   assert.match(document.querySelector('[role="dialog"] [role="dialog"]')?.textContent || document.querySelectorAll('[role="dialog"]')[1].textContent, /admin@example.com/);
   assert.equal(fixture.state.spaces.get(TEAM_A).members.find((row) => row.email === "admin@example.com").role, "account-admin", "role change waits for explicit confirmation");
-  await click(button("确认修改为所有者")); await waitFor(() => !button("确认修改为所有者"));
+  fixture.state.nextRoleLagReads = 2;
+  await click(button("确认修改为所有者")); await waitFor(() => !button("确认修改为所有者") && roleSelect()?.value === "account-owner");
   assert.equal(fixture.state.spaces.get(TEAM_A).members.find((row) => row.email === "admin@example.com").role, "account-owner");
   await act(async () => { roleSelect().value = "standard-user"; roleSelect().dispatchEvent(new window.Event("change", { bubbles: true })); });
-  await click(button("确认修改为普通成员")); await waitFor(() => !button("确认修改为普通成员"));
+  fixture.state.nextRoleLagReads = 4;
+  await click(button("确认修改为普通成员")); await waitFor(() => !button("确认修改为普通成员") && roleSelect()?.value === "standard-user");
+  assert.ok(requests.some((entry) => entry.route === "sync"), "a delayed role change schedules automatic read synchronization without a manual click");
   assert.equal(fixture.state.spaces.get(TEAM_A).members.find((row) => row.email === "admin@example.com").role, "standard-user");
   const memberRow = all(".team-member-table tbody tr").find((element) => element.textContent.includes("member@example.com"));
   await click(button("移除", memberRow)); assert.match(document.querySelector(".team-remove-target").textContent, /member@example.com/);

@@ -35,6 +35,8 @@ try {
   team = workspace.detail(team.id).team; assert.equal(team.accounts.length, 2);
   const promotion = { accountId: account1.id, memberId: "user-second", memberEmail: account2.email, previousRole: "standard-user", role: "account-owner", requestKey: key() };
   const promoted = await workspace.mutate(team.id, promotion, "operator", "role"); assert.equal(promoted.role, "account-owner");
+  assert.equal(workspace.detail(team.id, { accountId: account2.id }).team.capabilities.canChangeRoles, true, "the other account's owner permissions refresh immediately");
+  assert.deepEqual(workspace.detail(team.id, { accountId: account2.id }).team.errors, {});
   const patches = () => fixture.state.requests.filter((row) => row.method === "PATCH").length;
   const patchCount = patches(); assert.deepEqual(await workspace.mutate(team.id, promotion, "operator", "role"), promoted); assert.equal(patches(), patchCount);
   const changed = await workspace.mutate(team.id, { ...demote, requestKey: key() }, "operator", "role");

@@ -36,6 +36,25 @@ export function teamIdentity(source, email) {
   } catch (error) { throw teamError(["token_expired", "authorization_invalid"].includes(error.message) ? "TEAM_AUTH_EXPIRED" : "TEAM_IDENTITY"); }
 }
 export const teamRoleLabel = (role) => ({ "account-owner": "所有者", "account-admin": "管理员", "standard-user": "成员", "analytics-viewer": "分析查看者", "account-analytics-viewer": "分析查看者" })[role] || "未识别角色";
+export const TEAM_INVITE_ROLES = ["standard-user", "account-admin", "account-owner"];
+export const teamInviteRoleChoices = (role) => role === "account-owner" ? [...TEAM_INVITE_ROLES] : ["account-admin", "standard-user"].includes(role) ? ["standard-user"] : [];
+export function teamSnapshotCapabilities(snapshot, { email, accountUserId, role: discoveredRole } = {}) {
+  const current = snapshot.members?.items.find((member) => member.email === email && (!accountUserId || member.accountUserId === accountUserId));
+  const role = current?.role || "", seatType = role === "account-owner" ? "default" : snapshot.settings?.defaultSeatType;
+  const policyKnown = snapshot.policy?.verified === true;
+  const errors = snapshot.errors || {};
+  return { role, roleLabel: teamRoleLabel(role || discoveredRole), currentMemberId: current?.id || null,
+    canInvite: Boolean(current && teamInviteRoleChoices(role).length && seatType === "default" && policyKnown && snapshot.invites && snapshot.subscription && !["members", "invites", "subscription", "policy", "refresh"].some((name) => errors[name])),
+    canRemove: Boolean(current && ["account-owner", "account-admin"].includes(role) && !errors.members && !errors.refresh),
+    canChangeRoles: Boolean(current && role === "account-owner" && !errors.members && !errors.refresh),
+    inviteRoleChoices: teamInviteRoleChoices(role), inviteSeatType: seatType || null,
+    inviteReason: !current ? "无法确认当前账号的团队身份，请同步成员"
+      : !teamInviteRoleChoices(role).length ? "当前团队角色没有邀请权限"
+      : seatType !== "default" ? "当前默认席位类型尚未接入邀请，请在官方页面操作"
+      : !policyKnown ? "邀请和购买策略尚未确认，请在官方页面操作"
+      : !snapshot.invites || !snapshot.subscription ? "邀请或席位数据未完整同步"
+      : errors.refresh ? "团队操作结果正在自动同步确认" : "" };
+}
 export function teamCanRemove(role, member, current) {
   if (!member || !current || member.role === "account-owner" || member.id === current.id || member.email === current.email) return false;
   if (role === "account-owner") return true;
@@ -182,31 +201,23 @@ export async function createTeamClient({ session, email, proxyUrl = "", chatgptB
       else result.errors[name] = publicTeamError(value.reason);
     });
     if (Object.values(result.errors).some((error) => ["TEAM_AUTH_EXPIRED", "TEAM_IDENTITY"].includes(error.code))) throw teamError("TEAM_AUTH_EXPIRED");
-    const current = result.members?.items.find((member) => member.email === identity.email && (!team.accountUserId || member.accountUserId === team.accountUserId));
-    const role = current?.role || "";
     const defaultSeatType = text(result.settings?.default_seat_type);
     const policy = result.policy?.invite_prepurchase;
     if (policy?.workspace_id && policy.workspace_id !== id) throw teamError("TEAM_IDENTITY");
-    const seatType = role === "account-owner" ? "default" : defaultSeatType;
     const policyKnown = policy && ["prepurchase"].includes(policy.invite_purchase_mode);
-    result.capabilities = { role, roleLabel: teamRoleLabel(role || team.role), currentMemberId: current?.id || null,
-      canInvite: Boolean(current && ["account-owner", "account-admin", "standard-user"].includes(role) && seatType === "default" && policyKnown && result.invites && result.subscription),
-      canRemove: Boolean(current && ["account-owner", "account-admin"].includes(role)), inviteSeatType: seatType || null,
-      canChangeRoles: Boolean(current && role === "account-owner"),
-      inviteReason: !current ? "无法确认当前账号的团队身份，请同步成员"
-        : !["account-owner", "account-admin", "standard-user"].includes(role) ? "当前团队角色没有邀请权限"
-        : seatType !== "default" ? "当前默认席位类型尚未接入邀请，请在官方页面操作"
-        : !policyKnown ? "邀请和购买策略尚未确认，请在官方页面操作"
-        : !result.invites || !result.subscription ? "邀请或席位数据未完整同步" : "" };
     // Persist only the policy fields used by this feature, never unrelated billing data.
     result.settings = { defaultSeatType };
     result.policy = { invitePurchaseMode: text(policy?.invite_purchase_mode), verified: Boolean(policyKnown) };
+    result.capabilities = teamSnapshotCapabilities(result, { email: identity.email, accountUserId: team.accountUserId, role: team.role });
     return result;
   }
   return { discover, snapshot,
-    invite: (id, emails, requestKey) => request(`/backend-api/accounts/${segment(id)}/invites`, { method: "POST", workspaceId: id,
-      body: { email_addresses: emails, role: "standard-user", seat_type: "default", resend_emails: false, submission_id: requestKey,
-        submission_surface: "admin_console_members", purchase_authorization_choice: "not_shown", entry_surface: "admin_console_members" } }),
+    invite: (id, emails, requestKey, role = "standard-user") => {
+      if (!TEAM_INVITE_ROLES.includes(role)) throw teamError("TEAM_FORBIDDEN", 403);
+      return request(`/backend-api/accounts/${segment(id)}/invites`, { method: "POST", workspaceId: id,
+        body: { email_addresses: emails, role, seat_type: "default", resend_emails: false, submission_id: requestKey,
+          submission_surface: "admin_console_members", purchase_authorization_choice: "not_shown", entry_surface: "admin_console_members" } });
+    },
     remove: (id, memberId) => request(`/backend-api/accounts/${segment(id)}/users/${segment(memberId)}`, { method: "DELETE", workspaceId: id }),
     setRole: (id, memberId, role) => request(`/backend-api/accounts/${segment(id)}/users/${segment(memberId)}`, { method: "PATCH", workspaceId: id, body: { role } }),
     close: async () => { signal?.removeEventListener("abort", abort); await transport?.close(); } };

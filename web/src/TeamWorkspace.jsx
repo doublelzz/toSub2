@@ -10,6 +10,7 @@ const initialFilters = { search: "", status: "all", seats: "all", expiring: fals
 const requestKey = () => crypto.randomUUID();
 const time = (value, dateOnly = false) => value ? new Intl.DateTimeFormat("zh-CN", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit", ...(dateOnly ? {} : { hour: "2-digit", minute: "2-digit", hour12: false }) }).format(new Date(value)) : "—";
 const seatName = (type) => ({ default: "标准", prolite: "高级" })[type] || type || "未知";
+const inviteRoleLabels = { "standard-user": "成员", "account-admin": "管理员", "account-owner": "所有者" };
 const emailsOf = (raw) => [...new Set(raw.split(/[\s,;，；]+/).map((email) => email.trim().toLowerCase()).filter(Boolean))];
 const isAbort = (error) => error?.name === "AbortError";
 
@@ -115,7 +116,27 @@ function TeamDeleteRecord({ api, record, onClose, onDeleted }) {
 function TeamManage({ api, selected, revision, onClose, onChanged, onUpdate, onDelete }) {
   const [accountId, setAccountId] = useState(selected.accountId), [tab, setTab] = useState("members"), [search, setSearch] = useState(""), [page, setPage] = useState(1);
   const [data, setData] = useState(null), [error, setError] = useState(""), [busy, setBusy] = useState(false), [invite, setInvite] = useState(false), [removing, setRemoving] = useState(null), [roleChange, setRoleChange] = useState(null);
-  useEffect(() => { let current = true; void api(`${selected.id}/query`, { accountId, tab, search, page }).then((value) => { if (current) { setData(value); setError(""); } }).catch((failure) => { if (current && !isAbort(failure)) setError(failure.message); }); return () => { current = false; }; }, [api, selected.id, accountId, tab, search, page, revision]);
+  const detailSequence = useRef(0);
+  const loadDetail = useCallback(async (overrides = {}) => {
+    const ticket = ++detailSequence.current;
+    try { const value = await api(`${selected.id}/query`, { accountId, tab, search, page, ...overrides }); if (ticket === detailSequence.current) { setData(value); setError(""); } return value; }
+    catch (failure) { if (ticket === detailSequence.current && !isAbort(failure)) setError(failure.message); throw failure; }
+  }, [api, selected.id, accountId, tab, search, page]);
+  useEffect(() => { void loadDetail().catch(() => {}); return () => { detailSequence.current += 1; }; }, [loadDetail, revision]);
+  const mutationChanged = async (message, result, nextTab) => {
+    if (nextTab) { setTab(nextTab); setSearch(""); setPage(1); }
+    setBusy(true);
+    let syncFailure;
+    try {
+      if (result?.verifying || Object.keys(result?.refreshErrors || {}).length) {
+        try { await api("sync", { ids: [accountId] }); } catch (failure) { syncFailure = failure; }
+      }
+      await onChanged(message);
+      await loadDetail(nextTab ? { tab: nextTab, search: "", page: 1 } : {});
+      if (syncFailure) throw syncFailure;
+    } catch (failure) { if (!isAbort(failure)) setError(`操作已提交，自动刷新失败：${failure.message}`); }
+    finally { setBusy(false); }
+  };
   const team = data?.team;
   const switchAccount = async (value) => { if (busy) return; setBusy(true); try { await api(`${selected.id}/select-account`, { accountId: value }); setData(null); setAccountId(value); setPage(1); setSearch(""); await onChanged(); } catch (failure) { if (!isAbort(failure)) setError(failure.message); } finally { setBusy(false); } };
   const sync = async () => { if (busy) return; setBusy(true); try { await api("sync", { ids: [accountId] }); await onChanged("已排队同步当前团队账号"); } catch (failure) { if (!isAbort(failure)) setError(failure.message); } finally { setBusy(false); } };
@@ -136,20 +157,54 @@ function TeamManage({ api, selected, revision, onClose, onChanged, onUpdate, onD
         <p className="team-footnote">{tab === "members" ? "当前账号不能直接移除；可先由所有者降级目标账号，再切换另一所有者移除。团队至少保留一位所有者。" : "待接受邀请不计入现有成员。首版暂不提供撤销与重发操作。"}</p>
       </>}
       <footer className="team-drawer-footer"><span>最近查询：{time(team.checkedAt)} · Asia/Shanghai</span><button type="button" className="text-action team-danger" disabled={busy || team.canDelete === false} title={team.canDelete === false ? "请先停止任务或等待完成" : undefined} onClick={() => onDelete({ ...team, kind: "team" })}><Trash2 size={14} />删除记录</button><button type="button" className="secondary-button" disabled={busy || team.busy || ["queued", "running", "waiting_input"].includes(team.status)} onClick={() => void sync()}><RefreshCw size={15} />同步团队</button></footer>
-      {invite && <TeamInvite api={api} team={team} onClose={() => setInvite(false)} onChanged={onChanged} />}
-      {roleChange && <TeamRoleChange api={api} team={team} member={roleChange.member} role={roleChange.role} onClose={() => setRoleChange(null)} onChanged={onChanged} />}
-      {removing && <TeamRemove api={api} team={team} member={removing} onClose={() => setRemoving(null)} onChanged={onChanged} />}
+      {invite && <TeamInvite api={api} team={team} onClose={() => setInvite(false)} onChanged={(message, result) => mutationChanged(message, result, "invites")} />}
+      {roleChange && <TeamRoleChange api={api} team={team} member={roleChange.member} role={roleChange.role} onClose={() => setRoleChange(null)} onChanged={mutationChanged} />}
+      {removing && <TeamRemove api={api} team={team} member={removing} onClose={() => setRemoving(null)} onChanged={mutationChanged} />}
     </>}
   </Drawer></div>;
 }
 
 function TeamInvite({ api, team, onClose, onChanged }) {
-  const [raw, setRaw] = useState(""), [preview, setPreview] = useState(null), [error, setError] = useState(""), [busy, setBusy] = useState(false), [checking, setChecking] = useState(false), [results, setResults] = useState(null);
+  const [raw, setRaw] = useState(""), [role, setRole] = useState("standard-user"), [preview, setPreview] = useState(null), [error, setError] = useState("");
+  const [busy, setBusy] = useState(false), [checking, setChecking] = useState(false), [results, setResults] = useState(null);
+  const [draftRevision, setDraftRevision] = useState(0);
   const key = useRef(requestKey());
-  useEffect(() => { let current = true; const emails = emailsOf(raw); setPreview(null); if (!emails.length) { setError(""); setChecking(false); return undefined; } setChecking(true); const timer = setTimeout(() => { void api(`${team.id}/invite-preview`, { accountId: team.accountId, emails }).then((value) => { if (current) { setPreview(value); setError(""); } }).catch((failure) => { if (current && !isAbort(failure)) setError(failure.message); }).finally(() => { if (current) setChecking(false); }); }, 300); return () => { current = false; clearTimeout(timer); }; }, [raw, api, team.id, team.accountId, team.checkedAt]);
-  const send = async (event) => { event.preventDefault(); if (busy || !preview?.canInvite || results) return; setBusy(true); setError(""); try { const result = await api(`${team.id}/invite`, { accountId: team.accountId, emails: emailsOf(raw), requestKey: key.current }); setResults(result.results); await onChanged(Object.keys(result.refreshErrors || {}).length ? "邀请请求已返回，部分数据需重新同步" : "已更新邀请结果，成员接受后才会加入团队"); } catch (failure) { if (!isAbort(failure)) setError(failure.message); } finally { setBusy(false); } };
+  const roleChoices = team.capabilities.inviteRoleChoices || (team.capabilities.role === "account-owner" ? Object.keys(inviteRoleLabels) : ["standard-user"]);
+  const reset = () => { setPreview(null); setResults(null); setDraftRevision((value) => value + 1); key.current = requestKey(); };
+  useEffect(() => { if (!roleChoices.includes(role)) { setRole("standard-user"); reset(); } }, [roleChoices.join("|"), role]);
+  useEffect(() => {
+    let current = true; const emails = emailsOf(raw); setPreview(null);
+    if (!emails.length) { setError(""); setChecking(false); return undefined; }
+    setChecking(true);
+    const timer = setTimeout(() => {
+      void api(`${team.id}/invite-preview`, { accountId: team.accountId, emails, role })
+        .then((value) => { if (current) { setPreview(value); setError(""); } })
+        .catch((failure) => { if (current && !isAbort(failure)) setError(failure.message); })
+        .finally(() => { if (current) setChecking(false); });
+    }, 300);
+    return () => { current = false; clearTimeout(timer); };
+  }, [raw, role, api, team.id, team.accountId, team.checkedAt, draftRevision]);
+  const send = async (event) => {
+    event.preventDefault(); if (busy || !preview?.canInvite || preview.role !== role || results) return;
+    setBusy(true); setError("");
+    try {
+      const result = await api(`${team.id}/invite`, { accountId: team.accountId, emails: emailsOf(raw), role, requestKey: key.current });
+      setResults(result.results);
+      await onChanged(result.verifying || Object.keys(result.refreshErrors || {}).length ? "邀请请求已返回，正在自动同步最新数据" : "已刷新邀请结果与团队数据，成员接受后加入团队", result);
+    } catch (failure) { if (!isAbort(failure)) setError(failure.message); }
+    finally { setBusy(false); }
+  };
   const failed = (results || []).filter((row) => row.status === "failed");
-  return <TeamDialog title="邀请成员" description={`加入 ${team.name} · ${team.email}`} onClose={onClose} busy={busy}><form onSubmit={send}><div className="team-dialog-body"><label className="team-field">成员邮箱<textarea aria-label="邀请成员邮箱" value={raw} onChange={(event) => { setRaw(event.target.value); setResults(null); key.current = requestKey(); }} placeholder={"colleague@example.com\n支持多行或逗号分隔，最多 50 个邮箱"} disabled={busy} spellCheck={false} autoFocus /><small>自动去重；已是成员与已有邀请会跳过。</small></label><div className="team-form-grid"><label className="team-field">邀请角色<input value="成员" readOnly /></label><label className="team-field">席位类型<input value="标准" readOnly /><small>高级邀请暂未开放</small></label></div><div className={`team-capacity ${preview && !preview.capacityOk ? "warning" : ""}`}><CircleAlert size={16} /><div>{checking ? "正在核对成员、待接受邀请与席位…" : preview ? <>当前可用 <strong>{preview.available ?? "未知"}</strong> 席 · 已有待接受 <strong>{preview.pendingSeats}</strong> 人 · 本次新增 <strong>{preview.added}</strong> 人<p>{preview.reason || "仅发送成员邀请，首版不自动购买席位。"}</p></> : "输入邮箱后核对邀请人数和当前席位。"}</div></div>{error && <p className="dialog-error" role="alert">{error}</p>}{results && <div className="team-invite-results" aria-live="polite">{results.map((row) => <div key={row.email}><span>{row.email}</span><strong className={["failed", "unknown"].includes(row.status) ? "team-amber" : "team-success"}>{row.message}</strong></div>)}{failed.length > 0 && <button type="button" className="secondary-button" onClick={() => { setRaw(failed.map((row) => row.email).join("\n")); setResults(null); key.current = requestKey(); }}>仅重试失败的 {failed.length} 个邮箱</button>}</div>}</div><footer className="team-dialog-footer"><small>已识别 {emailsOf(raw).length} 个邮箱</small><button type="button" className="secondary-button" disabled={busy} onClick={onClose}>{results ? "完成" : "取消"}</button><button type="submit" className="primary-button" disabled={busy || checking || !preview?.canInvite || Boolean(results)}>{busy ? <LoaderCircle className="spin" size={15} /> : <Mail size={15} />}{busy ? "正在发送" : "发送邀请"}</button></footer></form></TeamDialog>;
+  return <TeamDialog title="邀请成员" description={`加入 ${team.name} · ${team.email}`} onClose={onClose} busy={busy}><form onSubmit={send}>
+    <div className="team-dialog-body">
+      <label className="team-field">成员邮箱<textarea aria-label="邀请成员邮箱" value={raw} onChange={(event) => { setRaw(event.target.value); reset(); }} placeholder={"colleague@example.com\n支持多行或逗号分隔，最多 50 个邮箱"} disabled={busy} spellCheck={false} autoFocus /><small>自动去重；已是成员与已有邀请会跳过。</small></label>
+      <div className="team-form-grid"><label className="team-field">邀请角色<select aria-label="邀请角色" value={role} disabled={busy || roleChoices.length < 2} onChange={(event) => { setRole(event.target.value); reset(); }}>{roleChoices.map((value) => <option key={value} value={value}>{inviteRoleLabels[value]}</option>)}</select><small>{roleChoices.length < 2 ? "当前账号仅可邀请成员" : role === "account-owner" ? "接受后将拥有团队所有者权限" : role === "account-admin" ? "接受后可管理团队成员" : "接受后成为团队成员"}</small></label><label className="team-field">席位类型<input value="标准" readOnly /><small>高级邀请暂未开放</small></label></div>
+      <div className={`team-capacity ${preview && !preview.capacityOk ? "warning" : ""}`}><CircleAlert size={16} /><div>{checking ? "正在核对角色、成员、待接受邀请与席位…" : preview ? <>当前可用 <strong>{preview.available ?? "未知"}</strong> 席 · 已有待接受 <strong>{preview.pendingSeats}</strong> 人 · 本次新增 <strong>{preview.added}</strong> 人<p>{preview.reason || "仅发送成员邀请，不自动购买席位。"}</p></> : "输入邮箱后核对邀请角色、人数和当前席位。"}</div></div>
+      {error && <p className="dialog-error" role="alert">{error}</p>}
+      {results && <div className="team-invite-results" aria-live="polite">{results.map((row) => <div key={row.email}><span>{row.email}</span><strong className={["failed", "unknown"].includes(row.status) ? "team-amber" : "team-success"}>{row.message}</strong></div>)}{failed.length > 0 && <button type="button" className="secondary-button" onClick={() => { setRaw(failed.map((row) => row.email).join("\n")); reset(); }}>仅重试失败的 {failed.length} 个邮箱</button>}</div>}
+    </div>
+    <footer className="team-dialog-footer"><small>已识别 {emailsOf(raw).length} 个邮箱</small><button type="button" className="secondary-button" disabled={busy} onClick={onClose}>{results ? "完成" : "取消"}</button><button type="submit" className="primary-button" disabled={busy || checking || !preview?.canInvite || preview.role !== role || Boolean(results)}>{busy ? <LoaderCircle className="spin" size={15} /> : <Mail size={15} />}{busy ? "正在邀请并刷新" : "发送邀请"}</button></footer>
+  </form></TeamDialog>;
 }
 function TeamRoleChange({ api, team, member, role, onClose, onChanged }) {
   const [busy, setBusy] = useState(false), [error, setError] = useState("");
@@ -159,7 +214,7 @@ function TeamRoleChange({ api, team, member, role, onClose, onChanged }) {
     if (busy) return; setBusy(true); setError("");
     try {
       const result = await api(`${team.id}/role`, { accountId: team.accountId, memberId: member.id, memberEmail: member.email, previousRole: member.role, role, requestKey: key.current });
-      await onChanged(result.verifying ? "角色修改已返回，请同步确认结果" : `已将 ${member.email} 设为${label}${result.selfChanged ? "；后续移除请切换另一位所有者账号管理" : ""}`);
+      await onChanged(result.verifying || Object.keys(result.refreshErrors || {}).length ? "角色修改已返回，正在自动同步确认结果" : `已将 ${member.email} 设为${label}，已刷新成员与管理权限${result.selfChanged ? "；后续移除请切换另一位所有者账号管理" : ""}`, result);
       onClose();
     } catch (failure) { if (!isAbort(failure)) setError(failure.message); }
     finally { setBusy(false); }
@@ -169,7 +224,7 @@ function TeamRoleChange({ api, team, member, role, onClose, onChanged }) {
 
 function TeamRemove({ api, team, member, onClose, onChanged }) {
   const [busy, setBusy] = useState(false), [error, setError] = useState(""); const key = useRef(requestKey());
-  const remove = async () => { if (busy) return; setBusy(true); try { const result = await api(`${team.id}/remove`, { accountId: team.accountId, memberId: member.id, memberEmail: member.email, requestKey: key.current }); await onChanged(result.verifying || Object.keys(result.refreshErrors || {}).length ? "移除请求已返回，成员与席位仍需同步核对" : `已从 ${team.name} 移除 ${member.email}`); onClose(); } catch (failure) { if (!isAbort(failure)) setError(failure.message); } finally { setBusy(false); } };
+  const remove = async () => { if (busy) return; setBusy(true); try { const result = await api(`${team.id}/remove`, { accountId: team.accountId, memberId: member.id, memberEmail: member.email, requestKey: key.current }); await onChanged(result.verifying || Object.keys(result.refreshErrors || {}).length ? "移除请求已返回，正在自动同步成员与席位" : `已从 ${team.name} 移除 ${member.email}`, result); onClose(); } catch (failure) { if (!isAbort(failure)) setError(failure.message); } finally { setBusy(false); } };
   return <TeamDialog title="移除团队成员" description={team.name} onClose={onClose} busy={busy} className="team-remove-dialog"><div className="team-dialog-body"><p>确认移除以下成员？完成后，对方将失去此团队的访问权限。</p><div className="team-remove-target"><Users size={22} /><div><strong>{member.name || "团队成员"}</strong><span>{member.email}</span></div></div><p className="team-muted">购买席位数量保持不变，操作后重新同步成员与可用席位。</p>{error && <p className="dialog-error" role="alert">{error}</p>}</div><footer className="team-dialog-footer"><button type="button" className="secondary-button" onClick={onClose} disabled={busy} autoFocus>取消</button><button type="button" className="team-delete-button" disabled={busy} onClick={() => void remove()}>{busy ? <LoaderCircle size={15} className="spin" /> : <Trash2 size={15} />}确认移除</button></footer></TeamDialog>;
 }
 
